@@ -1,0 +1,11 @@
+[package]
+name = "bais"
+
+[generator.client1]
+output_type = "typescript/node"
+naming_convention = "preserve-case"
+output_dir = "."
+
+# BAIS — Basically A made-up Issue Standard
+# One Issue = one file in .bais/issues/, git is the hosting for now.
+# baml generate in consumers (bi, bagl, bais CLI) gives typed Issue/Edge.
