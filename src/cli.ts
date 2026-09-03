@@ -10,6 +10,7 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cyclicIds, danglingRefsIn, loadIssues, projectName, readyIssues } from "./graph.js";
 import { hasStore, ingestIssues, storeCheck, storeEdges, storeGraph, storeList, storeReady } from "./store.js";
+import { createHub } from "./hub.js";
 
 const root = ".bais";
 const issuesDir = join(root, "issues");
@@ -24,6 +25,7 @@ Usage:
   bais ready [--json]               # carries as_of + completeness from the store
   bais check [--json]
   bais graph --from <id> [--json]   # recursive CTE from the store, BFS fallback
+  bais hub [--port N]               # lease coordinator (Phase 3), serves until SIGINT
 
 Not yet implemented:
   bais new "title" --kind bug [--area bridge/ffi] [--status open]
@@ -212,6 +214,31 @@ if (cmd === "check") {
 		// unresolvable from one directory. Applies to --json too: the old check
 		// exited 0 in JSON mode, which made it useless as a CI gate.
 		if (failures.length || missing.length || cycles.length) process.exit(1);
+	}
+	process.exit(0);
+}
+
+if (cmd === "hub") {
+	// Linearizable lease coordinator (Phase 3). Optional local process:
+	// `bais hub [--port N]` serves until SIGINT. Requires an ingested
+	// store; refuses hub-only boot (see hub.ts header for v1 limits).
+	ensureInit();
+	let port = 0;
+	const pi = argv.indexOf("--port");
+	if (pi !== -1 && pi + 1 < argv.length) port = Number(argv[pi + 1]) || 0;
+	try {
+		const { hub } = await createHub(issuesDir, { port });
+		console.error(`bais hub listening on :${hub.port} (store: ${join(root, "store.db")})`);
+		await new Promise<void>((resolve) => {
+			const stop = () => {
+				hub.close().then(() => resolve(), () => resolve());
+			};
+			process.on("SIGINT", stop);
+			process.on("SIGTERM", stop);
+		});
+	} catch (e: any) {
+		console.error(`hub: ${String(e?.message ?? e).split("\n")[0]}`);
+		process.exit(1);
 	}
 	process.exit(0);
 }
