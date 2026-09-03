@@ -84,6 +84,7 @@ class Reduction {
     budgets: Budget[],
     costs: CostEntry[],
     checkpoints: Checkpoint[],
+    caps: Cap[],
 }
 
 // Fold accumulator (internal): label ops and transition records are kept raw
@@ -122,6 +123,7 @@ class Acc {
     budgets: Budget[],
     costs: CostEntry[],
     checkpoints: Checkpoint[],
+    caps: Cap[],
 }
 
 function body_string(body: map<string, unknown>, key: string) -> string? {
@@ -263,6 +265,12 @@ function apply_transition(acc: Acc, e: WireEvent) -> void {
         } else if let iss: ReducedIssue = find_issue(acc, e.entity) {
             if (iss.status == "Dropped") {
                 acc.excluded.push(Excluded { event_id: e.id, reason: "terminal-transition" });
+            } else if (to == "Dropped" && label_present(acc.label_ops, e.entity, "needs-human")) {
+                // Human-oversight gate (Phase 5): a task flagged needs-human
+                // cannot transition to the terminal state while the flag
+                // stands. Removing the flag IS the approval — the
+                // LabelRemove event is the audit trail.
+                acc.excluded.push(Excluded { event_id: e.id, reason: "needs-approval" });
             } else {
                 for (let t in acc.transitions) {
                     if (t.entity == e.entity && t.lc == e.lc && t.to != to) {
@@ -420,14 +428,17 @@ function dispatch(acc: Acc, e: WireEvent) -> void {
         apply_receipt(acc, e);
     } else if (e.type == "CheckpointPublish") {
         apply_checkpoint(acc, e);
+    } else if (e.type == "CapGrant") {
+        apply_grant(acc, e);
+    } else if (e.type == "CapRevoke") {
+        apply_revoke(acc, e);
     } else if (event_type_name(e.type) == "unknown" && !is_ephemeral(e.type)) {
         acc.excluded.push(Excluded { event_id: e.id, reason: `unknown-type: ${e.type}` });
     }
 }
 
-// Known-but-out-of-scope types (Phase 3: verify,budget,caps) and ephemeral
-// telemetry fall through the chain above with no arm: neither state nor
-// evidence for this reducer.
+// Ephemeral telemetry falls through the chain above with no arm: neither
+// state nor evidence for this reducer.
 
 // Add-wins OR-Set per (entity, label): the max (lc, id) op decides, except a
 // remove concurrent with the winning add (same lc) loses to the add. Removes
@@ -487,6 +498,7 @@ function reduce(events: WireEvent[]) -> Reduction {
         budgets: [],
         costs: [],
         checkpoints: [],
+        caps: [],
     };
     let max_lc = 0;
     for (let e in ordered) {
@@ -518,6 +530,7 @@ function reduce(events: WireEvent[]) -> Reduction {
         budgets: acc.budgets,
         costs: acc.costs,
         checkpoints: acc.checkpoints,
+        caps: acc.caps,
     }
 }
 
@@ -682,13 +695,12 @@ test "unadmitted events are evidence, never state" {
     assert.equal(r.excluded[0].reason, "not-admitted: bad-sig")
 }
 
-test "ephemeral and unrouted Phase-4/5 types leave no trace" {
-    // Leases, verify, budget, and checkpoints reduce; caps/keys still fall
-    // through with no arm until Phase 5 lands.
+test "ephemeral and unrouted key types leave no trace" {
+    // Everything reduces now except ephemeral telemetry and KeyRotate
+    // (still unrouted — no key model in v1).
     let events = [
         wire("TaskCreate", "task:A", 1, "e1", {}),
         wire("Heartbeat", "task:A", 2, "e2", {}),
-        wire("CapGrant", "task:A", 3, "e3", {}),
         wire("KeyRotate", "task:A", 4, "e4", {}),
         wire("Progress", "task:A", 5, "e5", {}),
     ];
@@ -699,7 +711,48 @@ test "ephemeral and unrouted Phase-4/5 types leave no trace" {
     assert.equal(r.leases.length(), 0);
     assert.equal(r.submissions.length(), 0);
     assert.equal(r.budgets.length(), 0);
-    assert.equal(r.checkpoints.length(), 0)
+    assert.equal(r.checkpoints.length(), 0);
+    assert.equal(r.caps.length(), 0)
+}
+
+test "needs-human label gates the terminal transition" {
+    let lab: map<string, unknown> = {};
+    let _ = lab.set("label", "needs-human");
+    let tb: map<string, unknown> = {};
+    let _ = tb.set("to", "Dropped");
+    let events = [
+        wire("TaskCreate", "task:A", 1, "e1", {}),
+        wire("LabelAdd", "task:A", 2, "e2", lab),
+        wire("TaskTransition", "task:A", 3, "e3", tb),
+    ];
+    let r = reduce(events);
+    assert.equal(only_issue(r).status, "Open");
+    assert.equal(r.excluded.length(), 1);
+    assert.equal(r.excluded[0].reason, "needs-approval");
+    // Removing the flag IS the approval: the transition then lands.
+    let unlab: map<string, unknown> = {};
+    let _ = unlab.set("label", "needs-human");
+    let r2 = reduce(
+        [
+            wire("TaskCreate", "task:A", 1, "e1", {}),
+            wire("LabelAdd", "task:A", 2, "e2", lab),
+            wire("LabelRemove", "task:A", 3, "e3", unlab),
+            wire("TaskTransition", "task:A", 4, "e4", tb),
+        ],
+    );
+    assert.equal(only_issue(r2).status, "Dropped");
+    assert.equal(r2.excluded.length(), 0);
+    // Non-terminal moves are unaffected by the flag.
+    let ob: map<string, unknown> = {};
+    let _ = ob.set("to", "Doing");
+    let r3 = reduce(
+        [
+            wire("TaskCreate", "task:A", 1, "e1", {}),
+            wire("LabelAdd", "task:A", 2, "e2", lab),
+            wire("TaskTransition", "task:A", 3, "e3", ob),
+        ],
+    );
+    assert.equal(only_issue(r3).status, "Doing")
 }
 
 test "unknown type is excluded evidence" {
