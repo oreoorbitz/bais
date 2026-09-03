@@ -1,0 +1,215 @@
+{
+	"reducer_version": "bais.reduce@1",
+	"vectors": [
+		{
+			"name": "lww-title-ignores-array-position",
+			"events": [
+				{
+					"id": "e1",
+					"author": "did:key:z6Mk-a",
+					"seq": 1,
+					"prev": null,
+					"project": "bi",
+					"entity": "task:01JAAA",
+					"refs": [],
+					"lc": 1,
+					"ts": "2026-09-03T00:00:00Z",
+					"type": "TaskCreate",
+					"body": { "title": "first" },
+					"admitted": true,
+					"drop_reason": null
+				},
+				{
+					"id": "e2",
+					"author": "did:key:z6Mk-a",
+					"seq": 2,
+					"prev": "e1",
+					"project": "bi",
+					"entity": "task:01JAAA",
+					"refs": ["e1"],
+					"lc": 5,
+					"ts": "2026-09-03T00:00:01Z",
+					"type": "TaskSet",
+					"body": { "title": "newer" },
+					"admitted": true,
+					"drop_reason": null
+				},
+				{
+					"id": "e3",
+					"author": "did:key:z6Mk-b",
+					"seq": 1,
+					"prev": null,
+					"project": "bi",
+					"entity": "task:01JAAA",
+					"refs": ["e1"],
+					"lc": 2,
+					"ts": "2026-09-03T00:00:02Z",
+					"type": "TaskSet",
+					"body": { "title": "older" },
+					"admitted": true,
+					"drop_reason": null
+				}
+			],
+			"expect": {
+				"issues": [{ "entity": "task:01JAAA", "title": "newer", "status": "Open", "labels": [] }],
+				"conflicts": [],
+				"excluded_reasons": []
+			}
+		},
+		{
+			"name": "concurrent-transitions-conflict-greater-id-wins",
+			"events": [
+				{
+					"id": "e1",
+					"author": "did:key:z6Mk-a",
+					"seq": 1,
+					"prev": null,
+					"project": "bi",
+					"entity": "task:01JAAB",
+					"refs": [],
+					"lc": 1,
+					"ts": "2026-09-03T00:00:00Z",
+					"type": "TaskCreate",
+					"body": {},
+					"admitted": true,
+					"drop_reason": null
+				},
+				{
+					"id": "e2",
+					"author": "did:key:z6Mk-a",
+					"seq": 2,
+					"prev": "e1",
+					"project": "bi",
+					"entity": "task:01JAAB",
+					"refs": ["e1"],
+					"lc": 2,
+					"ts": "2026-09-03T00:00:01Z",
+					"type": "TaskTransition",
+					"body": { "to": "Doing" },
+					"admitted": true,
+					"drop_reason": null
+				},
+				{
+					"id": "e3",
+					"author": "did:key:z6Mk-b",
+					"seq": 1,
+					"prev": null,
+					"project": "bi",
+					"entity": "task:01JAAB",
+					"refs": ["e1"],
+					"lc": 2,
+					"ts": "2026-09-03T00:00:02Z",
+					"type": "TaskTransition",
+					"body": { "to": "Blocked" },
+					"admitted": true,
+					"drop_reason": null
+				},
+				{
+					"id": "e4",
+					"author": "did:key:z6Mk-a",
+					"seq": 3,
+					"prev": "e2",
+					"project": "bi",
+					"entity": "task:01JAAB",
+					"refs": ["e2", "e3"],
+					"lc": 3,
+					"ts": "2026-09-03T00:00:03Z",
+					"type": "Heartbeat",
+					"body": {},
+					"admitted": true,
+					"drop_reason": null
+				},
+				{
+					"id": "e5",
+					"author": "did:key:z6Mk-mallory",
+					"seq": 9,
+					"prev": null,
+					"project": "bi",
+					"entity": "task:01JAAB",
+					"refs": [],
+					"lc": 9,
+					"ts": "2026-09-03T00:00:04Z",
+					"type": "TaskTransition",
+					"body": { "to": "Done" },
+					"admitted": false,
+					"drop_reason": "bad-sig"
+				}
+			],
+			"expect": {
+				"issues": [{ "entity": "task:01JAAB", "title": "untitled", "status": "Blocked", "labels": [] }],
+				"conflicts": [{ "entity": "task:01JAAB", "field": "status", "winner": "Blocked" }],
+				"excluded_reasons": ["not-admitted: bad-sig"]
+			}
+		},
+		{
+			"name": "label-add-wins-concurrent-remove",
+			"events": [
+				{
+					"id": "e1",
+					"author": "did:key:z6Mk-a",
+					"seq": 1,
+					"prev": null,
+					"project": "bi",
+					"entity": "task:01JAAC",
+					"refs": [],
+					"lc": 1,
+					"ts": "2026-09-03T00:00:00Z",
+					"type": "TaskCreate",
+					"body": {},
+					"admitted": true,
+					"drop_reason": null
+				},
+				{
+					"id": "e2",
+					"author": "did:key:z6Mk-a",
+					"seq": 2,
+					"prev": "e1",
+					"project": "bi",
+					"entity": "task:01JAAC",
+					"refs": ["e1"],
+					"lc": 2,
+					"ts": "2026-09-03T00:00:01Z",
+					"type": "LabelAdd",
+					"body": { "label": "backend" },
+					"admitted": true,
+					"drop_reason": null
+				},
+				{
+					"id": "e3",
+					"author": "did:key:z6Mk-b",
+					"seq": 1,
+					"prev": null,
+					"project": "bi",
+					"entity": "task:01JAAC",
+					"refs": ["e1"],
+					"lc": 2,
+					"ts": "2026-09-03T00:00:02Z",
+					"type": "LabelRemove",
+					"body": { "label": "backend" },
+					"admitted": true,
+					"drop_reason": null
+				},
+				{
+					"id": "e4",
+					"author": "did:key:z6Mk-a",
+					"seq": 3,
+					"prev": "e2",
+					"project": "bi",
+					"entity": "task:01JAAC",
+					"refs": ["e2", "e3"],
+					"lc": 3,
+					"ts": "2026-09-03T00:00:03Z",
+					"type": "Teleport",
+					"body": {},
+					"admitted": true,
+					"drop_reason": null
+				}
+			],
+			"expect": {
+				"issues": [{ "entity": "task:01JAAC", "title": "untitled", "status": "Open", "labels": ["backend"] }],
+				"conflicts": [],
+				"excluded_reasons": ["unknown-type: Teleport"]
+			}
+		}
+	]
+}

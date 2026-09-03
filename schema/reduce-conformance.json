@@ -1,0 +1,182 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://oreoorbitz.github.io/bais/schema/reduce-conformance.json",
+	"title": "reduce conformance suite (fusion plan Phase 2, step 7)",
+	"description": "Golden events -> expected derived state. The reference reducer is bais/baml_src/ns_event/reduce.baml (baml test is the primary gate); this file lets INDEPENDENT implementations prove they derive identical state, and bais/conformance/run.mjs replays it through the real SDK (host->BAML FFI path). CI fails on any divergent tiebreak.",
+	"type": "object",
+	"required": [
+		"reducer_version",
+		"vectors"
+	],
+	"properties": {
+		"reducer_version": {
+			"const": "bais.reduce@1"
+		},
+		"vectors": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": [
+					"name",
+					"events",
+					"expect"
+				],
+				"additionalProperties": false,
+				"properties": {
+					"name": {
+						"type": "string"
+					},
+					"events": {
+						"type": "array",
+						"items": {
+							"$ref": "#/$defs/wire_event"
+						}
+					},
+					"expect": {
+						"type": "object",
+						"required": [
+							"issues",
+							"conflicts",
+							"excluded_reasons"
+						],
+						"additionalProperties": false,
+						"properties": {
+							"issues": {
+								"type": "array",
+								"items": {
+									"type": "object",
+									"required": [
+										"entity",
+										"title",
+										"status",
+										"labels"
+									],
+									"additionalProperties": false,
+									"properties": {
+										"entity": {
+											"type": "string"
+										},
+										"title": {
+											"type": "string"
+										},
+										"status": {
+											"type": "string"
+										},
+										"labels": {
+											"type": "array",
+											"items": {
+												"type": "string"
+											}
+										}
+									}
+								}
+							},
+							"conflicts": {
+								"type": "array",
+								"items": {
+									"type": "object",
+									"required": [
+										"entity",
+										"field",
+										"winner"
+									],
+									"additionalProperties": false,
+									"properties": {
+										"entity": {
+											"type": "string"
+										},
+										"field": {
+											"type": "string"
+										},
+										"winner": {
+											"type": "string"
+										}
+									}
+								}
+							},
+							"excluded_reasons": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	},
+	"$defs": {
+		"wire_event": {
+			"type": "object",
+			"required": [
+				"id",
+				"author",
+				"seq",
+				"prev",
+				"project",
+				"entity",
+				"refs",
+				"lc",
+				"ts",
+				"type",
+				"body",
+				"admitted",
+				"drop_reason"
+			],
+			"additionalProperties": false,
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"author": {
+					"type": "string"
+				},
+				"seq": {
+					"type": "integer",
+					"minimum": 0
+				},
+				"prev": {
+					"type": [
+						"string",
+						"null"
+					]
+				},
+				"project": {
+					"type": "string"
+				},
+				"entity": {
+					"type": "string"
+				},
+				"refs": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					}
+				},
+				"lc": {
+					"type": "integer",
+					"minimum": 0
+				},
+				"ts": {
+					"type": "string"
+				},
+				"type": {
+					"type": "string"
+				},
+				"body": {
+					"type": "object"
+				},
+				"admitted": {
+					"type": "boolean"
+				},
+				"drop_reason": {
+					"type": [
+						"string",
+						"null"
+					]
+				}
+			}
+		}
+	}
+}
