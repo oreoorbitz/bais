@@ -83,6 +83,7 @@ class Reduction {
     verifications: Verification[],
     budgets: Budget[],
     costs: CostEntry[],
+    checkpoints: Checkpoint[],
 }
 
 // Fold accumulator (internal): label ops and transition records are kept raw
@@ -120,6 +121,7 @@ class Acc {
     verifications: Verification[],
     budgets: Budget[],
     costs: CostEntry[],
+    checkpoints: Checkpoint[],
 }
 
 function body_string(body: map<string, unknown>, key: string) -> string? {
@@ -416,6 +418,8 @@ function dispatch(acc: Acc, e: WireEvent) -> void {
         apply_incurred(acc, e);
     } else if (e.type == "ReceiptAttach") {
         apply_receipt(acc, e);
+    } else if (e.type == "CheckpointPublish") {
+        apply_checkpoint(acc, e);
     } else if (event_type_name(e.type) == "unknown" && !is_ephemeral(e.type)) {
         acc.excluded.push(Excluded { event_id: e.id, reason: `unknown-type: ${e.type}` });
     }
@@ -482,6 +486,7 @@ function reduce(events: WireEvent[]) -> Reduction {
         verifications: [],
         budgets: [],
         costs: [],
+        checkpoints: [],
     };
     let max_lc = 0;
     for (let e in ordered) {
@@ -512,6 +517,7 @@ function reduce(events: WireEvent[]) -> Reduction {
         verifications: acc.verifications,
         budgets: acc.budgets,
         costs: acc.costs,
+        checkpoints: acc.checkpoints,
     }
 }
 
@@ -676,9 +682,9 @@ test "unadmitted events are evidence, never state" {
     assert.equal(r.excluded[0].reason, "not-admitted: bad-sig")
 }
 
-test "ephemeral and not-yet-reduced Phase-3 types leave no trace" {
-    // Leases, verify, and budget now reduce (lease/verify/budget.baml);
-    // caps still fall through with no arm until Phase 5 lands.
+test "ephemeral and unrouted Phase-4/5 types leave no trace" {
+    // Leases, verify, budget, and checkpoints reduce; caps/keys still fall
+    // through with no arm until Phase 5 lands.
     let events = [
         wire("TaskCreate", "task:A", 1, "e1", {}),
         wire("Heartbeat", "task:A", 2, "e2", {}),
@@ -692,7 +698,8 @@ test "ephemeral and not-yet-reduced Phase-3 types leave no trace" {
     assert.equal(r.conflicts.length(), 0);
     assert.equal(r.leases.length(), 0);
     assert.equal(r.submissions.length(), 0);
-    assert.equal(r.budgets.length(), 0)
+    assert.equal(r.budgets.length(), 0);
+    assert.equal(r.checkpoints.length(), 0)
 }
 
 test "unknown type is excluded evidence" {
