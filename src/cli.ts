@@ -11,6 +11,9 @@ import { join } from "node:path";
 import { cyclicIds, danglingRefsIn, loadIssues, projectName, readyIssues } from "./graph.js";
 import { hasStore, ingestIssues, storeCheck, storeEdges, storeGraph, storeList, storeReady } from "./store.js";
 import { createHub } from "./hub.js";
+import { loadPeerKey, appendForeignEvents, publishCheckpoint, verifyCheckpointRoot } from "./hub.js";
+import { exportSnapshot, importSnapshot, markBootstrapComplete } from "./store.js";
+import { event } from "../baml_sdk/index.js";
 
 const root = ".bais";
 const issuesDir = join(root, "issues");
@@ -26,6 +29,10 @@ Usage:
   bais check [--json]
   bais graph --from <id> [--json]   # recursive CTE from the store, BFS fallback
   bais hub [--port N]               # lease coordinator (Phase 3), serves until SIGINT
+  bais keygen [--force]             # peer ed25519 identity (.bais/key.json)
+  bais checkpoint                   # publish a signed state snapshot
+  bais snapshot [--out <file>]      # export fast-bootstrap snapshot JSON
+  bais sync --from <url>            # snapshot import + backfill-verify + delta
 
 Not yet implemented:
   bais new "title" --kind bug [--area bridge/ffi] [--status open]
@@ -226,6 +233,7 @@ if (cmd === "hub") {
 	let port = 0;
 	const pi = argv.indexOf("--port");
 	if (pi !== -1 && pi + 1 < argv.length) port = Number(argv[pi + 1]) || 0;
+	process.on("unhandledRejection", (e) => console.error(`hub: unhandled rejection: ${String((e as any)?.message ?? e).split("\n")[0]}`));
 	try {
 		const { hub } = await createHub(issuesDir, { port });
 		console.error(`bais hub listening on :${hub.port} (store: ${join(root, "store.db")})`);
@@ -238,6 +246,115 @@ if (cmd === "hub") {
 		});
 	} catch (e: any) {
 		console.error(`hub: ${String(e?.message ?? e).split("\n")[0]}`);
+		process.exit(1);
+	}
+	process.exit(0);
+}
+
+if (cmd === "keygen") {
+	ensureInit();
+	const { existsSync: ex, unlinkSync } = await import("node:fs");
+	const kp = join(root, "key.json");
+	if (ex(kp) && !argv.includes("--force")) {
+		const cur = loadPeerKey(root);
+		console.log(`keeping ${kp} (${cur.did}) — pass --force to rotate`);
+		process.exit(0);
+	}
+	if (ex(kp)) unlinkSync(kp);
+	const key = loadPeerKey(root);
+	console.log(`${kp}\n${key.did}`);
+	process.exit(0);
+}
+
+if (cmd === "checkpoint") {
+	ensureInit();
+	try {
+		const cp = await publishCheckpoint(issuesDir);
+		console.log(asJson ? JSON.stringify({ checkpoint: cp }, null, 2) : `checkpoint ${cp.id} lc=${cp.lc} root=${cp.state_root.slice(0, 12)}…`);
+	} catch (e: any) {
+		console.error(`checkpoint: ${String(e?.message ?? e).split("\n")[0]}`);
+		process.exit(1);
+	}
+	process.exit(0);
+}
+
+if (cmd === "snapshot") {
+	ensureInit();
+	const snap = exportSnapshot(issuesDir);
+	if (!snap.checkpoint) {
+		console.error("snapshot: no checkpoint published — run `bais checkpoint` first");
+		process.exit(1);
+	}
+	const out = argv.includes("--out") ? argv[argv.indexOf("--out") + 1] : null;
+	const text = JSON.stringify({ snapshot: snap }, null, 2);
+	if (out) {
+		const { writeFileSync } = await import("node:fs");
+		writeFileSync(out, text);
+		console.error(`snapshot ${snap.checkpoint.id} → ${out}`);
+	} else {
+		console.log(text);
+	}
+	process.exit(0);
+}
+
+if (cmd === "sync") {
+	// Fast bootstrap + verified replication (Phase 4 step 12/13):
+	// snapshot import (instant TOFU reads) → delta pull → backfill the
+	// covered log → recompute state_root → writes unlock only on match.
+	// A root mismatch keeps tables readable but writes blocked (restart
+	// the hub after resolving — divergence alarm, report failure mode #2).
+	ensureInit();
+	const fi = argv.indexOf("--from");
+	const peer = fi !== -1 ? argv[fi + 1] : null;
+	if (!peer) {
+		console.error("sync needs --from <hub url>");
+		process.exit(1);
+	}
+	const get = async (path: string): Promise<any> => {
+		const r = await fetch(`${peer}${path}`);
+		if (!r.ok) throw new Error(`GET ${path}: ${r.status}`);
+		return r.json();
+	};
+	try {
+		const { snapshot } = (await get("/snapshot")) as any;
+		if (!snapshot?.checkpoint) throw new Error("peer has no checkpoint — cannot anchor bootstrap");
+		importSnapshot(issuesDir, snapshot, peer);
+		console.error(`imported snapshot ${snapshot.checkpoint.id} (lc=${snapshot.checkpoint.lc})`);
+		const cp = snapshot.checkpoint;
+		// Backfill FIRST: delta chains only link onto a complete local log.
+		const full = (await get("/sync")) as any;
+		const covered = (full.events ?? []).filter((e: any) => e.lc <= cp.lc);
+		const missing = cp.heads.filter((h: string) => !covered.some((e: any) => e.id === h));
+		if (missing.length) throw new Error(`backfill incomplete: missing covered heads ${missing.join(",")}`);
+		const b = await appendForeignEvents(issuesDir, covered, { mode: "backfill" });
+		if (b.rejected.length) throw new Error(`backfill rejected: ${b.rejected.map((r) => `${r.id}=${r.reason}`).join(",")}`);
+		console.error(`backfill: ${b.accepted.length} events replayed`);
+		// Cryptographic trust establishment: re-derive the root locally.
+		const { DatabaseSync } = await import("node:sqlite");
+		const { resolve } = await import("node:path");
+		const db = new DatabaseSync(resolve(issuesDir, "..", "store.db"));
+		const rows = db.prepare("SELECT * FROM events ORDER BY lc, id").all() as any[];
+		db.close();
+		const reduction = await (event as any).reduce(
+			rows.map((r) => ({
+				...r,
+				refs: JSON.parse(r.refs),
+				body: JSON.parse(r.body),
+				sig: r.sig ?? null,
+				admitted: r.admitted === 1,
+				drop_reason: r.drop_reason,
+			})),
+		);
+		if (!verifyCheckpointRoot(reduction, cp.state_root)) throw new Error("state_root mismatch — divergence alarm, writes stay blocked");
+		// Root matches: pull the post-checkpoint delta, then unlock writes.
+		const delta = (await get(`/sync?since_lc=${cp.lc}`)) as any;
+		const d = await appendForeignEvents(issuesDir, delta.events ?? [], { mode: "delta" });
+		console.error(`delta: ${d.accepted.length} accepted, ${d.rejected.length} rejected`);
+		markBootstrapComplete(issuesDir);
+		console.error(`verified root ${cp.state_root.slice(0, 12)}… — writes unlocked`);
+		if (asJson) console.log(JSON.stringify({ checkpoint: cp.id, verified: true }, null, 2));
+	} catch (e: any) {
+		console.error(`sync: ${String(e?.message ?? e).split("\n")[0]}`);
 		process.exit(1);
 	}
 	process.exit(0);
