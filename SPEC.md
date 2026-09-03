@@ -232,18 +232,64 @@ subcommands are reserved, not yet implemented.)
 - `bais hub [--port N]` serves the coordinator + relay until SIGINT:
   `POST /claim|/renew|/release` (409 on contention, 402 when the author's
   budget is exhausted, 413 over bounds), `GET /leases`,
-  `POST /checkpoint`, `GET /checkpoint` (`{checkpoint, verified}`),
+  `POST /checkpoint`, `GET /checkpoint`
+  (`{checkpoint, verified, history: "complete"|"pruned", anchor}`),
   `GET /snapshot`, `GET|POST /sync`, `GET /sync/digest`,
-  `POST /pub` + `GET /pub` + `GET /pub/stream` (ephemeral only).
+  `POST /pub` + `GET /pub` + `GET /pub/stream` (ephemeral only),
+  `POST /prune` (truncate below a checkpoint — see §4.1).
 - `bais checkpoint` publishes a signed `{state_root, heads[],
   reducer_version}` over the current log. `GET /checkpoint` recomputes
-  the root live — `verified: false` is a divergence alarm.
+  the root live — `verified: false` with `history: "complete"` is a
+  divergence alarm; with `history: "pruned"` it means the covered log
+  was truncated by operator action (last full proof in
+  `anchor.verified_at`), not divergence.
 - `bais snapshot [--out <file>]` exports `{checkpoint, tables/*, as_of,
   completeness}` for fast bootstrap (requires a published checkpoint).
+  The hub's `GET /snapshot` additionally attaches `anchor_state` (the
+  stored anchor reduction) + `cursors` so peers bootstrapping from a
+  pruned hub can anchor themselves.
 - `bais sync --from <url>`: snapshot import (instant reads) → backfill
   the covered log → recompute `state_root` locally → pull the delta →
   unlock writes only on a root match. A mismatch keeps tables readable
-  but writes blocked (exit 1).
+  but writes blocked (exit 1). From a pruned peer the backfill is
+  unavailable: the CLI falls back to signature trust (the surviving
+  `CheckpointPublish` event is signature-checked on ingest), records
+  `trust: "signature"` in bootstrap meta, and anchors tables/floors from
+  the snapshot's `anchor_state` + `cursors`. `trust: "recomputed"` is the
+  full-verify path. Pruned peers running pre-anchor-state hubs are
+  refused — upgrade the peer, not the trust.
+
+### 4.1 Prune (truncation-with-anchor)
+
+The reducer is whole-log, so prune is truncation, not compaction:
+`POST /prune [{checkpoint}]` verifies the (latest) checkpoint by full
+recompute over the covered rows — refusing with 400 on divergence, on an
+unknown id, or when asked to anchor on a stale (non-latest) checkpoint —
+captures per-author chain floors, deletes event rows at or below the
+coverage `lc`, and records `{prune_anchor, author_cursors,
+anchor_reduction}` in meta. The `CheckpointPublish` event itself sits at
+coverage `lc + 1`, so it survives as the in-log trust root. Refused with
+503 while a snapshot bootstrap is still pending.
+
+Consequences, all fail-closed:
+
+- Reads keep serving from the materialized tables, which refresh merges
+  (anchor + surviving rows) instead of rebuilding. Budget `incurred`
+  sums across the truncation (deleted sets are disjoint, so no
+  double-count); anchor leases past expiry are marked expired at merge.
+- Writes and delta sync continue from the floors (`lc` never goes
+  backwards; `seq`/`prev` continue per author). Delta ingest additionally
+  accepts floor-head replays (surviving rows the floors were captured
+  from) and anchor-linked first events (prev in checkpoint heads).
+- A claim that the truncated log admits but a surviving anchor lease
+  still covers is rejected `409 lease-active-at-anchor` — prune idle
+  hubs, or holders re-claim after anchor leases expire. Renew/release of
+  pre-prune leases is likewise closed (unknown in the truncated view).
+- Budget overspend past pruned `incurred` totals can slip the sync-path
+  gate (bounded by one cap per prune cycle): anti-spam degrades
+  gracefully, fencing does not.
+- `bais ingest` wipes prune floors and bootstrap locks with the rows
+  they reference (reseed orphans them).
 - `bais ingest` rebuilds from the TOML seed and DROPS hub/sync-appended
   events: back up `store.db` (or export a snapshot) before re-ingesting
   a live hub.
@@ -355,8 +401,9 @@ in-band registry; split wire names at `@` for dispatch.
 - `state_root` = sha256 over the canonical materialization
   `{issues, rels, leases, submissions, verifications, budgets, costs,
   conflicts}` — one function computes it for publish and verify, so the
-  two cannot drift. Row-deletion prune is deferred (the reducer is
-  whole-log; deleting covered rows would corrupt re-derivation).
+  two cannot drift. Row-deletion prune is truncation-with-anchor (§4.1):
+  projections merge anchor + surviving rows because the covered log can
+  no longer re-derive them.
 
 ### 5.4 Reified edges
 
