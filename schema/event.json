@@ -1,0 +1,38 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://oreoorbitz.github.io/bais/schema/event.json",
+	"title": "BaisEvent — signed log envelope (SPEC §5.1)",
+	"description": "One event in the per-actor append-only log. type is the plain variant name (hosts MUST send the name, e.g. LeaseClaim, not an encoded enum). body readers MUST-ignore-unknown-fields.",
+	"type": "object",
+	"required": ["id", "author", "seq", "project", "entity", "refs", "lc", "ts", "type", "body"],
+	"additionalProperties": false,
+	"properties": {
+		"id": { "type": "string", "description": "bafy… content hash, assigned post-signing" },
+		"author": { "type": "string", "pattern": "^did:key:.+" },
+		"seq": { "type": "integer", "minimum": 0 },
+		"prev": { "type": ["string", "null"], "description": "null iff seq == 0" },
+		"project": { "type": "string", "minLength": 1 },
+		"entity": { "type": "string", "minLength": 1, "description": "stable task:01J… / rel:01J…" },
+		"refs": { "type": "array", "items": { "type": "string" } },
+		"lc": { "type": "integer", "minimum": 0 },
+		"ts": { "type": "string", "description": "advisory RFC3339 wall-clock" },
+		"type": { "type": "string", "minLength": 1 },
+		"body": { "type": "object" },
+		"cost": {
+			"type": ["object", "null"],
+			"required": ["tokens", "usd"],
+			"properties": {
+				"tokens": { "type": "integer", "minimum": 0 },
+				"usd": { "type": "number", "minimum": 0 }
+			}
+		},
+		"cap": {
+			"type": ["object", "null"],
+			"required": ["event"],
+			"properties": {
+				"event": { "type": "string", "description": "bafy… of the cap.grant" }
+			}
+		},
+		"sig": { "type": ["string", "null"], "description": "ed25519 multibase; null only pre-signing" }
+	}
+}

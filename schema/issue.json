@@ -1,0 +1,41 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://oreoorbitz.github.io/bais/schema/issue.json",
+	"title": "BaisFile — one parsed BAIS issue file (SPEC §2, §4.1)",
+	"description": "Parsed form of one .bais/issues/<id>.toml. status/kind are exact-case enum strings; absent optionals may be null or omitted.",
+	"type": "object",
+	"required": ["issue", "edges"],
+	"additionalProperties": false,
+	"properties": {
+		"issue": {
+			"type": "object",
+			"required": ["id", "title", "status", "kind", "body"],
+			"additionalProperties": false,
+			"properties": {
+				"id": { "type": "string", "minLength": 1 },
+				"title": { "type": "string", "minLength": 1 },
+				"status": { "enum": ["Open", "Doing", "Blocked", "Done", "Dropped"] },
+				"kind": { "enum": ["Bug", "Feat", "Proposal", "Debt", "Flake", "Spike"] },
+				"area": { "type": ["string", "null"] },
+				"severity": { "type": ["integer", "null"] },
+				"source": { "type": ["string", "null"] },
+				"body": { "type": "string" }
+			}
+		},
+		"edges": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": ["from", "to", "kind"],
+				"additionalProperties": false,
+				"properties": {
+					"from": { "type": "string", "minLength": 1 },
+					"to": { "type": "string", "minLength": 1 },
+					"kind": {
+						"enum": ["Blocks", "DependsOn", "SubtaskOf", "DuplicateOf", "Related", "Fixes", "Replaces"]
+					}
+				}
+			}
+		}
+	}
+}

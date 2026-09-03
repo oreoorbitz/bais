@@ -1,0 +1,42 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://oreoorbitz.github.io/bais/schema/check-output.json",
+	"title": "BaisCheckOutput — bais check --json (SPEC §4.3)",
+	"description": "Exit code is 1 when bad is non-empty, any dangling status is Missing, or cycles is non-empty. External alone never fails.",
+	"type": "object",
+	"required": ["ok", "bad", "dangling", "cycles"],
+	"additionalProperties": false,
+	"properties": {
+		"ok": { "type": "integer", "minimum": 0, "description": "count of parseable files" },
+		"bad": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": ["file", "error"],
+				"additionalProperties": false,
+				"properties": {
+					"file": { "type": "string" },
+					"error": { "type": "string", "description": "message text is unstable (VM traces); match on file" }
+				}
+			}
+		},
+		"dangling": {
+			"type": "array",
+			"items": {
+				"type": "object",
+				"required": ["declaredBy", "from", "to", "kind", "id", "side", "status"],
+				"additionalProperties": false,
+				"properties": {
+					"declaredBy": { "type": "string" },
+					"from": { "type": "string" },
+					"to": { "type": "string" },
+					"kind": { "type": "string" },
+					"id": { "type": "string", "description": "the unresolvable end" },
+					"side": { "enum": ["from", "to"] },
+					"status": { "enum": ["Missing", "External"] }
+				}
+			}
+		},
+		"cycles": { "type": "array", "items": { "type": "string" } }
+	}
+}
