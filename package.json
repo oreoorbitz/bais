@@ -4,8 +4,18 @@
 	"private": true,
 	"type": "module",
 	"description": "BAIS — Basically A made-up Issue Standard (BAML). One Issue = one file in .bais/issues/, git is the hosting.",
-	"bin": { "bais": "./dist/src/cli.js" },
-	"scripts": { "build": "tsc -p tsconfig.json", "typecheck": "tsc -p tsconfig.json --noEmit" },
-	"dependencies": { "@boundaryml/baml-bridge": "0.17.0" },
-	"devDependencies": { "@types/node": "22.19.19", "typescript": "5.9.3" }
+	"bin": {
+		"bais": "./dist/src/cli.js"
+	},
+	"scripts": {
+		"build": "tsc -p tsconfig.json",
+		"typecheck": "tsc -p tsconfig.json --noEmit"
+	},
+	"dependencies": {
+		"@boundaryml/baml-bridge": "0.17.0"
+	},
+	"devDependencies": {
+		"@types/node": "22.19.19",
+		"typescript": "5.9.3"
+	}
 }
