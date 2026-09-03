@@ -21,10 +21,12 @@
 //   unsigned peer events outright. Full sig-required mode is later.
 // - Event ids are `hub:<type>:<lc>` (dev identities, not bafy hashes).
 // - `expires_at` projects as '' — expiry is lc-derived in the reducer.
-// - No row-deletion prune: the reducer is whole-log, so deleting covered
-//   rows would corrupt re-derivation. Checkpoints enable verified
-//   bootstrap + divergence alarms; storage prune needs incremental
-//   reduce (follow-up).
+// - Prune is truncation-with-anchor (`POST /prune`), not compaction: the
+//   reducer is whole-log, so post-prune recompute covers surviving rows
+//   only. Reads keep serving from the materialized tables; writes and
+//   delta sync continue from the anchor floors; new peers bootstrap via
+//   signature trust (`snapshot.anchor`). `GET /checkpoint` reports
+//   `history: "pruned"` so the anchor mismatch is not read as divergence.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { DatabaseSync } from "node:sqlite";
@@ -32,7 +34,7 @@ import { resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { event } from "../baml_sdk/index.js";
 import { projectName } from "./graph.js";
-import { refreshProjectionTables, ensureSchema, exportSnapshot } from "./store.js";
+import { refreshProjectionTables, ensureSchema, exportSnapshot, mergeAnchorReduction } from "./store.js";
 import {
 	generatePeerKey,
 	signPayload,
@@ -195,7 +197,7 @@ export interface AppendResult {
 export async function appendForeignEvents(
 	issuesDir: string,
 	incoming: any[],
-	opts: { requireSigs?: boolean; mode?: "delta" | "backfill"; maxBodyBytes?: number; maxRefs?: number; maxBatchEvents?: number } = {},
+	opts: { requireSigs?: boolean; mode?: "delta" | "backfill"; maxBodyBytes?: number; maxRefs?: number; maxBatchEvents?: number; anchorHeads?: string[] } = {},
 ): Promise<AppendResult> {
 	const maxBodyBytes = opts.maxBodyBytes ?? 262144;
 	const maxRefs = opts.maxRefs ?? 64;
@@ -275,6 +277,17 @@ export async function appendForeignEvents(
 					lastId.set(e.author, e.id);
 				}
 			}
+			// Pruned history: seed continuity from the anchor floor so
+			// post-prune continuations are not mistaken for forks.
+			const floors: Record<string, { seq: number; id: string }> = readAuthorCursors(db);
+			for (const [author, c] of Object.entries(floors)) {
+				if (c.seq >= (maxSeq.get(author) ?? -1)) {
+					maxSeq.set(author, c.seq);
+					nextSeq.set(author, c.seq + 1);
+					lastId.set(author, c.id);
+				}
+			}
+			const anchorHeads = opts.anchorHeads ? new Set(opts.anchorHeads) : null;
 			for (const raw of incoming) {
 				const shape = checkEventShape(raw);
 				if (shape || raw == null || typeof raw.id !== "string") {
@@ -282,16 +295,38 @@ export async function appendForeignEvents(
 					continue;
 				}
 				if (known.has(raw.id) || staged.some((s) => s.id === raw.id)) continue; // idempotent
-				const want = nextSeq.get(raw.author) ?? 0;
-				if (raw.seq !== want) {
-					rejected.push({ id: raw.id, reason: "chain-break" });
-					evidence.push({ e: toWire(raw), reason: "chain-break" });
-					continue;
+				let want = nextSeq.get(raw.author) ?? 0;
+				let lastKnown = lastId.get(raw.author);
+				// History replay: the event IS the floor's head (a surviving
+				// row the snapshot cursors were captured from). Its linkage
+				// is already counted — accept it so refresh and later
+				// continuity see the same rows.
+				const floor = floors[raw.author];
+				const isReplay = !!floor && raw.seq === floor.seq && raw.id === floor.id;
+				if (!isReplay && raw.seq !== want) {
+					if (
+						// Fresh log bootstrapped from a pruned peer: the first
+						// event per author links into the anchor (prev is a
+						// covered head). Trust the anchor linkage and seed the
+						// chain from the event itself — its sig is still checked
+						// below, so this confers no authenticity.
+						!nextSeq.has(raw.author) &&
+						typeof raw.prev === "string" &&
+						anchorHeads?.has(raw.prev)
+					) {
+						want = raw.seq;
+						lastKnown = raw.prev;
+					} else {
+						rejected.push({ id: raw.id, reason: "chain-break" });
+						evidence.push({ e: toWire(raw), reason: "chain-break" });
+						continue;
+					}
 				}
 				// Genesis (want 0) needs null prev; otherwise prev must link
 				// to the author's last known id — a fork or gap breaks here.
-				const lastKnown = lastId.get(raw.author);
-				if (want === 0 ? raw.prev !== null : raw.prev !== lastKnown) {
+				// (lastKnown may have been seeded from the anchor above;
+				// replays skip the check — their linkage is counted.)
+				if (!isReplay && (want === 0 ? raw.prev !== null : raw.prev !== lastKnown)) {
 					rejected.push({ id: raw.id, reason: want === 0 ? "genesis-prev" : "prev-mismatch" });
 					evidence.push({ e: toWire(raw), reason: want === 0 ? "genesis-prev" : "prev-mismatch" });
 					continue;
@@ -419,8 +454,15 @@ export async function publishCheckpoint(issuesDir: string): Promise<{
 		const lc = log.reduce((m, e) => Math.max(m, e.lc), 0);
 		const heads = log.map((e) => e.id);
 		const authorEvents = log.filter((e) => e.author === key.did);
-		const seq = authorEvents.reduce((m, e) => Math.max(m, e.seq), -1) + 1;
-		const prev = authorEvents.length ? authorEvents[authorEvents.length - 1].id : null;
+		let seq = authorEvents.reduce((m, e) => Math.max(m, e.seq), -1) + 1;
+		let prev = authorEvents.length ? authorEvents[authorEvents.length - 1].id : null;
+		// Pruned history: continue the publisher chain from the anchor
+		// floor instead of restarting seq (a fork to every peer).
+		const floor = readAuthorCursors(db)[key.did];
+		if (floor && floor.seq + 1 > seq) {
+			seq = floor.seq + 1;
+			prev = floor.id;
+		}
 		const body = encodeBodyArrays({ state_root: root, heads, reducer_version: reduction.version, lc });
 		const candidate: WireEvent = {
 			id: `hub:checkpoint:${lc}:${Date.now()}`,
@@ -462,6 +504,144 @@ export async function publishCheckpoint(issuesDir: string): Promise<{
 			heads,
 			reducer_version: reduction.version,
 		};
+	} finally {
+		db.close();
+	}
+}
+
+// Prune state (Phase 4, step 13): row deletion below a verified checkpoint.
+// The reducer is whole-log, so deletion is truncation-with-anchor, not
+// compaction — post-prune, recompute covers only surviving rows. The anchor
+// records the last full proof (`verified_at`, taken before deletion) and
+// per-author floors so seq/prev chains continue without forking.
+export type PruneAnchorRecord = {
+	checkpoint: string;
+	publisher: string;
+	lc: number;
+	state_root: string;
+	pruned_at: string;
+	verified_at: string;
+};
+function readPruneAnchor(db: DatabaseSync): PruneAnchorRecord | null {
+	try {
+		const raw = (db.prepare("SELECT v FROM meta WHERE k = 'prune_anchor'").get() as any)?.v;
+		return raw ? (JSON.parse(raw) as PruneAnchorRecord) : null;
+	} catch {
+		return null;
+	}
+}
+function readAuthorCursors(db: DatabaseSync): Record<string, { seq: number; id: string }> {
+	try {
+		const raw = (db.prepare("SELECT v FROM meta WHERE k = 'author_cursors'").get() as any)?.v;
+		return raw ? JSON.parse(raw) : {};
+	} catch {
+		return {};
+	}
+}
+// Truncation floors shared by hub boot and reload: lc never goes
+// backwards across the anchor, and pruned author heads seed the maps.
+function applyPruneFloors(
+	db: DatabaseSync,
+	st: { maxLc: number; authorSeq: Map<string, number>; authorLastId: Map<string, string> },
+): void {
+	const anchor = readPruneAnchor(db);
+	if (anchor && anchor.lc > st.maxLc) st.maxLc = anchor.lc;
+	const floors = readAuthorCursors(db);
+	for (const author of Object.keys(floors)) {
+		const c = floors[author];
+		if (c.seq >= (st.authorSeq.get(author) ?? -1)) {
+			st.authorSeq.set(author, c.seq);
+			st.authorLastId.set(author, c.id);
+		}
+	}
+}
+
+// A pre-prune lease the truncated log can no longer see still blocks a
+// new claim on its task (fail-closed against double-fencing). Returns the
+// blocking anchor lease, or null when the truncated view already ruled.
+function anchorLeaseConflict(db: DatabaseSync, reduction: any, entity: string, lc: number, excludeId: string): any | null {
+	const anchor = readPruneAnchor(db);
+	if (!anchor) return null;
+	try {
+		const raw = (db.prepare("SELECT v FROM meta WHERE k = 'anchor_reduction'").get() as any)?.v;
+		if (!raw) return null;
+		const merged = mergeAnchorReduction(JSON.parse(raw), reduction, lc);
+		// The candidate's own newly-admitted lease lives in both views —
+		// exclude it, or every post-prune claim false-positives.
+		const live = (ls: any[]): any | null =>
+			ls.find((l) => l.lease_id !== excludeId && l.entity === entity && l.status === "active" && l.expires_lc > lc) ?? null;
+		const hit = live(merged.leases ?? []);
+		if (!hit) return null;
+		if (live(reduction.leases ?? [])) return null; // truncated view saw it — BAML already ruled
+		return hit;
+	} catch {
+		return null;
+	}
+}
+
+// Delete covered event rows below a checkpoint. Verifies the checkpoint by
+// full recompute FIRST (refuses on divergence), captures author floors,
+// and records the anchor. The CheckpointPublish event itself sits at
+// lc = covered lc + 1, so it survives as the in-log trust root.
+export async function pruneBelowCheckpoint(
+	issuesDir: string,
+	checkpointId?: string,
+): Promise<{ pruned: number; anchor: PruneAnchorRecord }> {
+	const baisDir = resolve(issuesDir, "..");
+	const db = new DatabaseSync(resolve(baisDir, "store.db"));
+	try {
+		ensureSchema(db);
+		try {
+			const raw = (db.prepare("SELECT v FROM meta WHERE k = 'bootstrap'").get() as any)?.v;
+			if (raw && !(JSON.parse(raw) as any).complete) throw new Error("backfill-pending — finish `bais sync --from` first");
+		} catch (e: any) {
+			if (e?.message?.startsWith("backfill-pending")) throw e;
+		}
+		const cps = db.prepare("SELECT * FROM checkpoints ORDER BY lc DESC").all() as any[];
+		if (!cps.length) throw new Error("no checkpoint published — nothing to prune below");
+		const target = checkpointId ? cps.find((c) => c.id === checkpointId) : cps[0];
+		if (!target) throw new Error(`unknown checkpoint ${checkpointId}`);
+		if (target.id !== cps[0].id) throw new Error("prune anchors on the latest checkpoint — publish a new one first");
+		const log = loadLog(db);
+		// Verify against the covered subset only: later writes are outside
+		// the checkpoint and must not fail its proof.
+		const covered = log.filter((e) => e.lc <= target.lc);
+		if (!covered.length) throw new Error("checkpoint covers no local rows — nothing to prove");
+		const reduction = await (event as any).reduce(covered);
+		if (!verifyCheckpointRoot(reduction, target.state_root)) {
+			throw new Error("checkpoint divergent — recompute mismatch, prune refused");
+		}
+		const cursors: Record<string, { seq: number; id: string }> = {};
+		for (const e of log) {
+			const c = cursors[e.author];
+			if (!c || e.seq > c.seq) cursors[e.author] = { seq: e.seq, id: e.id };
+		}
+		const now = new Date().toISOString();
+		const anchor: PruneAnchorRecord = {
+			checkpoint: target.id,
+			publisher: target.publisher,
+			lc: target.lc,
+			state_root: target.state_root,
+			pruned_at: now,
+			verified_at: now,
+		};
+		// Anchor state for projection refresh: the covered-subset reduction
+		// (exactly the deleted rows' contribution), composed over any older
+		// anchor. Deleted sets are disjoint across prunes, so budget sums
+		// never double-count — anchoring the full reduction would.
+		let anchorReduction = reduction;
+		try {
+			const raw = (db.prepare("SELECT v FROM meta WHERE k = 'anchor_reduction'").get() as any)?.v;
+			if (raw) anchorReduction = mergeAnchorReduction(JSON.parse(raw), reduction, target.lc);
+		} catch {
+			anchorReduction = reduction;
+		}
+		const del = db.prepare("DELETE FROM events WHERE lc <= ?").run(target.lc);
+		const upsert = db.prepare("INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v");
+		upsert.run("prune_anchor", JSON.stringify(anchor));
+		upsert.run("author_cursors", JSON.stringify(cursors));
+		upsert.run("anchor_reduction", JSON.stringify(anchorReduction));
+		return { pruned: Number((del as any).changes ?? 0), anchor };
 	} finally {
 		db.close();
 	}
@@ -517,6 +697,10 @@ export async function createHub(
 			authorLastId.set(e.author, e.id);
 		}
 	}
+	// Pruned history: lc and author chains continue from the anchor floor.
+	const bootFloors = { maxLc, authorSeq, authorLastId };
+	applyPruneFloors(db, bootFloors);
+	maxLc = bootFloors.maxLc;
 	let lastReduction: any = await (event as any).reduce(log);
 
 	const changesByTask = new Map<string, number[]>();
@@ -541,6 +725,17 @@ export async function createHub(
 	const pubCap = 1000;
 	const sseClients = new Set<ServerResponse>();
 
+	// Pruned history: reads serve the merged view (anchor state + surviving
+	// rows), so projections never lose pre-prune state the tables kept.
+	const mergedView = (): any => {
+		try {
+			const raw = (db.prepare("SELECT v FROM meta WHERE k = 'anchor_reduction'").get() as any)?.v;
+			if (!raw) return lastReduction;
+			return mergeAnchorReduction(JSON.parse(raw), lastReduction, maxLc);
+		} catch {
+			return lastReduction;
+		}
+	};
 	const reload = async (): Promise<void> => {
 		log = loadEvents();
 		maxLc = log.reduce((m, e) => Math.max(m, e.lc), 0);
@@ -552,6 +747,9 @@ export async function createHub(
 				authorLastId.set(e.author, e.id);
 			}
 		}
+		const rf = { maxLc, authorSeq, authorLastId };
+		applyPruneFloors(db, rf);
+		maxLc = rf.maxLc;
 		lastReduction = await (event as any).reduce(log);
 		rebuildRenews();
 	};
@@ -677,6 +875,15 @@ export async function createHub(
 				send(res, 409, { reason: d.reason });
 				return;
 			}
+			// Pruned history: the truncated decide cannot see anchor leases.
+			// A surviving active lease on the entity blocks the claim —
+			// otherwise two holders fence the same task (fail-closed).
+			// Holders re-claim after anchor leases expire; prune idle hubs.
+			const anchorBlock = anchorLeaseConflict(db, d.reduction, task, lc, candidate.id);
+			if (anchorBlock) {
+				send(res, 409, { reason: "lease-active-at-anchor", lease_id: anchorBlock.lease_id });
+				return;
+			}
 			admit(candidate, d.reduction);
 			recordChange(task);
 			const lease = (d.reduction.leases as any[]).find((l) => l.lease_id === candidate.id);
@@ -755,7 +962,7 @@ export async function createHub(
 			const now = Date.now();
 			for (const [t, u] of [...frozenUntil]) if (now >= u) frozenUntil.delete(t);
 			send(res, 200, {
-				leases: (lastReduction.leases as any[]).filter((l) => l.status === "active"),
+				leases: (mergedView().leases as any[]).filter((l) => l.status === "active"),
 				frozen: [...frozenUntil].map(([task, until]) => ({ task, until: new Date(until).toISOString() })),
 			});
 		},
@@ -784,11 +991,16 @@ export async function createHub(
 			if (sinceLcN !== null) out = out.filter((e) => e.lc > sinceLcN);
 			if (have.size) out = out.filter((e) => !have.has(e.id));
 			const cursors = new Map<string, { author: string; seq: number; id: string }>();
+			// Pruned authors have no surviving rows — seed cursors from
+			// the anchor floor so since_seq reconciliation still works.
+			for (const [a, c] of Object.entries(readAuthorCursors(db))) {
+				cursors.set(a, { author: a, seq: c.seq, id: c.id });
+			}
 			for (const e of log) {
 				const cur = cursors.get(e.author);
 				if (!cur || e.seq > cur.seq) cursors.set(e.author, { author: e.author, seq: e.seq, id: e.id });
 			}
-			send(res, 200, { events: out, cursors: [...cursors.values()], lc: maxLc });
+			send(res, 200, { events: out, cursors: [...cursors.values()], lc: maxLc, anchor: readPruneAnchor(db) });
 		},
 		// Negentropy-shape reconciliation stub: compare fingerprints before
 		// fetching. Same filters as /sync; digest covers the sorted id set.
@@ -862,16 +1074,59 @@ export async function createHub(
 				return;
 			}
 			const cp = cps[0];
+			// Post-prune the covered log is gone, so recompute cannot
+			// reproduce the anchor root — `history: "pruned"` says the
+			// mismatch is operator truncation (last full proof in
+			// anchor.verified_at), not divergence.
+			const anchor = readPruneAnchor(db);
 			send(res, 200, {
 				checkpoint: { id: cp.id, publisher: cp.publisher, lc: cp.lc, state_root: cp.state_root, heads: cp.heads, reducer_version: cp.reducer_version },
 				verified: verifyCheckpointRoot(lastReduction, cp.state_root),
+				history: anchor ? "pruned" : "complete",
+				anchor,
 			});
+		},
+		// Log truncation below a checkpoint (Phase 4 step 13): verifies by
+		// full recompute, captures chain floors, deletes covered rows, and
+		// reloads. Peers bootstrap afterwards via signature trust (see
+		// `bais sync --from` + snapshot.anchor).
+		"POST /prune": async (b, res) => {
+			if (backfillPending()) {
+				send(res, 503, { reason: "backfill-pending" });
+				return;
+			}
+			try {
+				const r = await pruneBelowCheckpoint(issuesDir, b?.checkpoint);
+				await reload();
+				send(res, 200, r);
+			} catch (e: any) {
+				send(res, 400, { error: String(e?.message ?? e).split("\n")[0] });
+			}
 		},
 		// Fast-bootstrap export: latest checkpoint + every materialized
 		// table. Import with `bais sync --from` (TOFU reads, backfill then
 		// verifies state_root before writes unlock).
+		//
+		// Anchor state rides along so a peer bootstrapping from a PRUNED
+		// hub can anchor itself: the stored anchor reduction (exactly the
+		// deleted rows' contribution — disjoint from surviving rows, so
+		// budget sums never double-count) plus chain cursors for silent
+		// authors. Tables alone cannot re-derive lease expiry or floors,
+		// and the covered log is gone. Recomputed-path peers ignore both.
 		"GET /snapshot": async (_b, res) => {
-			send(res, 200, { snapshot: exportSnapshot(issuesDir) });
+			const cursors: { author: string; seq: number; id: string }[] = [];
+			for (const [author, seq] of authorSeq) {
+				const id = authorLastId.get(author);
+				if (id !== undefined) cursors.push({ author, seq, id });
+			}
+			let anchor_state: any = null;
+			try {
+				const raw = (db.prepare("SELECT v FROM meta WHERE k = 'anchor_reduction'").get() as any)?.v;
+				anchor_state = raw ? JSON.parse(raw) : null;
+			} catch {
+				anchor_state = null;
+			}
+			send(res, 200, { snapshot: { ...exportSnapshot(issuesDir), anchor_state, cursors } });
 		},
 		// Ephemeral publish (Phase 4 step 14): Heartbeat/Progress ONLY.
 		// Anything else is 400 — durable types go through the log.
