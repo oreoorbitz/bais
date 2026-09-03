@@ -34,7 +34,7 @@ import { resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { event } from "../baml_sdk/index.js";
 import { projectName } from "./graph.js";
-import { refreshProjectionTables, ensureSchema, exportSnapshot, mergeAnchorReduction } from "./store.js";
+import { refreshProjectionTables, ensureSchema, exportSnapshot, mergeAnchorReduction, storeOversight } from "./store.js";
 import {
 	generatePeerKey,
 	signPayload,
@@ -54,6 +54,32 @@ export interface HubLimits {
 	maxRefs?: number;
 	maxBatchEvents?: number;
 	requireSigs?: boolean;
+	// Capability enforcement (Phase 5, step 15): off by default
+	// (trusted-local coordinator). When on, every write needs a live
+	// cap for its author+action — except issuers, who bootstrap trust.
+	requireCaps?: boolean;
+	capIssuers?: string[];
+}
+
+// Write type -> capability action. Unknown types are closed under
+// requireCaps (evidence, never state).
+function actionForType(type: string): string | null {
+	if (type === "LeaseClaim") return "lease.claim";
+	if (type === "LeaseRenew") return "lease.renew";
+	if (type === "LeaseRelease") return "lease.release";
+	if (
+		type === "TaskCreate" || type === "TaskSet" || type === "TaskTransition" || type === "LabelAdd" ||
+		type === "LabelRemove" || type === "CommentPost" || type === "RelAdd" || type === "RelRetract"
+	) return "task.write";
+	if (type === "WorkSubmit") return "work.submit";
+	if (type === "VerifyRecord") return "verify.record";
+	if (type === "WorkAccept" || type === "WorkReject") return "work.decide";
+	if (type === "BudgetAuthorize" || type === "CostReserve" || type === "CostIncurred" || type === "ReceiptAttach") {
+		return "budget.write";
+	}
+	if (type === "CapGrant" || type === "CapRevoke") return "cap.admin";
+	if (type === "CheckpointPublish") return "checkpoint.publish";
+	return null;
 }
 
 export interface Hub {
@@ -197,7 +223,7 @@ export interface AppendResult {
 export async function appendForeignEvents(
 	issuesDir: string,
 	incoming: any[],
-	opts: { requireSigs?: boolean; mode?: "delta" | "backfill"; maxBodyBytes?: number; maxRefs?: number; maxBatchEvents?: number; anchorHeads?: string[] } = {},
+	opts: { requireSigs?: boolean; mode?: "delta" | "backfill"; maxBodyBytes?: number; maxRefs?: number; maxBatchEvents?: number; anchorHeads?: string[]; capCheck?: (author: string, action: string, scope: string, atLc: number) => boolean } = {},
 ): Promise<AppendResult> {
 	const maxBodyBytes = opts.maxBodyBytes ?? 262144;
 	const maxRefs = opts.maxRefs ?? 64;
@@ -330,6 +356,17 @@ export async function appendForeignEvents(
 					rejected.push({ id: raw.id, reason: want === 0 ? "genesis-prev" : "prev-mismatch" });
 					evidence.push({ e: toWire(raw), reason: want === 0 ? "genesis-prev" : "prev-mismatch" });
 					continue;
+				}
+				// Capability gate (backfill history is exempt — it is
+				// verified by recompute/signature, not re-authorized).
+				if (opts.capCheck) {
+					const action = actionForType(raw.type);
+					const scope = raw.type === "CheckpointPublish" ? raw.project : raw.entity;
+					if (action === null || !opts.capCheck(raw.author, action, scope, raw.lc)) {
+						rejected.push({ id: raw.id, reason: "cap-denied" });
+						evidence.push({ e: toWire(raw), reason: "cap-denied" });
+						continue;
+					}
 				}
 				const sig = checkSig(raw);
 				const bounds = checkBounds(raw.body, raw.refs);
@@ -679,11 +716,15 @@ export async function createHub(
 		maxRefs: opts.limits?.maxRefs ?? 64,
 		maxBatchEvents: opts.limits?.maxBatchEvents ?? 500,
 		requireSigs: opts.limits?.requireSigs ?? false,
+		requireCaps: opts.limits?.requireCaps ?? false,
 	};
 	// Ensure the hub identity exists (checkpoint signing loads it per
 	// publish in publishCheckpoint; creation here keeps first-boot logs
 	// intelligible — one "generated peer key" moment, not a surprise).
-	loadPeerKey(baisDir);
+	const hubKey = loadPeerKey(baisDir);
+	// Issuers bootstrap capability trust: their writes bypass requireCaps
+	// (default: the hub key alone — self-sovereign local net).
+	const capIssuers = opts.limits?.capIssuers ?? [hubKey.did];
 
 	const loadEvents = (): WireEvent[] => loadLog(db);
 
@@ -832,6 +873,18 @@ export async function createHub(
 	};
 
 	const nextLc = (): number => maxLc + 1;
+	// Capability gate (Phase 5, step 15): the RULE lives in BAML
+	// (cap_covers over the fold); the host only calls it. Issuers bypass
+	// to bootstrap trust; everything else needs a live cap at head.
+	const needsCap = (author: string, action: string, scope: string): boolean => {
+		if (!limits.requireCaps) return false;
+		if (capIssuers.includes(author)) return false;
+		try {
+			return !(event as any).cap_live(lastReduction.caps ?? [], author, action, scope, maxLc);
+		} catch {
+			return true;
+		}
+	};
 	const nextSeq = (author: string): number => (authorSeq.get(author) ?? -1) + 1;
 	// Chain link: the author's last id, null at genesis. Every hub-built
 	// event links, so peer chain checks pass on replication.
@@ -861,6 +914,10 @@ export async function createHub(
 			const frozen = isFrozen(task);
 			if (frozen) {
 				send(res, 409, { reason: "frozen", until: new Date(frozen).toISOString() });
+				return;
+			}
+			if (needsCap(holder, "lease.claim", task)) {
+				send(res, 403, { reason: "cap-denied", action: "lease.claim", scope: task });
 				return;
 			}
 			const lc = nextLc();
@@ -917,6 +974,10 @@ export async function createHub(
 			// Entity is cosmetic for renew/release; resolve it for the log.
 			const rec = (lastReduction.leases as any[]).find((l) => l.lease_id === lease_ref);
 			candidate.entity = rec.entity;
+			if (needsCap(holder, "lease.renew", rec.entity)) {
+				send(res, 403, { reason: "cap-denied", action: "lease.renew", scope: rec.entity });
+				return;
+			}
 			const d = await decide(candidate);
 			if (!d.ok) {
 				send(res, 409, { reason: d.reason });
@@ -941,6 +1002,10 @@ export async function createHub(
 			const rec = (lastReduction.leases as any[]).find((l) => l.lease_id === lease_ref);
 			if (!rec) {
 				send(res, 404, { reason: "unknown-lease" });
+				return;
+			}
+			if (needsCap(holder, "lease.release", rec.entity)) {
+				send(res, 403, { reason: "cap-denied", action: "lease.release", scope: rec.entity });
 				return;
 			}
 			const lc = nextLc();
@@ -1045,6 +1110,7 @@ export async function createHub(
 					maxBodyBytes: limits.maxBodyBytes,
 					maxRefs: limits.maxRefs,
 					maxBatchEvents: limits.maxBatchEvents,
+					capCheck: limits.requireCaps ? (author, action, scope) => !needsCap(author, action, scope) : undefined,
 				});
 				await reload();
 				send(res, 200, r);
@@ -1057,6 +1123,10 @@ export async function createHub(
 		"POST /checkpoint": async (_b, res) => {
 			if (backfillPending()) {
 				send(res, 503, { reason: "backfill-pending" });
+				return;
+			}
+			if (needsCap(hubKey.did, "checkpoint.publish", project)) {
+				send(res, 403, { reason: "cap-denied", action: "checkpoint.publish", scope: project });
 				return;
 			}
 			try {
@@ -1102,6 +1172,86 @@ export async function createHub(
 			} catch (e: any) {
 				send(res, 400, { error: String(e?.message ?? e).split("\n")[0] });
 			}
+		},
+		// Capability issuance (Phase 5, step 15): coordinator-built grant
+		// events, claim-style. The issuer defaults to the hub key; anyone
+		// else needs cap.admin over the grant scope when requireCaps is on
+		// (otherwise grants would be a privilege factory). Events carry
+		// sig=null (envelope-legal pre-signing); strict deployments issue
+		// signed grants via POST /sync instead. BAML validates the fields.
+		"POST /grant": async (b, res) => {
+			if (backfillPending()) {
+				send(res, 503, { reason: "backfill-pending" });
+				return;
+			}
+			const { audience, can, scope, expiry_lc, budget_cap_usd, budget_cap_tokens, issuer } = b ?? {};
+			if (typeof audience !== "string" || !Array.isArray(can) || typeof scope !== "string" || typeof expiry_lc !== "number") {
+				send(res, 400, { error: "grant needs {audience, can[], scope, expiry_lc}" });
+				return;
+			}
+			const by = typeof issuer === "string" ? issuer : hubKey.did;
+			if (needsCap(by, "cap.admin", scope)) {
+				send(res, 403, { reason: "cap-denied", action: "cap.admin", scope });
+				return;
+			}
+			const lc = nextLc();
+			const body: Record<string, unknown> = { audience, can: JSON.stringify(can), scope, expiry_lc };
+			if (typeof budget_cap_usd === "number") body.budget_cap_usd = budget_cap_usd;
+			if (typeof budget_cap_tokens === "number") body.budget_cap_tokens = budget_cap_tokens;
+			const candidate: WireEvent = {
+				id: `hub:grant:${lc}`, author: by, seq: nextSeq(by), prev: nextPrev(by),
+				project, entity: audience, refs: [], lc, ts: new Date().toISOString(),
+				type: "CapGrant", body: encodeBodyArrays(body), sig: null, admitted: true, drop_reason: null,
+			};
+			const d = await decide(candidate);
+			if (!d.ok) {
+				send(res, 409, { reason: d.reason });
+				return;
+			}
+			admit(candidate, d.reduction);
+			send(res, 200, { grant_id: candidate.id, audience, scope });
+		},
+		// The kill switch (Phase 5, step 16): revocation is fail-open by
+		// design — no cap check here. BAML admits only issuer- or
+		// audience-authored revokes, so the open door cannot grief.
+		"POST /revoke": async (b, res) => {
+			if (backfillPending()) {
+				send(res, 503, { reason: "backfill-pending" });
+				return;
+			}
+			const { grant_ref, revoker } = b ?? {};
+			if (typeof grant_ref !== "string" || typeof revoker !== "string") {
+				send(res, 400, { error: "revoke needs {grant_ref, revoker}" });
+				return;
+			}
+			const lc = nextLc();
+			const candidate: WireEvent = {
+				id: `hub:revoke:${lc}`, author: revoker, seq: nextSeq(revoker), prev: nextPrev(revoker),
+				project, entity: revoker, refs: [], lc, ts: new Date().toISOString(),
+				type: "CapRevoke", body: { grant_ref }, sig: null, admitted: true, drop_reason: null,
+			};
+			const d = await decide(candidate);
+			if (!d.ok) {
+				send(res, 409, { reason: d.reason });
+				return;
+			}
+			admit(candidate, d.reduction);
+			send(res, 200, { revoked: grant_ref, by: revoker });
+		},
+		// Live capability view (causal-position correct at head).
+		"GET /caps": async (_b, res, url) => {
+			const audience = url.searchParams.get("audience");
+			let caps = (mergedView().caps as any[]).map((c) => ({
+				grant_id: c.grant_id, issuer: c.issuer, audience: c.audience, can: c.can, scope: c.scope,
+				expiry_lc: c.expiry_lc, budget_cap_usd: c.budget_cap_usd ?? null,
+				budget_cap_tokens: c.budget_cap_tokens ?? null, revoked: c.revoked, revoked_by: c.revoked_by ?? null,
+			}));
+			if (audience !== null) caps = caps.filter((c) => c.audience === audience);
+			send(res, 200, { caps });
+		},
+		// Exception feeds, queryable not scrollable (Phase 5, step 16).
+		"GET /oversight": async (_b, res) => {
+			send(res, 200, storeOversight(issuesDir));
 		},
 		// Fast-bootstrap export: latest checkpoint + every materialized
 		// table. Import with `bais sync --from` (TOFU reads, backfill then

@@ -60,8 +60,10 @@ CREATE TABLE IF NOT EXISTS conflicts (
 );
 CREATE TABLE IF NOT EXISTS excluded (event_id TEXT PRIMARY KEY, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS failures (file TEXT PRIMARY KEY, error TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS leases (id TEXT PRIMARY KEY, task TEXT NOT NULL, holder TEXT NOT NULL, epoch INTEGER NOT NULL, expires_at TEXT NOT NULL, read_set TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS leases (id TEXT PRIMARY KEY, task TEXT NOT NULL, holder TEXT NOT NULL, epoch INTEGER NOT NULL, expires_at TEXT NOT NULL, read_set TEXT NOT NULL, expires_lc INTEGER);
 CREATE TABLE IF NOT EXISTS verifies (id TEXT PRIMARY KEY, task TEXT NOT NULL, submit_ref TEXT NOT NULL, verdict TEXT NOT NULL, verifier TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS submissions (submit_id TEXT PRIMARY KEY, task TEXT NOT NULL, producer TEXT NOT NULL, status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS caps (grant_id TEXT PRIMARY KEY, issuer TEXT NOT NULL, audience TEXT NOT NULL, can TEXT NOT NULL, scope TEXT NOT NULL, expiry_lc INTEGER NOT NULL, budget_cap_usd REAL, budget_cap_tokens INTEGER, revoked INTEGER NOT NULL, revoked_by TEXT);
 CREATE TABLE IF NOT EXISTS budgets (principal TEXT PRIMARY KEY, cap REAL NOT NULL, incurred REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, publisher TEXT NOT NULL, lc INTEGER NOT NULL, state_root TEXT NOT NULL, heads TEXT NOT NULL, reducer_version TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity);
@@ -81,6 +83,8 @@ export function ensureSchema(db: DatabaseSync): void {
 	db.exec(SCHEMA);
 	const cols = new Set((db.prepare("PRAGMA table_info(events)").all() as any[]).map((c) => c.name as string));
 	if (!cols.has("sig")) db.exec("ALTER TABLE events ADD COLUMN sig TEXT");
+	const leaseCols = new Set((db.prepare("PRAGMA table_info(leases)").all() as any[]).map((c) => c.name as string));
+	if (!leaseCols.has("expires_lc")) db.exec("ALTER TABLE leases ADD COLUMN expires_lc INTEGER");
 }
 
 function openDb(issuesDir: string): DatabaseSync {
@@ -173,7 +177,7 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 		// carries no lease/verify/budget/checkpoint events, so keeping those
 		// rows would orphan them from the events they reduced from. Back up
 		// store.db (or export a snapshot) before re-ingesting a live hub.
-		db.exec("DELETE FROM events; DELETE FROM tasks; DELETE FROM rels; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM failures; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM checkpoints;");
+		db.exec("DELETE FROM events; DELETE FROM tasks; DELETE FROM rels; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM failures; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM checkpoints; DELETE FROM submissions; DELETE FROM caps;");
 		// Reseed orphans prune floors and bootstrap locks (they reference
 		// deleted event rows) — drop them with the rows.
 		db.exec("DELETE FROM meta WHERE k IN ('prune_anchor', 'author_cursors', 'anchor_reduction', 'bootstrap');");
@@ -336,6 +340,90 @@ export function storeList(issuesDir: string): { tasks: StoredTask[]; as_of: AsOf
 	}
 }
 
+export function storeCaps(issuesDir: string): StoredCap[] {
+	const db = openDb(issuesDir);
+	try {
+		return (db.prepare("SELECT * FROM caps ORDER BY grant_id").all() as any[]).map((r) => ({
+			grant_id: r.grant_id,
+			issuer: r.issuer,
+			audience: r.audience,
+			can: JSON.parse(r.can),
+			scope: r.scope,
+			expiry_lc: r.expiry_lc,
+			budget_cap_usd: r.budget_cap_usd ?? null,
+			budget_cap_tokens: r.budget_cap_tokens ?? null,
+			revoked: r.revoked === 1,
+			revoked_by: r.revoked_by ?? null,
+		}));
+	} finally {
+		db.close();
+	}
+}
+
+// Human-oversight exception feeds (Phase 5, step 16): queryable, not
+// scrollable. All four read the projection — no log scan.
+export type Oversight = {
+	conflicts: { entity: string; field: string; options: string[]; winner: string | null; event_ids: string[]; at_lc: number }[];
+	budget_overruns: { principal: string; cap: number; incurred: number }[];
+	unverified_submits: StoredSubmit[];
+	stalled_leases: { id: string; task: string; holder: string; epoch: number; expires_lc: number | null }[];
+	caps_over_budget: { grant_id: string; audience: string; budget_cap_usd: number; incurred: number }[];
+	as_of: AsOf;
+	completeness: Completeness;
+};
+export function storeOversight(issuesDir: string): Oversight {
+	const db = openDb(issuesDir);
+	try {
+		const { as_of, completeness } = readAsOfFrom(db);
+		const conflicts = (db.prepare("SELECT * FROM conflicts ORDER BY at_lc DESC").all() as any[]).map((r) => ({
+			entity: r.entity,
+			field: r.field,
+			options: JSON.parse(r.options),
+			winner: r.winner,
+			event_ids: JSON.parse(r.event_ids),
+			at_lc: r.at_lc,
+		}));
+		const budget_overruns = db.prepare("SELECT principal, cap, incurred FROM budgets WHERE incurred > cap ORDER BY principal").all() as Oversight["budget_overruns"];
+		const unverified_submits = db.prepare(
+			`SELECT s.submit_id, s.task, s.producer, s.status FROM submissions s WHERE s.status = 'submitted'
+			 AND NOT EXISTS (SELECT 1 FROM verifies v WHERE v.submit_ref = s.submit_id AND v.verdict = 'accept') ORDER BY s.submit_id`,
+		).all() as StoredSubmit[];
+		const stalled_leases = db.prepare(
+			"SELECT id, task, holder, epoch, expires_lc FROM leases WHERE expires_lc IS NOT NULL AND expires_lc <= ? ORDER BY id",
+		).all(as_of.lc) as Oversight["stalled_leases"];
+		const caps_over_budget = db.prepare(
+			`SELECT c.grant_id, c.audience, c.budget_cap_usd, b.incurred FROM caps c JOIN budgets b ON b.principal = c.audience
+			 WHERE c.revoked = 0 AND c.budget_cap_usd IS NOT NULL AND b.incurred > c.budget_cap_usd ORDER BY c.grant_id`,
+		).all() as Oversight["caps_over_budget"];
+		return { conflicts, budget_overruns, unverified_submits, stalled_leases, caps_over_budget, as_of, completeness };
+	} finally {
+		db.close();
+	}
+}
+
+// Deterministic sampling (Phase 5, step 16): FNV-1a over seed+entity,
+// so the "random sample of completed work" is reproducible and auditable.
+// Completed = Done (Accepted is a submission state, not a task status).
+export function storeSample(issuesDir: string, n: number, seed = 0): { sample: StoredTask[]; total: number } {
+	const db = openDb(issuesDir);
+	try {
+		const rows = db.prepare("SELECT * FROM tasks WHERE status = 'Done'").all() as any[];
+		const tasks = rows.map(rowToTask);
+		const hash = (s: string): number => {
+			let h = (2166136261 ^ seed) >>> 0;
+			for (let i = 0; i < s.length; i++) {
+				h ^= s.charCodeAt(i);
+				h = Math.imul(h, 16777619);
+			}
+			return h >>> 0;
+		};
+		tasks.sort((a, b) => hash(a.entity) - hash(b.entity) || (a.entity < b.entity ? -1 : 1));
+		return { sample: tasks.slice(0, Math.max(0, n)), total: tasks.length };
+	} finally {
+		db.close();
+	}
+}
+
 export type SnapshotCheckpoint = {
 	id: string;
 	publisher: string;
@@ -365,6 +453,12 @@ export type PruneAnchor = {
 // before writing (trust-on-first-use reads, verify-before-write).
 // When `anchor` is present the peer pruned below the checkpoint: covered
 // heads are unrecoverable and bootstrap falls back to signature trust.
+export type StoredSubmit = { submit_id: string; task: string; producer: string; status: string };
+export type StoredCap = {
+	grant_id: string; issuer: string; audience: string; can: string[]; scope: string; expiry_lc: number;
+	budget_cap_usd: number | null; budget_cap_tokens: number | null; revoked: boolean; revoked_by: string | null;
+};
+
 export type Snapshot = {
 	checkpoint: SnapshotCheckpoint | null;
 	anchor: PruneAnchor | null;
@@ -378,8 +472,10 @@ export type Snapshot = {
 	tables: {
 		tasks: StoredTask[];
 		rels: StoredRel[];
-		leases: { id: string; task: string; holder: string; epoch: number; expires_at: string; read_set: string[] }[];
+		leases: { id: string; task: string; holder: string; epoch: number; expires_at: string; read_set: string[]; expires_lc: number | null }[];
 		verifies: { id: string; task: string; submit_ref: string; verdict: string; verifier: string }[];
+		submissions: StoredSubmit[];
+		caps: StoredCap[];
 		budgets: { principal: string; cap: number; incurred: number }[];
 		conflicts: { entity: string; field: string; options: string[]; winner: string | null; event_ids: string[]; at_lc: number }[];
 		excluded: { event_id: string; reason: string }[];
@@ -430,8 +526,22 @@ export function exportSnapshot(issuesDir: string): Snapshot {
 					epoch: r.epoch,
 					expires_at: r.expires_at,
 					read_set: JSON.parse(r.read_set),
+					expires_lc: r.expires_lc ?? null,
 				})),
 				verifies: (db.prepare("SELECT * FROM verifies ORDER BY id").all() as any[]),
+				submissions: (db.prepare("SELECT * FROM submissions ORDER BY submit_id").all() as any[]),
+				caps: (db.prepare("SELECT * FROM caps ORDER BY grant_id").all() as any[]).map((r) => ({
+					grant_id: r.grant_id,
+					issuer: r.issuer,
+					audience: r.audience,
+					can: JSON.parse(r.can),
+					scope: r.scope,
+					expiry_lc: r.expiry_lc,
+					budget_cap_usd: r.budget_cap_usd ?? null,
+					budget_cap_tokens: r.budget_cap_tokens ?? null,
+					revoked: r.revoked === 1,
+					revoked_by: r.revoked_by ?? null,
+				})),
 				budgets: (db.prepare("SELECT * FROM budgets ORDER BY principal").all() as any[]),
 				conflicts: (db.prepare("SELECT * FROM conflicts ORDER BY entity").all() as any[]).map((r) => ({
 					entity: r.entity,
@@ -462,7 +572,7 @@ export function importSnapshot(issuesDir: string, snap: Snapshot, peer: string):
 	const db = openDb(issuesDir);
 	try {
 		db.exec(
-			"DELETE FROM tasks; DELETE FROM rels; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM failures; DELETE FROM checkpoints;",
+			"DELETE FROM tasks; DELETE FROM rels; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM failures; DELETE FROM checkpoints; DELETE FROM submissions; DELETE FROM caps;",
 		);
 		const insTask = db.prepare(
 			"INSERT INTO tasks(entity, title, status, kind, area, severity, source, body, labels, comments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -472,10 +582,18 @@ export function importSnapshot(issuesDir: string, snap: Snapshot, peer: string):
 		}
 		const insRel = db.prepare("INSERT INTO rels(id, source, type, target) VALUES (?, ?, ?, ?)");
 		for (const r of snap.tables.rels) insRel.run(r.id, r.source, r.type, r.target);
-		const insLease = db.prepare("INSERT INTO leases(id, task, holder, epoch, expires_at, read_set) VALUES (?, ?, ?, ?, ?, ?)");
-		for (const l of snap.tables.leases) insLease.run(l.id, l.task, l.holder, l.epoch, l.expires_at, JSON.stringify(l.read_set));
+		const insLease = db.prepare("INSERT INTO leases(id, task, holder, epoch, expires_at, read_set, expires_lc) VALUES (?, ?, ?, ?, ?, ?, ?)");
+		for (const l of snap.tables.leases) insLease.run(l.id, l.task, l.holder, l.epoch, l.expires_at, JSON.stringify(l.read_set), l.expires_lc ?? null);
 		const insVerify = db.prepare("INSERT INTO verifies(id, task, submit_ref, verdict, verifier) VALUES (?, ?, ?, ?, ?)");
 		for (const v of snap.tables.verifies) insVerify.run(v.id, v.task, v.submit_ref, v.verdict, v.verifier);
+		const insSubmit = db.prepare("INSERT INTO submissions(submit_id, task, producer, status) VALUES (?, ?, ?, ?)");
+		for (const s of snap.tables.submissions ?? []) insSubmit.run(s.submit_id, s.task, s.producer, s.status);
+		const insCap = db.prepare(
+			"INSERT INTO caps(grant_id, issuer, audience, can, scope, expiry_lc, budget_cap_usd, budget_cap_tokens, revoked, revoked_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		);
+		for (const c of snap.tables.caps ?? []) {
+			insCap.run(c.grant_id, c.issuer, c.audience, JSON.stringify(c.can), c.scope, c.expiry_lc, c.budget_cap_usd ?? null, c.budget_cap_tokens ?? null, c.revoked ? 1 : 0, c.revoked_by ?? null);
+		}
 		const insBudget = db.prepare("INSERT INTO budgets(principal, cap, incurred) VALUES (?, ?, ?)");
 		for (const b of snap.tables.budgets) insBudget.run(b.principal, b.cap, b.incurred);
 		const insConf = db.prepare("INSERT INTO conflicts(entity, field, options, winner, event_ids, at_lc) VALUES (?, ?, ?, ?, ?, ?)");
@@ -558,6 +676,7 @@ export function mergeAnchorReduction(anchor: any, partial: any, maxLc: number): 
 		conflicts: union(anchor.conflicts, partial.conflicts, (x) => JSON.stringify([x.entity, x.field])),
 		excluded: union(anchor.excluded, partial.excluded, (x) => x.event_id),
 		checkpoints: union(anchor.checkpoints, partial.checkpoints, (x) => x.id),
+		caps: union(anchor.caps, partial.caps, (x) => x.grant_id),
 	};
 }
 
@@ -577,7 +696,7 @@ export function refreshProjectionTables(db: DatabaseSync, reduction: any, heads:
 	} catch {
 		effective = reduction;
 	}
-	db.exec("DELETE FROM tasks; DELETE FROM rels; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM checkpoints;");
+	db.exec("DELETE FROM tasks; DELETE FROM rels; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM checkpoints; DELETE FROM submissions; DELETE FROM caps;");
 	const insTask = db.prepare(
 		"INSERT INTO tasks(entity, title, status, kind, area, severity, source, body, labels, comments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	);
@@ -592,12 +711,16 @@ export function refreshProjectionTables(db: DatabaseSync, reduction: any, heads:
 	}
 	const insExcl = db.prepare("INSERT INTO excluded(event_id, reason) VALUES (?, ?)");
 	for (const x of effective.excluded as any[]) insExcl.run(x.event_id, x.reason);
-	const insLease = db.prepare("INSERT INTO leases(id, task, holder, epoch, expires_at, read_set) VALUES (?, ?, ?, ?, ?, ?)");
+	const insLease = db.prepare("INSERT INTO leases(id, task, holder, epoch, expires_at, read_set, expires_lc) VALUES (?, ?, ?, ?, ?, ?, ?)");
 	for (const l of (effective.leases as any[]) ?? []) {
-		if (l.status === "active") insLease.run(l.lease_id, l.entity, l.holder, l.epoch, "", JSON.stringify(l.read_set));
+		if (l.status === "active") insLease.run(l.lease_id, l.entity, l.holder, l.epoch, "", JSON.stringify(l.read_set), l.expires_lc ?? null);
 	}
 	const submitTask = new Map<string, string>();
-	for (const s of (effective.submissions as any[]) ?? []) submitTask.set(s.submit_id, s.entity);
+	const insSubmit = db.prepare("INSERT INTO submissions(submit_id, task, producer, status) VALUES (?, ?, ?, ?)");
+	for (const s of (effective.submissions as any[]) ?? []) {
+		submitTask.set(s.submit_id, s.entity);
+		insSubmit.run(s.submit_id, s.entity, s.producer, s.status);
+	}
 	const insVerify = db.prepare("INSERT INTO verifies(id, task, submit_ref, verdict, verifier) VALUES (?, ?, ?, ?, ?)");
 	for (const v of (effective.verifications as any[]) ?? []) {
 		insVerify.run(v.verify_id, submitTask.get(v.submit_id) ?? "", v.submit_id, v.verdict, v.verifier);
@@ -607,6 +730,12 @@ export function refreshProjectionTables(db: DatabaseSync, reduction: any, heads:
 	const insCp = db.prepare("INSERT INTO checkpoints(id, publisher, lc, state_root, heads, reducer_version) VALUES (?, ?, ?, ?, ?, ?)");
 	for (const c of (effective.checkpoints as any[]) ?? []) {
 		insCp.run(c.id, c.publisher, c.lc, c.state_root, JSON.stringify(c.heads), c.reducer_version);
+	}
+	const insCap = db.prepare(
+		"INSERT INTO caps(grant_id, issuer, audience, can, scope, expiry_lc, budget_cap_usd, budget_cap_tokens, revoked, revoked_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+	);
+	for (const c of (effective.caps as any[]) ?? []) {
+		insCap.run(c.grant_id, c.issuer, c.audience, JSON.stringify(c.can), c.scope, c.expiry_lc, c.budget_cap_usd ?? null, c.budget_cap_tokens ?? null, c.revoked ? 1 : 0, c.revoked_by ?? null);
 	}
 	setMeta(db, "as_of", JSON.stringify({ heads, lc: maxLc, wall_ts: new Date().toISOString() }));
 }
