@@ -161,8 +161,9 @@ Scope = text before `#` (`bi#04` → `bi`); an id with no `#` is local scope.
 
 ## 4. CLI contract
 
-`bais list | ready | check [--json]` plus `bais ingest` and `bais graph`.
-JSON output goes to stdout; diagnostics to stderr. Machine consumers MUST pass
+`bais list | ready | check [--json]` plus `bais ingest` and `bais graph`,
+`bais hub | keygen | checkpoint | snapshot | sync`. JSON output goes to
+stdout; diagnostics to stderr. Machine consumers MUST pass
 `--json` and parse stdout.
 
 Reads prefer the SQLite projection (`.bais/store.db`, built by `bais ingest`
@@ -223,6 +224,30 @@ No `.bais` directory → stderr `No .bais — run bais init`, exit 1.
 `bais init` creates `.bais/issues/` + `config.toml`. (`new`/`move`/`graph`
 subcommands are reserved, not yet implemented.)
 
+### 4.5 Hub, keys, checkpoints, sync
+
+- `bais keygen [--force]` creates `.bais/key.json` (ed25519 peer
+  identity, mode 600, `did:key` form). The hub and local CLI sign as the
+  same peer. Without `--force` an existing key is kept and printed.
+- `bais hub [--port N]` serves the coordinator + relay until SIGINT:
+  `POST /claim|/renew|/release` (409 on contention, 402 when the author's
+  budget is exhausted, 413 over bounds), `GET /leases`,
+  `POST /checkpoint`, `GET /checkpoint` (`{checkpoint, verified}`),
+  `GET /snapshot`, `GET|POST /sync`, `GET /sync/digest`,
+  `POST /pub` + `GET /pub` + `GET /pub/stream` (ephemeral only).
+- `bais checkpoint` publishes a signed `{state_root, heads[],
+  reducer_version}` over the current log. `GET /checkpoint` recomputes
+  the root live — `verified: false` is a divergence alarm.
+- `bais snapshot [--out <file>]` exports `{checkpoint, tables/*, as_of,
+  completeness}` for fast bootstrap (requires a published checkpoint).
+- `bais sync --from <url>`: snapshot import (instant reads) → backfill
+  the covered log → recompute `state_root` locally → pull the delta →
+  unlock writes only on a root match. A mismatch keeps tables readable
+  but writes blocked (exit 1).
+- `bais ingest` rebuilds from the TOML seed and DROPS hub/sync-appended
+  events: back up `store.db` (or export a snapshot) before re-ingesting
+  a live hub.
+
 ## 5. Event log (source of truth)
 
 TOML files are the human projection. The machine source of truth is an
@@ -279,13 +304,59 @@ in-band registry; split wire names at `@` for dispatch.
 ### 5.3 Channel + coordination rules
 
 - **Ephemeral:** `Heartbeat`/`Progress` MUST NEVER enter the durable DAG —
-  route to memory/pubsub only.
+  route to memory/pubsub only (`POST /pub`, `GET /pub`, live `GET
+  /pub/stream`; no replay, no history).
 - **Coordination:** only `LeaseClaim` requires a central coordinator (exclusive
   work claims are impossible merge-only). All other types merge without
   coordination. Lease fencing: `epoch`/`ttl`/`read_set` accompany side effects
   so zombies are rejected.
 - **Done is split:** `WorkSubmit{evidence} → VerifyRecord{verdict} →
   WorkAccept`; producer MUST NOT be sole verifier.
+- **Signing:** hosts sign `ed25519(canonical(project + prev + refs + type +
+  entity + body))` under `did:key` (`type` + `entity` included — without
+  them a signed body replays across tasks and types). Canonical form is
+  sorted-keys compact JSON (JCS-lite; full RFC 8785 number normalization
+  deferred — cross-impl float canonicalization may differ). `sig` is null
+  only pre-signing: coordinator-built events are unsigned by design
+  (trusted-local hub); peer replication verifies sigs when present and
+  always enforces seq/prev continuity. Hubs started with `requireSigs`
+  reject unsigned peer events outright.
+- **Lists cross the bridge JSON-encoded:** hosts MUST send list-typed
+  body fields (`read_set`, `evidence`, `verify_refs`, `heads`) as JSON
+  text — raw arrays do not survive the TS→BAML boundary (toolchain gap).
+  The reducer parses them back and accepts native arrays from BAML-side
+  callers. Whole-number amounts (`10`, not `10.0`) narrow to `float`.
+  Encode BEFORE signing: signatures cover the wire form, and the hub
+  normalizes arrays on store — a sig over raw arrays breaks for every
+  downstream verifier (ingress rejects it as `unencoded-lists`).
+- **Bounds (hub-enforced, pre-admission):** body ≤ 256 KiB, `refs[]` ≤ 64,
+  sync batches ≤ 500 events (413 past any bound); authors with exhausted
+  budgets get 402 on new state writes (renew/release stay open as
+  wind-down). Bounds never enter the log — they reject before reduction.
+
+### 5.5 Sync protocol (want/have, per-actor logs)
+
+- `GET /sync?author=<did>&since_seq=<n>` follows one actor's log;
+  `GET /sync?since_lc=<n>` catches up whole-workspace; `have=<id,…>`
+  subtracts what the requester holds. Every response carries
+  `cursors: [{author, seq, id}]` (each actor's head) and `lc`.
+- `GET /sync/digest` returns `{count, digest, head_lc}` over the sorted
+  id set — compare fingerprints before fetching (Negentropy shape, no
+  DHT; the reconcile loop itself is future work).
+- `POST /sync {events}` appends through chain + signature + bounds
+  checks. Invalid events persist as evidence (`admitted=0` +
+  `drop_reason`), never silently: `chain-break`, `prev-mismatch`,
+  `genesis-prev`, `bad-sig`, `sig-required`, `over-size`, `over-fanout`.
+  Known ids are idempotent skips. Malformed shapes are dropped with a
+  reason (they cannot be represented).
+- Chain rule (envelope genesis): new authors start at `seq 0`/`prev
+  null`; every later event links its author's last id. Forks and gaps
+  break here, before the reducer ever sees them.
+- `state_root` = sha256 over the canonical materialization
+  `{issues, rels, leases, submissions, verifications, budgets, costs,
+  conflicts}` — one function computes it for publish and verify, so the
+  two cannot drift. Row-deletion prune is deferred (the reducer is
+  whole-log; deleting covered rows would corrupt re-derivation).
 
 ### 5.4 Reified edges
 
@@ -303,6 +374,9 @@ different edges MUST NOT clobber each other.
   JSON shapes with the §4.3 exit-code rule.
 - **L3 event log:** append/verify §5 events, enforce genesis/sequence,
   ephemeral split, and coordinator routing.
+- **L4 sync:** implement §5.5 (§4.5 CLI) — want/have catch-up, digest
+  compare, evidence-preserving ingest, checkpoint publish/verify, and
+  snapshot bootstrap with backfill-verified writes.
 
 ## 7. Evolution
 
