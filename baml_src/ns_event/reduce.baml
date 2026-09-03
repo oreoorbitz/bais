@@ -78,6 +78,7 @@ class Reduction {
     rels: ReducedRel[],
     conflicts: Conflict[],
     excluded: Excluded[],
+    leases: Lease[],
 }
 
 // Fold accumulator (internal): label ops and transition records are kept raw
@@ -110,6 +111,7 @@ class Acc {
     transitions: TransRec[],
     conflicts: Conflict[],
     excluded: Excluded[],
+    leases: Lease[],
 }
 
 function body_string(body: map<string, unknown>, key: string) -> string? {
@@ -164,10 +166,11 @@ function wire(
     body: map<string, unknown>,
     admitted: bool = true,
     drop_reason: string? = null,
+    author: string = "did:key:z6Mk-test",
 ) -> WireEvent {
     WireEvent {
         id: id,
-        author: "did:key:z6Mk-test",
+        author: author,
         seq: lc,
         prev: null,
         project: "bi",
@@ -240,7 +243,11 @@ function apply_set(acc: Acc, e: WireEvent) -> void {
 // Concurrent same-lc transitions to different targets are conflicts as values
 // (Jujutsu model): state takes the (lc, id) winner, the conflict is recorded.
 function apply_transition(acc: Acc, e: WireEvent) -> void {
-    if let to: string = body_string(e.body, "to") {
+    // Fencing gate (Phase 3): a task under an active lease only moves on an
+    // exact fencing-token echo; otherwise the write is evidence, not state.
+    if (!lease_fence_ok(acc, e.entity, e.lc, body_int(e.body, "fencing"))) {
+        acc.excluded.push(Excluded { event_id: e.id, reason: "stale-fence" });
+    } else if let to: string = body_string(e.body, "to") {
         if (!is_status(to)) {
             acc.excluded.push(Excluded { event_id: e.id, reason: "unknown-status" });
         } else if let iss: ReducedIssue = find_issue(acc, e.entity) {
@@ -379,14 +386,20 @@ function dispatch(acc: Acc, e: WireEvent) -> void {
         apply_rel_add(acc, e);
     } else if (e.type == "RelRetract") {
         apply_rel_retract(acc, e);
+    } else if (e.type == "LeaseClaim") {
+        apply_claim(acc, e);
+    } else if (e.type == "LeaseRenew") {
+        apply_renew(acc, e);
+    } else if (e.type == "LeaseRelease") {
+        apply_release(acc, e);
     } else if (event_type_name(e.type) == "unknown" && !is_ephemeral(e.type)) {
         acc.excluded.push(Excluded { event_id: e.id, reason: `unknown-type: ${e.type}` });
     }
 }
 
-// Known-but-out-of-scope types (Phase 3: leases,verify,budget,caps) and
-// ephemeral telemetry fall through the chain above with no arm: neither state
-// nor evidence for this reducer.
+// Known-but-out-of-scope types (Phase 3: verify,budget,caps) and ephemeral
+// telemetry fall through the chain above with no arm: neither state nor
+// evidence for this reducer.
 
 // Add-wins OR-Set per (entity, label): the max (lc, id) op decides, except a
 // remove concurrent with the winning add (same lc) loses to the add. Removes
@@ -433,10 +446,24 @@ function reduce(events: WireEvent[]) -> Reduction {
         .sort_by_key((e) -> {
             order_key(e)
         });
-    let acc = Acc { issues: [], rels: [], label_ops: [], transitions: [], conflicts: [], excluded: [] };
+    let acc = Acc {
+        issues: [],
+        rels: [],
+        label_ops: [],
+        transitions: [],
+        conflicts: [],
+        excluded: [],
+        leases: [],
+    };
+    let max_lc = 0;
     for (let e in ordered) {
         dispatch(acc, e);
+        if (e.admitted && e.lc > max_lc) {
+            max_lc = e.lc;
+        }
     }
+    // Derived expiry (Phase 3): expire is never written, only swept here.
+    sweep_expiry(acc, max_lc);
     for (let iss in acc.issues) {
         iss.labels = present_labels(acc.label_ops, iss.entity);
     }
@@ -452,6 +479,7 @@ function reduce(events: WireEvent[]) -> Reduction {
         rels: out_rels,
         conflicts: acc.conflicts,
         excluded: acc.excluded,
+        leases: acc.leases,
     }
 }
 
@@ -616,17 +644,21 @@ test "unadmitted events are evidence, never state" {
     assert.equal(r.excluded[0].reason, "not-admitted: bad-sig")
 }
 
-test "ephemeral and Phase-3 types leave no trace" {
+test "ephemeral and not-yet-reduced Phase-3 types leave no trace" {
+    // Leases now reduce (see lease.baml); verify/budget/caps still fall
+    // through with no arm until their Phase 3 step lands.
     let events = [
         wire("TaskCreate", "task:A", 1, "e1", {}),
         wire("Heartbeat", "task:A", 2, "e2", {}),
-        wire("LeaseClaim", "task:A", 3, "e3", {}),
-        wire("Progress", "task:A", 4, "e4", {}),
+        wire("WorkSubmit", "task:A", 3, "e3", {}),
+        wire("BudgetAuthorize", "task:A", 4, "e4", {}),
+        wire("Progress", "task:A", 5, "e5", {}),
     ];
     let r = reduce(events);
     assert.equal(only_issue(r).status, "Open");
     assert.equal(r.excluded.length(), 0);
-    assert.equal(r.conflicts.length(), 0)
+    assert.equal(r.conflicts.length(), 0);
+    assert.equal(r.leases.length(), 0)
 }
 
 test "unknown type is excluded evidence" {
