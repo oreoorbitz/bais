@@ -81,6 +81,8 @@ class Reduction {
     leases: Lease[],
     submissions: Submission[],
     verifications: Verification[],
+    budgets: Budget[],
+    costs: CostEntry[],
 }
 
 // Fold accumulator (internal): label ops and transition records are kept raw
@@ -116,6 +118,8 @@ class Acc {
     leases: Lease[],
     submissions: Submission[],
     verifications: Verification[],
+    budgets: Budget[],
+    costs: CostEntry[],
 }
 
 function body_string(body: map<string, unknown>, key: string) -> string? {
@@ -404,6 +408,14 @@ function dispatch(acc: Acc, e: WireEvent) -> void {
         apply_accept(acc, e);
     } else if (e.type == "WorkReject") {
         apply_reject(acc, e);
+    } else if (e.type == "BudgetAuthorize") {
+        apply_authorize(acc, e);
+    } else if (e.type == "CostReserve") {
+        apply_reserve(acc, e);
+    } else if (e.type == "CostIncurred") {
+        apply_incurred(acc, e);
+    } else if (e.type == "ReceiptAttach") {
+        apply_receipt(acc, e);
     } else if (event_type_name(e.type) == "unknown" && !is_ephemeral(e.type)) {
         acc.excluded.push(Excluded { event_id: e.id, reason: `unknown-type: ${e.type}` });
     }
@@ -468,6 +480,8 @@ function reduce(events: WireEvent[]) -> Reduction {
         leases: [],
         submissions: [],
         verifications: [],
+        budgets: [],
+        costs: [],
     };
     let max_lc = 0;
     for (let e in ordered) {
@@ -496,6 +510,8 @@ function reduce(events: WireEvent[]) -> Reduction {
         leases: acc.leases,
         submissions: acc.submissions,
         verifications: acc.verifications,
+        budgets: acc.budgets,
+        costs: acc.costs,
     }
 }
 
@@ -661,13 +677,13 @@ test "unadmitted events are evidence, never state" {
 }
 
 test "ephemeral and not-yet-reduced Phase-3 types leave no trace" {
-    // Leases and verify now reduce (see lease.baml, verify.baml);
-    // budget/caps still fall through with no arm until their step lands.
+    // Leases, verify, and budget now reduce (lease/verify/budget.baml);
+    // caps still fall through with no arm until Phase 5 lands.
     let events = [
         wire("TaskCreate", "task:A", 1, "e1", {}),
         wire("Heartbeat", "task:A", 2, "e2", {}),
-        wire("BudgetAuthorize", "task:A", 3, "e3", {}),
-        wire("CapGrant", "task:A", 4, "e4", {}),
+        wire("CapGrant", "task:A", 3, "e3", {}),
+        wire("KeyRotate", "task:A", 4, "e4", {}),
         wire("Progress", "task:A", 5, "e5", {}),
     ];
     let r = reduce(events);
@@ -675,7 +691,8 @@ test "ephemeral and not-yet-reduced Phase-3 types leave no trace" {
     assert.equal(r.excluded.length(), 0);
     assert.equal(r.conflicts.length(), 0);
     assert.equal(r.leases.length(), 0);
-    assert.equal(r.submissions.length(), 0)
+    assert.equal(r.submissions.length(), 0);
+    assert.equal(r.budgets.length(), 0)
 }
 
 test "unknown type is excluded evidence" {
