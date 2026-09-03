@@ -174,6 +174,9 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 		// rows would orphan them from the events they reduced from. Back up
 		// store.db (or export a snapshot) before re-ingesting a live hub.
 		db.exec("DELETE FROM events; DELETE FROM tasks; DELETE FROM rels; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM failures; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM checkpoints;");
+		// Reseed orphans prune floors and bootstrap locks (they reference
+		// deleted event rows) — drop them with the rows.
+		db.exec("DELETE FROM meta WHERE k IN ('prune_anchor', 'author_cursors', 'anchor_reduction', 'bootstrap');");
 		const insEv = db.prepare(
 			"INSERT INTO events(id, author, seq, prev, project, entity, refs, lc, ts, type, body, admitted, drop_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		);
@@ -342,12 +345,36 @@ export type SnapshotCheckpoint = {
 	reducer_version: string;
 };
 
+// Prune anchor (Phase 4, step 13): recorded when the hub deletes covered
+// event rows. The log below `lc` is gone by operator action — future peers
+// bootstrap from the signed checkpoint (signature trust) instead of a
+// recomputed backfill. `verified_at` is the last full recompute proof,
+// taken at prune time before deletion.
+export type PruneAnchor = {
+	checkpoint: string;
+	publisher: string;
+	lc: number;
+	state_root: string;
+	pruned_at: string;
+	verified_at: string;
+};
+
 // Fast-bootstrap snapshot (Phase 4, step 13): the latest checkpoint plus
 // every materialized table. A peer imports this for instant reads, then
 // backfills the covered log and cryptographically verifies state_root
 // before writing (trust-on-first-use reads, verify-before-write).
+// When `anchor` is present the peer pruned below the checkpoint: covered
+// heads are unrecoverable and bootstrap falls back to signature trust.
 export type Snapshot = {
 	checkpoint: SnapshotCheckpoint | null;
+	anchor: PruneAnchor | null;
+	// Live anchor state, attached by the hub (not the file export): the
+	// stored anchor reduction (deleted rows' contribution only) +
+	// per-author chain cursors. Lets a peer bootstrapping from a pruned
+	// hub anchor its tables, floors, and future refreshes exactly —
+	// tables alone cannot re-derive lease expiry or silent-author floors.
+	anchor_state?: any;
+	cursors?: { author: string; seq: number; id: string }[];
 	tables: {
 		tasks: StoredTask[];
 		rels: StoredRel[];
@@ -378,8 +405,16 @@ export function exportSnapshot(issuesDir: string): Snapshot {
 				}
 			: null;
 		const { as_of, completeness } = readAsOfFrom(db);
+		let anchor: PruneAnchor | null = null;
+		try {
+			const raw = getMeta(db, "prune_anchor");
+			anchor = raw ? (JSON.parse(raw) as PruneAnchor) : null;
+		} catch {
+			anchor = null;
+		}
 		return {
 			checkpoint,
+			anchor,
 			tables: {
 				tasks: (db.prepare("SELECT * FROM tasks ORDER BY entity").all() as any[]).map(rowToTask),
 				rels: (db.prepare("SELECT * FROM rels ORDER BY id").all() as any[]).map((r) => ({
@@ -471,53 +506,139 @@ export function importSnapshot(issuesDir: string, snap: Snapshot, peer: string):
 		setMeta(
 			db,
 			"bootstrap",
-			JSON.stringify({ checkpoint_id: cp.id, backfill_before_lc: cp.lc, complete: false, peer }),
+			JSON.stringify({ checkpoint_id: cp.id, backfill_before_lc: cp.lc, complete: false, peer, trust: "pending" }),
 		);
 	} finally {
 		db.close();
 	}
 }
 
+// Merge a pre-prune anchor reduction with a partial reduction over
+// surviving rows (Phase 4, step 13). Sections merge by identity with the
+// partial winning; budgets sum incurred spend across the truncation (caps:
+// partial wins when present, else anchor); anchor leases past expiry are
+// marked expired so reads never resurrect them. Everything else unknown
+// passes through from the partial side.
+export function mergeAnchorReduction(anchor: any, partial: any, maxLc: number): any {
+	const byKey = (arr: any[], key: (x: any) => string): Map<string, any> => {
+		const m = new Map<string, any>();
+		for (const x of arr ?? []) m.set(key(x), x);
+		return m;
+	};
+	const union = (a: any[], p: any[], key: (x: any) => string): any[] => {
+		const m = byKey(a, key);
+		for (const x of p ?? []) m.set(key(x), x);
+		return [...m.values()];
+	};
+	const aIssues = byKey(anchor.issues, (x) => x.entity);
+	for (const x of partial.issues ?? []) aIssues.set(x.entity, x);
+	const aBudgets = byKey(anchor.budgets, (x) => x.principal);
+	for (const p of partial.budgets ?? []) {
+		const a = aBudgets.get(p.principal);
+		aBudgets.set(p.principal, {
+			...p,
+			cap_usd: p.cap_usd ?? a?.cap_usd,
+			cap_tokens: p.cap_tokens ?? a?.cap_tokens,
+			incurred_usd: (a?.incurred_usd ?? 0) + (p.incurred_usd ?? 0),
+			incurred_tokens: (a?.incurred_tokens ?? 0) + (p.incurred_tokens ?? 0),
+		});
+	}
+	const leases = union(anchor.leases, partial.leases, (x) => x.lease_id).map((l) =>
+		l.status === "active" && typeof l.expires_lc === "number" && l.expires_lc <= maxLc ? { ...l, status: "expired" } : l,
+	);
+	return {
+		version: partial.version ?? anchor.version,
+		issues: [...aIssues.values()],
+		rels: union(anchor.rels, partial.rels, (x) => x.id),
+		leases,
+		submissions: union(anchor.submissions, partial.submissions, (x) => x.submit_id),
+		verifications: union(anchor.verifications, partial.verifications, (x) => x.verify_id),
+		budgets: [...aBudgets.values()],
+		costs: union(anchor.costs, partial.costs, (x) => x.entry_id),
+		conflicts: union(anchor.conflicts, partial.conflicts, (x) => JSON.stringify([x.entity, x.field])),
+		excluded: union(anchor.excluded, partial.excluded, (x) => x.event_id),
+		checkpoints: union(anchor.checkpoints, partial.checkpoints, (x) => x.id),
+	};
+}
+
 // Full projection refresh from a reduction (hub + sync path). Unlike
 // ingestIssues this never touches the events table or failures: it
 // re-derives every materialized table, so sync-appended task events land
 // in tasks/rels/conflicts exactly as seeded ones do.
+//
+// Prune-aware: when a prune anchor is recorded, the reduction covers
+// surviving rows only, so tables rebuild from the anchor merged with the
+// partial — pruned state is preserved, new writes layer on top.
 export function refreshProjectionTables(db: DatabaseSync, reduction: any, heads: string[], maxLc: number): void {
+	let effective = reduction;
+	try {
+		const raw = (db.prepare("SELECT v FROM meta WHERE k = 'anchor_reduction'").get() as any)?.v;
+		if (raw) effective = mergeAnchorReduction(JSON.parse(raw), reduction, maxLc);
+	} catch {
+		effective = reduction;
+	}
 	db.exec("DELETE FROM tasks; DELETE FROM rels; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM checkpoints;");
 	const insTask = db.prepare(
 		"INSERT INTO tasks(entity, title, status, kind, area, severity, source, body, labels, comments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 	);
-	for (const t of reduction.issues as any[]) {
+	for (const t of effective.issues as any[]) {
 		insTask.run(t.entity, t.title, t.status, t.kind, t.area, t.severity, t.source, t.body, JSON.stringify(t.labels), JSON.stringify(t.comments));
 	}
 	const insRel = db.prepare("INSERT INTO rels(id, source, type, target) VALUES (?, ?, ?, ?)");
-	for (const r of reduction.rels as any[]) insRel.run(r.id, r.source, r.type, r.target);
+	for (const r of effective.rels as any[]) insRel.run(r.id, r.source, r.type, r.target);
 	const insConf = db.prepare("INSERT INTO conflicts(entity, field, options, winner, event_ids, at_lc) VALUES (?, ?, ?, ?, ?, ?)");
-	for (const c of reduction.conflicts as any[]) {
+	for (const c of effective.conflicts as any[]) {
 		insConf.run(c.entity, c.field, JSON.stringify(c.options), c.winner, JSON.stringify(c.event_ids), c.at_lc);
 	}
 	const insExcl = db.prepare("INSERT INTO excluded(event_id, reason) VALUES (?, ?)");
-	for (const x of reduction.excluded as any[]) insExcl.run(x.event_id, x.reason);
+	for (const x of effective.excluded as any[]) insExcl.run(x.event_id, x.reason);
 	const insLease = db.prepare("INSERT INTO leases(id, task, holder, epoch, expires_at, read_set) VALUES (?, ?, ?, ?, ?, ?)");
-	for (const l of (reduction.leases as any[]) ?? []) {
+	for (const l of (effective.leases as any[]) ?? []) {
 		if (l.status === "active") insLease.run(l.lease_id, l.entity, l.holder, l.epoch, "", JSON.stringify(l.read_set));
 	}
 	const submitTask = new Map<string, string>();
-	for (const s of (reduction.submissions as any[]) ?? []) submitTask.set(s.submit_id, s.entity);
+	for (const s of (effective.submissions as any[]) ?? []) submitTask.set(s.submit_id, s.entity);
 	const insVerify = db.prepare("INSERT INTO verifies(id, task, submit_ref, verdict, verifier) VALUES (?, ?, ?, ?, ?)");
-	for (const v of (reduction.verifications as any[]) ?? []) {
+	for (const v of (effective.verifications as any[]) ?? []) {
 		insVerify.run(v.verify_id, submitTask.get(v.submit_id) ?? "", v.submit_id, v.verdict, v.verifier);
 	}
 	const insBudget = db.prepare("INSERT INTO budgets(principal, cap, incurred) VALUES (?, ?, ?)");
-	for (const b of (reduction.budgets as any[]) ?? []) insBudget.run(b.principal, b.cap_usd, b.incurred_usd);
+	for (const b of (effective.budgets as any[]) ?? []) insBudget.run(b.principal, b.cap_usd, b.incurred_usd);
 	const insCp = db.prepare("INSERT INTO checkpoints(id, publisher, lc, state_root, heads, reducer_version) VALUES (?, ?, ?, ?, ?, ?)");
-	for (const c of (reduction.checkpoints as any[]) ?? []) {
+	for (const c of (effective.checkpoints as any[]) ?? []) {
 		insCp.run(c.id, c.publisher, c.lc, c.state_root, JSON.stringify(c.heads), c.reducer_version);
 	}
 	setMeta(db, "as_of", JSON.stringify({ heads, lc: maxLc, wall_ts: new Date().toISOString() }));
 }
 
-export function readBootstrap(issuesDir: string): { checkpoint_id: string; backfill_before_lc: number; complete: boolean; peer: string } | null {
+// Anchor inherited from a snapshot import (signature-trust bootstrap):
+// the peer's anchor reduction (deleted rows' contribution, disjoint from
+// the replicated delta) + chain cursors, so tables, floors, and future
+// refreshes behave exactly as if the covered log were local.
+export function recordImportedAnchor(
+	issuesDir: string,
+	anchor: PruneAnchor,
+	reduction: any,
+	cursors: { author: string; seq: number; id: string }[],
+): void {
+	const db = openDb(issuesDir);
+	try {
+		const upsert = db.prepare("INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v");
+		upsert.run("prune_anchor", JSON.stringify({ ...anchor, source: "snapshot-import" }));
+		upsert.run("anchor_reduction", JSON.stringify(reduction));
+		const floors: Record<string, { seq: number; id: string }> = {};
+		for (const c of cursors) {
+			const cur = floors[c.author];
+			if (!cur || c.seq > cur.seq) floors[c.author] = { seq: c.seq, id: c.id };
+		}
+		upsert.run("author_cursors", JSON.stringify(floors));
+	} finally {
+		db.close();
+	}
+}
+
+export type BootstrapTrust = "pending" | "recomputed" | "signature";
+export function readBootstrap(issuesDir: string): { checkpoint_id: string; backfill_before_lc: number; complete: boolean; peer: string; trust: BootstrapTrust } | null {
 	const db = openDb(issuesDir);
 	try {
 		const raw = getMeta(db, "bootstrap");
@@ -527,13 +648,14 @@ export function readBootstrap(issuesDir: string): { checkpoint_id: string; backf
 	}
 }
 
-export function markBootstrapComplete(issuesDir: string): void {
+export function markBootstrapComplete(issuesDir: string, trust: BootstrapTrust = "recomputed"): void {
 	const db = openDb(issuesDir);
 	try {
 		const raw = getMeta(db, "bootstrap");
 		if (!raw) return;
 		const b = JSON.parse(raw) as any;
 		b.complete = true;
+		b.trust = trust;
 		setMeta(db, "bootstrap", JSON.stringify(b));
 	} finally {
 		db.close();
