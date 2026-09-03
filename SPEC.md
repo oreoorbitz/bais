@@ -162,9 +162,10 @@ Scope = text before `#` (`bi#04` → `bi`); an id with no `#` is local scope.
 ## 4. CLI contract
 
 `bais list | ready | check [--json]` plus `bais ingest` and `bais graph`,
-`bais hub | keygen | checkpoint | snapshot | sync`. JSON output goes to
-stdout; diagnostics to stderr. Machine consumers MUST pass
-`--json` and parse stdout.
+`bais hub | keygen | checkpoint | snapshot | sync`,
+`bais oversight | sample | caps [--json]`, `bais grant | revoke --hub`,
+`bais mcp`. JSON output goes to stdout; diagnostics to stderr. Machine
+consumers MUST pass `--json` and parse stdout.
 
 Reads prefer the SQLite projection (`.bais/store.db`, built by `bais ingest`
 from the TOML seed through the BAML reducer) and fall back to the directory
@@ -221,10 +222,43 @@ even when empty.
 ### 4.4 Errors
 
 No `.bais` directory → stderr `No .bais — run bais init`, exit 1.
-`bais init` creates `.bais/issues/` + `config.toml`. (`new`/`move`/`graph`
+`bais init` creates `.bais/issues/` + `config.toml`. (`new`/`move`
 subcommands are reserved, not yet implemented.)
 
-### 4.5 Hub, keys, checkpoints, sync
+### 4.5 Capabilities, oversight, MCP
+
+- `bais grant <audience> --can a,b --scope S --expiry-lc N [--budget-usd
+  X --budget-tokens Y --issuer DID] --hub URL` issues a `CapGrant`
+  through the live hub (single writer, correct chains). The issuer
+  defaults to the hub key; anyone else needs `cap.admin` over the scope
+  when the hub runs with `requireCaps` (off by default — trusted-local
+  coordinator). Strict deployments issue signed grants via `POST /sync`.
+- `bais revoke <grant-id> --revoker DID --hub URL` is the kill switch:
+  revocation is fail-open by design (no cap check); BAML admits only
+  issuer- or audience-authored revokes, strangers get `revoke-denied`,
+  re-revoke is an idempotent no-op. Revocation is sticky per grant id —
+  only a NEW grant event re-enables.
+- `bais caps [--audience DID] [--json]` reads the capability projection
+  (live + revoked). `GET /caps[?audience=]` on the hub serves the
+  causal-position-correct head view.
+- `bais oversight [--json]` prints the exception feeds: `conflicts`,
+  `budget_overruns` (spend past cap), `unverified_submits` (submitted
+  with no accept verdict), `stalled_leases` (active past `expires_lc`),
+  `caps_over_budget` (audience spend past the grant's `budget_cap_usd`).
+  `GET /oversight` serves the same shape.
+- `bais sample <n> [--seed S] [--json]` returns a deterministic (FNV-1a
+  over seed+entity) sample of `Done` work for human review.
+  Reproducible beats random for audits.
+- Approval rule: a task carrying the `needs-human` label cannot
+  transition to `Dropped` (`needs-approval` exclusion). Removing the
+  label IS the approval — the `LabelRemove` event is the audit trail.
+- `bais mcp` serves the MCP tool surface over stdio (Content-Length
+  framed JSON-RPC 2.0): `initialize`, `tools/list`, `tools/call` for
+  `bais_list|ready|graph|check|oversight|sample`. Tool specs
+  (name/description/input_schema) come from BAML `mcp_tools()`; the host
+  executes against the projection. Stdout is protocol bytes only.
+
+### 4.6 Hub, keys, checkpoints, sync
 
 - `bais keygen [--force]` creates `.bais/key.json` (ed25519 peer
   identity, mode 600, `did:key` form). The hub and local CLI sign as the
@@ -236,7 +270,11 @@ subcommands are reserved, not yet implemented.)
   (`{checkpoint, verified, history: "complete"|"pruned", anchor}`),
   `GET /snapshot`, `GET|POST /sync`, `GET /sync/digest`,
   `POST /pub` + `GET /pub` + `GET /pub/stream` (ephemeral only),
-  `POST /prune` (truncate below a checkpoint — see §4.1).
+  `POST /prune` (truncate below a checkpoint — see §4.1),
+  `POST /grant` (issues a `CapGrant` as the hub key; 403 when the
+  issuer lacks `cap.admin` under `requireCaps`), `POST /revoke`
+  (fail-open kill switch — see §4.5), `GET /caps[?audience=]`,
+  `GET /oversight` (exception feeds — see §4.5).
 - `bais checkpoint` publishes a signed `{state_root, heads[],
   reducer_version}` over the current log. `GET /checkpoint` recomputes
   the root live — `verified: false` with `history: "complete"` is a
