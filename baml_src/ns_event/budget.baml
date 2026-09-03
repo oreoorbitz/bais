@@ -54,11 +54,16 @@ class CostEntry {
 }
 
 function body_float(body: map<string, unknown>, key: string) -> float? {
+    // Integer-valued JS numbers never narrow to float over the bridge
+    // (same gap as arrays), so the int arm + 0.0 keeps whole-dollar
+    // amounts working from hosts. BAML-native floats take the first arm.
     let v = body.get(key);
     if (v == null) {
         null
     } else if let f: float = v {
         f
+    } else if let i: int = v {
+        i + 0.0
     } else {
         null
     }
@@ -265,6 +270,16 @@ test "authorize sets the cap, latest wins, bad caps excluded" {
     let _ = missing.set("cap_usd", 1.0);
     let mis = reduce([wire("BudgetAuthorize", "did:key:z6Mk-alice", 1, "e1", missing)]);
     assert.equal(mis.excluded[0].reason, "missing-cap")
+}
+
+test "integer amounts narrow to float (bridge whole numbers)" {
+    // Hosts send 10, not 10.0 — over the bridge the two differ.
+    let b: map<string, unknown> = {};
+    let _ = b.set("cap_usd", 10);
+    let _ = b.set("cap_tokens", 100);
+    let r = reduce([wire("BudgetAuthorize", "did:key:z6Mk-alice", 1, "e1", b)]);
+    assert.equal(r.excluded.length(), 0);
+    assert.equal(only_budget(r).cap_usd, 10.0)
 }
 
 test "reserve fits the cap in both dimensions or is excluded" {

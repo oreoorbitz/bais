@@ -60,21 +60,24 @@ function find_verification(acc: Acc, verify_id: string) -> Verification? {
 }
 
 function apply_submit(acc: Acc, e: WireEvent) -> void {
-    let evidence = body_strings(e.body, "evidence");
     if (!lease_fence_ok(acc, e.entity, e.lc, body_int(e.body, "fencing"))) {
         acc.excluded.push(Excluded { event_id: e.id, reason: "stale-fence" });
-    } else if (evidence.length() == 0) {
-        acc.excluded.push(Excluded { event_id: e.id, reason: "missing-evidence" });
+    } else if let evidence: string[] = body_string_list(e.body, "evidence") {
+        if (evidence.length() == 0) {
+            acc.excluded.push(Excluded { event_id: e.id, reason: "missing-evidence" });
+        } else {
+            acc.submissions.push(
+                Submission {
+                    submit_id: e.id,
+                    entity: e.entity,
+                    producer: e.author,
+                    evidence: evidence,
+                    status: "submitted",
+                },
+            );
+        }
     } else {
-        acc.submissions.push(
-            Submission {
-                submit_id: e.id,
-                entity: e.entity,
-                producer: e.author,
-                evidence: evidence,
-                status: "submitted",
-            },
-        );
+        acc.excluded.push(Excluded { event_id: e.id, reason: "missing-evidence" });
     }
 }
 
@@ -113,40 +116,43 @@ function apply_verify(acc: Acc, e: WireEvent) -> void {
 }
 
 function apply_accept(acc: Acc, e: WireEvent) -> void {
-    let refs = body_strings(e.body, "verify_refs");
-    if (refs.length() == 0) {
-        acc.excluded.push(Excluded { event_id: e.id, reason: "missing-verify-refs" });
-    } else {
-        let ok = true;
-        for (let ref in refs) {
-            if let v: Verification = find_verification(acc, ref) {
-                if let s: Submission = find_submission(acc, v.submit_id) {
-                    if (s.entity != e.entity) {
-                        acc.excluded.push(Excluded { event_id: e.id, reason: "foreign-ref" });
-                        ok = false;
-                    } else if (v.verdict != "accept") {
-                        acc.excluded.push(Excluded { event_id: e.id, reason: "reject-ref" });
+    if let refs: string[] = body_string_list(e.body, "verify_refs") {
+        if (refs.length() == 0) {
+            acc.excluded.push(Excluded { event_id: e.id, reason: "missing-verify-refs" });
+        } else {
+            let ok = true;
+            for (let ref in refs) {
+                if let v: Verification = find_verification(acc, ref) {
+                    if let s: Submission = find_submission(acc, v.submit_id) {
+                        if (s.entity != e.entity) {
+                            acc.excluded.push(Excluded { event_id: e.id, reason: "foreign-ref" });
+                            ok = false;
+                        } else if (v.verdict != "accept") {
+                            acc.excluded.push(Excluded { event_id: e.id, reason: "reject-ref" });
+                            ok = false;
+                        }
+                    } else {
+                        acc.excluded.push(Excluded { event_id: e.id, reason: "unknown-submit" });
                         ok = false;
                     }
                 } else {
-                    acc.excluded.push(Excluded { event_id: e.id, reason: "unknown-submit" });
+                    acc.excluded.push(Excluded { event_id: e.id, reason: "unknown-verify-ref" });
                     ok = false;
                 }
-            } else {
-                acc.excluded.push(Excluded { event_id: e.id, reason: "unknown-verify-ref" });
-                ok = false;
             }
-        }
-        if (ok) {
-            for (let ref in refs) {
-                // Idempotent: re-accepting an accepted submit is a no-op.
-                if let v: Verification = find_verification(acc, ref) {
-                    if let s: Submission = find_submission(acc, v.submit_id) {
-                        s.status = "accepted";
+            if (ok) {
+                for (let ref in refs) {
+                    // Idempotent: re-accepting an accepted submit is a no-op.
+                    if let v: Verification = find_verification(acc, ref) {
+                        if let s: Submission = find_submission(acc, v.submit_id) {
+                            s.status = "accepted";
+                        }
                     }
                 }
             }
         }
+    } else {
+        acc.excluded.push(Excluded { event_id: e.id, reason: "missing-verify-refs" });
     }
 }
 
@@ -199,6 +205,25 @@ test "submit with evidence is submitted, without is excluded" {
     let bare = reduce([wire("WorkSubmit", "task:A", 1, "e1", submit_body([]))]);
     assert.equal(bare.submissions.length(), 0);
     assert.equal(bare.excluded[0].reason, "missing-evidence")
+}
+
+test "hosts send evidence and refs JSON-encoded" {
+    let sb: map<string, unknown> = {};
+    let _ = sb.set("evidence", "[\"cid:abc\"]");
+    let r = reduce([wire("WorkSubmit", "task:A", 1, "e1", sb, author = "did:key:z6Mk-alice")]);
+    assert.equal(r.excluded.length(), 0);
+    assert.equal(only_submission(r).evidence[0], "cid:abc");
+    let ab: map<string, unknown> = {};
+    let _ = ab.set("verify_refs", "[\"e2\"]");
+    let ok = reduce(
+        [
+            wire("WorkSubmit", "task:A", 1, "e1", sb, author = "did:key:z6Mk-alice"),
+            wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "accept"), author = "did:key:z6Mk-bob"),
+            wire("WorkAccept", "task:A", 3, "e3", ab),
+        ],
+    );
+    assert.equal(ok.excluded.length(), 0);
+    assert.equal(only_submission(ok).status, "accepted")
 }
 
 test "submit on a leased task needs the fencing echo" {

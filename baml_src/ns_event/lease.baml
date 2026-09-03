@@ -44,14 +44,24 @@ class Lease {
     status: string @description("active | released | expired | superseded"),
 }
 
-function body_strings(body: map<string, unknown>, key: string) -> string[] {
+// Lists cross the host boundary as JSON text: over the TS→BAML bridge,
+// a JS array inside map<string,unknown> never narrows to string[] (and
+// an integer-valued JS number never narrows to float) — BAML-native
+// callers are unaffected, hence the dual path. Hosts MUST JSON-encode
+// list bodies (hub encodeBodyArrays does this centrally); BAML-native
+// callers may pass real arrays. Malformed JSON counts as missing.
+function body_string_list(body: map<string, unknown>, key: string) -> string[]? {
     let v = body.get(key);
     if (v == null) {
-        []
+        null
     } else if let l: string[] = v {
         l
+    } else if let s: string = v {
+        baml.json.from_string<string[]>(s) catch_all (e) {
+            _ => null
+        }
     } else {
-        []
+        null
     }
 }
 
@@ -105,7 +115,7 @@ function apply_claim(acc: Acc, e: WireEvent) -> void {
                             fencing: e.lc,
                             ttl: ttl,
                             expires_lc: e.lc + ttl,
-                            read_set: body_strings(e.body, "read_set"),
+                            read_set: body_string_list(e.body, "read_set") ?? [],
                             idem: idem,
                             status: "active",
                         },
@@ -125,7 +135,7 @@ function apply_claim(acc: Acc, e: WireEvent) -> void {
                         fencing: e.lc,
                         ttl: ttl,
                         expires_lc: e.lc + ttl,
-                        read_set: body_strings(e.body, "read_set"),
+                        read_set: body_string_list(e.body, "read_set") ?? [],
                         idem: idem,
                         status: "active",
                     },
@@ -463,6 +473,22 @@ test "fenced transition passes, unfenced or stale fence is excluded" {
     );
     assert.equal(stale.excluded.length(), 1);
     assert.equal(stale.excluded[0].reason, "stale-fence")
+}
+
+test "hosts send read_set JSON-encoded (bridge arrays do not narrow)" {
+    let b = claim_body(100, 0, "a1");
+    let _ = b.set("read_set", "[\"task:B\",\"task:C\"]");
+    let r = reduce([wire("LeaseClaim", "task:A", 1, "e1", b, author = "did:key:z6Mk-alice")]);
+    assert.equal(r.excluded.length(), 0);
+    let l = only_lease(r);
+    assert.equal(l.read_set.length(), 2);
+    assert.equal(l.read_set[1], "task:C");
+    // Malformed JSON counts as missing, not as a crash.
+    let bad = claim_body(100, 0, "a2");
+    let _ = bad.set("read_set", "nope[");
+    let r2 = reduce([wire("LeaseClaim", "task:A", 1, "e1", bad, author = "did:key:z6Mk-alice")]);
+    assert.equal(r2.excluded.length(), 0);
+    assert.equal(only_lease(r2).read_set.length(), 0)
 }
 
 test "claim without ttl or idem is excluded, not defaulted" {

@@ -39,24 +39,27 @@ class Checkpoint {
 
 function apply_checkpoint(acc: Acc, e: WireEvent) -> void {
     if let root: string = body_string(e.body, "state_root") {
-        let heads = body_strings(e.body, "heads");
-        if let version: string = body_string(e.body, "reducer_version") {
-            if let at: int = body_int(e.body, "lc") {
-                if (root == "" || heads.length() == 0) {
-                    acc.excluded.push(Excluded { event_id: e.id, reason: "missing-checkpoint-field" });
-                } else if (version != reducer_version()) {
-                    acc.excluded.push(Excluded { event_id: e.id, reason: "version-skew" });
+        if let heads: string[] = body_string_list(e.body, "heads") {
+            if let version: string = body_string(e.body, "reducer_version") {
+                if let at: int = body_int(e.body, "lc") {
+                    if (root == "" || heads.length() == 0) {
+                        acc.excluded.push(Excluded { event_id: e.id, reason: "missing-checkpoint-field" });
+                    } else if (version != reducer_version()) {
+                        acc.excluded.push(Excluded { event_id: e.id, reason: "version-skew" });
+                    } else {
+                        acc.checkpoints.push(
+                            Checkpoint {
+                                id: e.id,
+                                publisher: e.author,
+                                lc: at,
+                                state_root: root,
+                                heads: heads,
+                                reducer_version: version,
+                            },
+                        );
+                    }
                 } else {
-                    acc.checkpoints.push(
-                        Checkpoint {
-                            id: e.id,
-                            publisher: e.author,
-                            lc: at,
-                            state_root: root,
-                            heads: heads,
-                            reducer_version: version,
-                        },
-                    );
+                    acc.excluded.push(Excluded { event_id: e.id, reason: "missing-checkpoint-field" });
                 }
             } else {
                 acc.excluded.push(Excluded { event_id: e.id, reason: "missing-checkpoint-field" });
@@ -93,6 +96,17 @@ test "valid checkpoint records with publisher and coverage" {
     assert.equal(c.state_root, "ab12");
     assert.equal(c.heads.length(), 1);
     assert.equal(c.reducer_version, "bais.reduce@1")
+}
+
+test "hosts send heads JSON-encoded" {
+    let b: map<string, unknown> = {};
+    let _ = b.set("state_root", "ab12");
+    let _ = b.set("heads", "[\"e0\",\"e9\"]");
+    let _ = b.set("reducer_version", "bais.reduce@1");
+    let _ = b.set("lc", 4);
+    let r = reduce([wire("CheckpointPublish", "task:A", 5, "e1", b)]);
+    assert.equal(r.excluded.length(), 0);
+    assert.equal(only_checkpoint(r).heads.length(), 2)
 }
 
 test "checkpoint with missing fields is excluded" {
