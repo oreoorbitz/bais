@@ -339,6 +339,57 @@ let anchorId = "";
 	check(storeList(dirA).tasks.length > 0, "tables intact after second prune");
 }
 
+// --- capabilities: grant -> write, revoke -> kill switch (in-process HTTP;
+// requireCaps hub; CLI oversight/sample/caps are local-only children) ---
+{
+	const dirF = join(root, "f", ".bais", "issues");
+	mkdirSync(dirF, { recursive: true });
+	writeFileSync(join(dirF, "t1.toml"), `id = "t1"\ntitle = "caps"\nstatus = "Open"\nkind = "Feat"\nbody = "x"\n`);
+	await ingestIssues(dirF);
+	const { createHub: capHub } = await import(`${BAIS}/dist/src/hub.js`);
+	const { hub: hubF } = await capHub(dirF, { port: 0, limits: { requireCaps: true } });
+	const baseF = `http://127.0.0.1:${hubF.port}`;
+	const postF = async (path, body) => {
+		const r = await fetch(baseF + path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+		return { status: r.status, json: await r.json() };
+	};
+	const AUD = "did:key:captest";
+	const denied = await postF("/claim", { task: "t1", holder: AUD, ttl: 100, epoch: 0, idem: "c0" });
+	check(denied.status === 403 && denied.json.reason === "cap-denied", "writes need a capability when requireCaps");
+	const grant = await postF("/grant", { audience: AUD, can: ["lease.claim"], scope: "*", expiry_lc: 1000000 });
+	check(grant.status === 200 && !!grant.json.grant_id, "grant issued");
+	const allowed = await postF("/claim", { task: "t1", holder: AUD, ttl: 100, epoch: 0, idem: "c1" });
+	check(allowed.status === 200 && !!allowed.json.lease_id, "live grant unlocks the write");
+	const caps1 = await (await fetch(`${baseF}/caps?audience=${AUD}`)).json();
+	check(caps1.caps.length === 1 && caps1.caps[0].revoked === false, "caps view shows the live grant");
+	const stranger = await postF("/revoke", { grant_ref: grant.json.grant_id, revoker: "did:key:mallory" });
+	check(stranger.status === 409 && /revoke-denied/.test(stranger.json.reason ?? stranger.json.error ?? ""), "stranger revoke refused on live grant");
+	const revoke = await postF("/revoke", { grant_ref: grant.json.grant_id, revoker: AUD });
+	check(revoke.status === 200, "audience self-revoke admitted (kill switch)");
+	const denied2 = await postF("/claim", { task: "t1", holder: AUD, ttl: 100, epoch: 1, idem: "c2" });
+	check(denied2.status === 403, "revocation sticks — write denied again");
+	const caps2 = await (await fetch(`${baseF}/caps?audience=${AUD}`)).json();
+	check(caps2.caps[0].revoked === true, "caps view shows the revocation");
+
+	const over = await (await fetch(`${baseF}/oversight`)).json();
+	check(Array.isArray(over.conflicts) && Array.isArray(over.unverified_submits) && Array.isArray(over.stalled_leases) && Array.isArray(over.budget_overruns), "oversight feeds served");
+	await hubF.close();
+	const cli = resolve(BAIS, "dist/src/cli.js");
+	const run = (args) => {
+		try {
+			return { out: execFileSync("node", [cli, ...args], { cwd: join(root, "f"), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }) };
+		} catch (e) {
+			return { err: e.status };
+		}
+	};
+	const o = run(["oversight", "--json"]);
+	check(!!o.out && JSON.parse(o.out).as_of !== undefined, "CLI oversight reads the projection");
+	const s = run(["sample", "5", "--json"]);
+	check(!!s.out && JSON.parse(s.out).total !== undefined, "CLI sample reads the projection");
+	const c = run(["caps", "--json"]);
+	check(!!c.out && Array.isArray(JSON.parse(c.out).caps), "CLI caps reads the projection");
+}
+
 await hubA.close();
 if (failures) {
 	console.error(`${failures} failure(s)`);

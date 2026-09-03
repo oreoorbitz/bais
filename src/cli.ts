@@ -9,11 +9,11 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cyclicIds, danglingRefsIn, loadIssues, projectName, readyIssues } from "./graph.js";
-import { hasStore, ingestIssues, storeCheck, storeEdges, storeGraph, storeList, storeReady } from "./store.js";
+import { hasStore, ingestIssues, storeCaps, storeCheck, storeEdges, storeGraph, storeList, storeOversight, storeReady, storeSample } from "./store.js";
 import { createHub } from "./hub.js";
 import { loadPeerKey, appendForeignEvents, publishCheckpoint, verifyCheckpointRoot } from "./hub.js";
 import { exportSnapshot, importSnapshot, markBootstrapComplete, recordImportedAnchor } from "./store.js";
-import { event } from "../baml_sdk/index.js";
+import { event, mcp_tools } from "../baml_sdk/index.js";
 
 const root = ".bais";
 const issuesDir = join(root, "issues");
@@ -33,6 +33,11 @@ Usage:
   bais checkpoint                   # publish a signed state snapshot
   bais snapshot [--out <file>]      # export fast-bootstrap snapshot JSON
   bais sync --from <url>            # snapshot import + backfill-verify + delta
+  bais oversight [--json]           # exception feeds (conflicts, overruns, unverified, stalled, caps)
+  bais sample <n> [--seed s]        # deterministic sample of Done work for review
+  bais caps [--audience did]        # live capability view
+  bais grant <aud> --can a,b --scope S --expiry-lc N --hub URL
+  bais revoke <grant-id> --revoker did --hub URL   # the kill switch
 
 Not yet implemented:
   bais new "title" --kind bug [--area bridge/ffi] [--status open]
@@ -295,6 +300,230 @@ if (cmd === "snapshot") {
 		console.log(text);
 	}
 	process.exit(0);
+}
+
+if (cmd === "oversight") {
+	// Exception feeds, queryable not scrollable (Phase 5, step 16).
+	// Local-first: reads the projection, no hub needed.
+	ensureInit();
+	if (!useStore) {
+		console.error("oversight needs .bais/store.db — run bais ingest");
+		process.exit(1);
+	}
+	const o = storeOversight(issuesDir);
+	if (asJson) {
+		console.log(JSON.stringify(o, null, 2));
+	} else {
+		console.log(`conflicts\t${o.conflicts.length}`);
+		for (const c of o.conflicts) console.log(`  ${c.entity}\t${c.field}\t${c.options.join("|")}\t@lc${c.at_lc}`);
+		console.log(`budget_overruns\t${o.budget_overruns.length}`);
+		for (const b of o.budget_overruns) console.log(`  ${b.principal}\t${b.incurred} > ${b.cap}`);
+		console.log(`unverified_submits\t${o.unverified_submits.length}`);
+		for (const s of o.unverified_submits) console.log(`  ${s.submit_id}\t${s.task}\tby ${s.producer}`);
+		console.log(`stalled_leases\t${o.stalled_leases.length}`);
+		for (const l of o.stalled_leases) console.log(`  ${l.id}\t${l.task}\tholder ${l.holder}`);
+		console.log(`caps_over_budget\t${o.caps_over_budget.length}`);
+		for (const c of o.caps_over_budget) console.log(`  ${c.grant_id}\t${c.audience}\tspent ${c.incurred} > cap ${c.budget_cap_usd}`);
+	}
+	process.exit(0);
+}
+
+if (cmd === "sample") {
+	// Deterministic sample of completed (Done) work for human review.
+	ensureInit();
+	if (!useStore) {
+		console.error("sample needs .bais/store.db — run bais ingest");
+		process.exit(1);
+	}
+	const n = Number(argv[1] ?? "5");
+	const seedIdx = argv.indexOf("--seed");
+	const seed = seedIdx !== -1 ? Number(argv[seedIdx + 1] ?? "0") : 0;
+	if (!Number.isInteger(n) || n < 0) {
+		console.error("sample needs <n> (non-negative integer)");
+		process.exit(1);
+	}
+	const { sample, total } = storeSample(issuesDir, n, Number.isInteger(seed) ? seed : 0);
+	if (asJson) console.log(JSON.stringify({ sample, total, n, seed }, null, 2));
+	else for (const t of sample) console.log(`${t.entity}\t${t.title}`);
+	process.exit(0);
+}
+
+if (cmd === "caps") {
+	// Live capability view from the projection.
+	ensureInit();
+	if (!useStore) {
+		console.error("caps needs .bais/store.db — run bais ingest");
+		process.exit(1);
+	}
+	const audIdx = argv.indexOf("--audience");
+	const aud = audIdx !== -1 ? argv[audIdx + 1] : undefined;
+	let caps = storeCaps(issuesDir);
+	if (aud) caps = caps.filter((c) => c.audience === aud);
+	if (asJson) console.log(JSON.stringify({ caps }, null, 2));
+	else for (const c of caps) console.log(`${c.revoked ? "revoked" : "live"}\t${c.grant_id}\t${c.audience}\t${c.can.join(",")}\t${c.scope}`);
+	process.exit(0);
+}
+
+if (cmd === "grant" || cmd === "revoke") {
+	// Issuance goes through the live hub (single writer, correct chains).
+	// The kill switch is `bais revoke` — revocation is fail-open by design.
+	ensureInit();
+	const hubIdx = argv.indexOf("--hub");
+	const hub = hubIdx !== -1 ? argv[hubIdx + 1] : undefined;
+	if (!hub) {
+		console.error(`bais ${cmd} requires --hub <url> (issuance is a hub write)`);
+		process.exit(1);
+	}
+	const post = async (path: string, body: unknown): Promise<any> => {
+		const r = await fetch(`${hub}${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+		const j = (await r.json()) as any;
+		if (!r.ok) throw new Error(j.error ?? j.reason ?? r.status);
+		return j;
+	};
+	const opt = (name: string): string | undefined => {
+		const i = argv.indexOf(name);
+		return i !== -1 ? argv[i + 1] : undefined;
+	};
+	try {
+		if (cmd === "grant") {
+			const audience = argv[1];
+			const can = (opt("--can") ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+			const scope = opt("--scope") ?? "*";
+			const expiry = Number(opt("--expiry-lc") ?? "");
+			if (!audience || !can.length || !Number.isInteger(expiry)) {
+				console.error("bais grant <audience> --can a,b --scope S --expiry-lc N [--budget-usd X --budget-tokens Y --issuer DID --hub URL]");
+				process.exit(1);
+			}
+			const body: Record<string, unknown> = { audience, can, scope, expiry_lc: expiry };
+			const bu = opt("--budget-usd");
+			const bt = opt("--budget-tokens");
+			if (bu !== undefined) body.budget_cap_usd = Number(bu);
+			if (bt !== undefined) body.budget_cap_tokens = Number(bt);
+			const issuer = opt("--issuer");
+			if (issuer) body.issuer = issuer;
+			const j = await post("/grant", body);
+			console.log(`granted\t${j.grant_id}\t${audience}\t${scope}`);
+		} else {
+			const ref = argv[1];
+			const revoker = opt("--revoker");
+			if (!ref || !revoker) {
+				console.error("bais revoke <grant-id> --revoker DID --hub URL");
+				process.exit(1);
+			}
+			const j = await post("/revoke", { grant_ref: ref, revoker });
+			console.log(`revoked\t${j.revoked}\tby ${j.by}`);
+		}
+	} catch (e: any) {
+		console.error(`${cmd}: ${String(e?.message ?? e).split("\n")[0]}`);
+		process.exit(1);
+	}
+	process.exit(0);
+}
+
+if (cmd === "mcp") {
+	// MCP server over stdio (Phase 5, step 17): Content-Length framed
+	// JSON-RPC 2.0. Tool specs come from BAML (names/descriptions/schemas);
+	// execution is local projection reads. Logs go to stderr — stdout is
+	// protocol bytes only.
+	ensureInit();
+	const specs = (await (mcp_tools as any)()) as { name: string; description: string; input_schema: unknown }[];
+	const text = (v: unknown): { content: { type: string; text: string }[] } => ({
+		content: [{ type: "text", text: JSON.stringify(v, null, 2) }],
+	});
+	const callTool = (name: string, args: any): unknown => {
+		switch (name) {
+			case "bais_list":
+				return text(storeList(issuesDir));
+			case "bais_ready": {
+				const { ready, as_of, completeness } = storeReady(issuesDir);
+				const edges = storeEdges(issuesDir);
+				return text({
+					ready: ready.map((t) => ({
+						issue: { id: t.entity, title: t.title, status: t.status, kind: t.kind, area: t.area, severity: t.severity, source: t.source, body: t.body },
+						edges: edges.filter((e) => e.declaredBy === t.entity),
+					})),
+					as_of,
+					completeness,
+				});
+			}
+			case "bais_graph": {
+				if (!args || typeof args.from !== "string") throw Object.assign(new Error("graph needs {from}"), { code: -32602 });
+				const { nodes, as_of, completeness } = storeGraph(issuesDir, args.from);
+				return text({ from: args.from, nodes, as_of, completeness });
+			}
+			case "bais_check":
+				return text(storeCheck(issuesDir));
+			case "bais_oversight":
+				return text(storeOversight(issuesDir));
+			case "bais_sample": {
+				const n = Number(args?.n ?? 5);
+				const seed = Number(args?.seed ?? 0);
+				if (!Number.isInteger(n) || n < 0 || !Number.isInteger(seed)) {
+					throw Object.assign(new Error("sample needs {n} and optional {seed}"), { code: -32602 });
+				}
+				return text({ ...storeSample(issuesDir, n, seed), n, seed });
+			}
+			default:
+				throw Object.assign(new Error(`unknown tool: ${name}`), { code: -32602 });
+		}
+	};
+	const sendMsg = (obj: unknown): void => {
+		const b = Buffer.from(JSON.stringify(obj), "utf8");
+		process.stdout.write(`Content-Length: ${b.length}\r\n\r\n`);
+		process.stdout.write(b);
+	};
+	const route = async (method: string, params: any): Promise<unknown> => {
+		if (method === "initialize") {
+			return { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "bais", version: "0.0.0" } };
+		}
+		if (method === "ping") return {};
+		if (method === "tools/list") {
+			return { tools: specs.map((s) => ({ name: s.name, description: s.description, inputSchema: s.input_schema })) };
+		}
+		if (method === "tools/call") {
+			return callTool(params?.name, params?.arguments ?? {});
+		}
+		throw Object.assign(new Error(`method not found: ${method}`), { code: -32601 });
+	};
+	let buf = Buffer.alloc(0);
+	const pump = (): void => {
+		for (;;) {
+			const hi = buf.indexOf("\r\n\r\n");
+			if (hi === -1) return;
+			const m = /content-length:\s*(\d+)/i.exec(buf.subarray(0, hi).toString("utf8"));
+			if (!m) {
+				buf = buf.subarray(hi + 4);
+				continue;
+			}
+			const len = Number(m[1]);
+			if (buf.length < hi + 4 + len) return;
+			const body = buf.subarray(hi + 4, hi + 4 + len).toString("utf8");
+			buf = buf.subarray(hi + 4 + len);
+			void (async () => {
+				let msg: any;
+				try {
+					msg = JSON.parse(body);
+				} catch {
+					sendMsg({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+					return;
+				}
+				if (msg.id === undefined) return; // notification — no response
+				try {
+					sendMsg({ jsonrpc: "2.0", id: msg.id, result: await route(msg.method, msg.params ?? {}) });
+				} catch (e: any) {
+					sendMsg({ jsonrpc: "2.0", id: msg.id, error: { code: typeof e?.code === "number" ? e.code : -32603, message: String(e?.message ?? e).split("\n")[0] } });
+				}
+			})();
+		}
+	};
+	process.stdin.on("data", (c: Buffer) => {
+		buf = Buffer.concat([buf, c]);
+		pump();
+	});
+	process.stdin.on("end", () => process.exit(0));
+	process.stdin.resume();
+	// Stay alive serving; the process ends on stdin end.
+	await new Promise(() => {});
 }
 
 if (cmd === "sync") {
