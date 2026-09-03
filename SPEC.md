@@ -161,8 +161,16 @@ Scope = text before `#` (`bi#04` → `bi`); an id with no `#` is local scope.
 
 ## 4. CLI contract
 
-`bais list | ready | check [--json]`. JSON output goes to stdout; diagnostics to
-stderr. Machine consumers MUST pass `--json` and parse stdout.
+`bais list | ready | check [--json]` plus `bais ingest` and `bais graph`.
+JSON output goes to stdout; diagnostics to stderr. Machine consumers MUST pass
+`--json` and parse stdout.
+
+Reads prefer the SQLite projection (`.bais/store.db`, built by `bais ingest`
+from the TOML seed through the BAML reducer) and fall back to the directory
+scan when absent. Store-backed `list`/`ready`/`graph` add `as_of: {heads, lc,
+wall_ts}` and `completeness: "complete"|"partial"` so `empty` is
+distinguishable from `not-synced`; `check` keeps the §4.3 shape exactly.
+`store.db` is a rebuildable artifact — never commit it.
 
 ### 4.1 `bais list --json`
 
@@ -180,6 +188,11 @@ the list, never as zero issues. (`error` strings contain VM traces; match on
 ```json
 { "ready": [ <same BaisFile shape as list> ], "unparseable": [ … ] }
 ```
+
+Store-backed reads append `"as_of": {"heads": […], "lc": 10, "wall_ts": "…"}`
+and `"completeness": "complete"|"partial"`. `bais graph --from <id> --json`
+returns `{from, nodes: […], as_of, completeness}` (recursive CTE; BFS fallback
+without a store).
 
 `ready` applies §3.1. Empty `ready` is ambiguous by design — it means *either*
 "nothing to do" *or* "everything parked/cyclic/unsynced". Disambiguate with
