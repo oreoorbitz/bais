@@ -79,6 +79,8 @@ class Reduction {
     conflicts: Conflict[],
     excluded: Excluded[],
     leases: Lease[],
+    submissions: Submission[],
+    verifications: Verification[],
 }
 
 // Fold accumulator (internal): label ops and transition records are kept raw
@@ -112,6 +114,8 @@ class Acc {
     conflicts: Conflict[],
     excluded: Excluded[],
     leases: Lease[],
+    submissions: Submission[],
+    verifications: Verification[],
 }
 
 function body_string(body: map<string, unknown>, key: string) -> string? {
@@ -392,6 +396,14 @@ function dispatch(acc: Acc, e: WireEvent) -> void {
         apply_renew(acc, e);
     } else if (e.type == "LeaseRelease") {
         apply_release(acc, e);
+    } else if (e.type == "WorkSubmit") {
+        apply_submit(acc, e);
+    } else if (e.type == "VerifyRecord") {
+        apply_verify(acc, e);
+    } else if (e.type == "WorkAccept") {
+        apply_accept(acc, e);
+    } else if (e.type == "WorkReject") {
+        apply_reject(acc, e);
     } else if (event_type_name(e.type) == "unknown" && !is_ephemeral(e.type)) {
         acc.excluded.push(Excluded { event_id: e.id, reason: `unknown-type: ${e.type}` });
     }
@@ -454,6 +466,8 @@ function reduce(events: WireEvent[]) -> Reduction {
         conflicts: [],
         excluded: [],
         leases: [],
+        submissions: [],
+        verifications: [],
     };
     let max_lc = 0;
     for (let e in ordered) {
@@ -480,6 +494,8 @@ function reduce(events: WireEvent[]) -> Reduction {
         conflicts: acc.conflicts,
         excluded: acc.excluded,
         leases: acc.leases,
+        submissions: acc.submissions,
+        verifications: acc.verifications,
     }
 }
 
@@ -645,20 +661,21 @@ test "unadmitted events are evidence, never state" {
 }
 
 test "ephemeral and not-yet-reduced Phase-3 types leave no trace" {
-    // Leases now reduce (see lease.baml); verify/budget/caps still fall
-    // through with no arm until their Phase 3 step lands.
+    // Leases and verify now reduce (see lease.baml, verify.baml);
+    // budget/caps still fall through with no arm until their step lands.
     let events = [
         wire("TaskCreate", "task:A", 1, "e1", {}),
         wire("Heartbeat", "task:A", 2, "e2", {}),
-        wire("WorkSubmit", "task:A", 3, "e3", {}),
-        wire("BudgetAuthorize", "task:A", 4, "e4", {}),
+        wire("BudgetAuthorize", "task:A", 3, "e3", {}),
+        wire("CapGrant", "task:A", 4, "e4", {}),
         wire("Progress", "task:A", 5, "e5", {}),
     ];
     let r = reduce(events);
     assert.equal(only_issue(r).status, "Open");
     assert.equal(r.excluded.length(), 0);
     assert.equal(r.conflicts.length(), 0);
-    assert.equal(r.leases.length(), 0)
+    assert.equal(r.leases.length(), 0);
+    assert.equal(r.submissions.length(), 0)
 }
 
 test "unknown type is excluded evidence" {
