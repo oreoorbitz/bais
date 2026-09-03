@@ -12,7 +12,7 @@ import { cyclicIds, danglingRefsIn, loadIssues, projectName, readyIssues } from 
 import { hasStore, ingestIssues, storeCheck, storeEdges, storeGraph, storeList, storeReady } from "./store.js";
 import { createHub } from "./hub.js";
 import { loadPeerKey, appendForeignEvents, publishCheckpoint, verifyCheckpointRoot } from "./hub.js";
-import { exportSnapshot, importSnapshot, markBootstrapComplete } from "./store.js";
+import { exportSnapshot, importSnapshot, markBootstrapComplete, recordImportedAnchor } from "./store.js";
 import { event } from "../baml_sdk/index.js";
 
 const root = ".bais";
@@ -321,38 +321,78 @@ if (cmd === "sync") {
 		importSnapshot(issuesDir, snapshot, peer);
 		console.error(`imported snapshot ${snapshot.checkpoint.id} (lc=${snapshot.checkpoint.lc})`);
 		const cp = snapshot.checkpoint;
+		let trust: "recomputed" | "signature" = "recomputed";
+		// An anchored peer's backfill can never reproduce the tables (the
+		// covered log is gone), so anchor first: refreshes merge instead of
+		// rebuilding, in BOTH trust paths below. Peers predating
+		// anchor-state snapshots cannot source anchored bootstraps —
+		// upgrade the peer, not the trust.
+		if (snapshot.anchor) {
+			if (!snapshot.anchor_state || !Array.isArray(snapshot.cursors)) {
+				throw new Error("pruned peer predates anchor-state snapshots — upgrade the peer hub first");
+			}
+			recordImportedAnchor(issuesDir, snapshot.anchor, snapshot.anchor_state, snapshot.cursors);
+		}
 		// Backfill FIRST: delta chains only link onto a complete local log.
 		const full = (await get("/sync")) as any;
 		const covered = (full.events ?? []).filter((e: any) => e.lc <= cp.lc);
 		const missing = cp.heads.filter((h: string) => !covered.some((e: any) => e.id === h));
-		if (missing.length) throw new Error(`backfill incomplete: missing covered heads ${missing.join(",")}`);
-		const b = await appendForeignEvents(issuesDir, covered, { mode: "backfill" });
-		if (b.rejected.length) throw new Error(`backfill rejected: ${b.rejected.map((r) => `${r.id}=${r.reason}`).join(",")}`);
-		console.error(`backfill: ${b.accepted.length} events replayed`);
-		// Cryptographic trust establishment: re-derive the root locally.
-		const { DatabaseSync } = await import("node:sqlite");
-		const { resolve } = await import("node:path");
-		const db = new DatabaseSync(resolve(issuesDir, "..", "store.db"));
-		const rows = db.prepare("SELECT * FROM events ORDER BY lc, id").all() as any[];
-		db.close();
-		const reduction = await (event as any).reduce(
-			rows.map((r) => ({
-				...r,
-				refs: JSON.parse(r.refs),
-				body: JSON.parse(r.body),
-				sig: r.sig ?? null,
-				admitted: r.admitted === 1,
-				drop_reason: r.drop_reason,
-			})),
+		if (missing.length && !snapshot.anchor) throw new Error(`backfill incomplete: missing covered heads ${missing.join(",")}`);
+		if (missing.length && snapshot.anchor) {
+			// Truncated peer (POST /prune): the covered log is gone by
+			// operator action, so recompute-verify is impossible. Fall back
+			// to signature trust — the surviving CheckpointPublish event is
+			// still signature-checked on ingest, and accepting it means the
+			// publisher attests these tables. Recorded as trust: signature.
+			// (Anchor recorded above; the delta layers onto it.)
+			console.error(`peer pruned below ${cp.id} — backfill unavailable, establishing signature trust`);
+			const tdelta = (await get(`/sync?since_lc=${cp.lc}`)) as any;
+			const t = await appendForeignEvents(issuesDir, tdelta.events ?? [], { mode: "delta", anchorHeads: cp.heads });
+			if (!t.accepted.includes(cp.id)) {
+				throw new Error("anchor checkpoint event not replicated — cannot establish signature trust");
+			}
+			console.error(`anchor ${cp.id} accepted (publisher signature valid)`);
+			trust = "signature";
+		} else {
+			const b = await appendForeignEvents(issuesDir, covered, { mode: "backfill" });
+			if (b.rejected.length) throw new Error(`backfill rejected: ${b.rejected.map((r) => `${r.id}=${r.reason}`).join(",")}`);
+			console.error(`backfill: ${b.accepted.length} events replayed`);
+		}
+		if (trust === "recomputed") {
+			// Cryptographic trust establishment: re-derive the root locally.
+			const { DatabaseSync } = await import("node:sqlite");
+			const { resolve } = await import("node:path");
+			const db = new DatabaseSync(resolve(issuesDir, "..", "store.db"));
+			const rows = db.prepare("SELECT * FROM events ORDER BY lc, id").all() as any[];
+			db.close();
+			const reduction = await (event as any).reduce(
+				rows.map((r) => ({
+					...r,
+					refs: JSON.parse(r.refs),
+					body: JSON.parse(r.body),
+					sig: r.sig ?? null,
+					admitted: r.admitted === 1,
+					drop_reason: r.drop_reason,
+				})),
+			);
+			if (!verifyCheckpointRoot(reduction, cp.state_root)) throw new Error("state_root mismatch — divergence alarm, writes stay blocked");
+			// Root matches: pull the post-checkpoint delta, then unlock writes.
+			const delta = (await get(`/sync?since_lc=${cp.lc}`)) as any;
+			const d = await appendForeignEvents(issuesDir, delta.events ?? [], { mode: "delta" });
+			console.error(`delta: ${d.accepted.length} accepted, ${d.rejected.length} rejected`);
+		}
+		// Signature-trust branch already ingested the delta above; the
+		// anchor event's acceptance is the trust decision (no recompute —
+		// the covered log is gone by operator action, recorded in meta).
+		markBootstrapComplete(issuesDir, trust);
+		// Final unlock verdict goes to stdout (machine-readable result —
+		// sync-test.mjs asserts on it); progress stays on stderr.
+		console.log(
+			trust === "recomputed"
+				? `verified root ${cp.state_root.slice(0, 12)}… — writes unlocked`
+				: `signature trust on ${cp.id} — writes unlocked (trust: signature)`,
 		);
-		if (!verifyCheckpointRoot(reduction, cp.state_root)) throw new Error("state_root mismatch — divergence alarm, writes stay blocked");
-		// Root matches: pull the post-checkpoint delta, then unlock writes.
-		const delta = (await get(`/sync?since_lc=${cp.lc}`)) as any;
-		const d = await appendForeignEvents(issuesDir, delta.events ?? [], { mode: "delta" });
-		console.error(`delta: ${d.accepted.length} accepted, ${d.rejected.length} rejected`);
-		markBootstrapComplete(issuesDir);
-		console.error(`verified root ${cp.state_root.slice(0, 12)}… — writes unlocked`);
-		if (asJson) console.log(JSON.stringify({ checkpoint: cp.id, verified: true }, null, 2));
+		if (asJson) console.log(JSON.stringify({ checkpoint: cp.id, verified: true, trust }, null, 2));
 	} catch (e: any) {
 		console.error(`sync: ${String(e?.message ?? e).split("\n")[0]}`);
 		process.exit(1);
