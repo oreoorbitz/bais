@@ -16,6 +16,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { event } from "../baml_sdk/index.js";
 import { parseBaisFile } from "./toml.js";
+import { eventId } from "./ids.js";
 import { projectName } from "./graph.js";
 import { whyNotIn } from "./graph.js";
 import type { BaisEdge, BaisFile, HostLease, WhyNot } from "./graph.js";
@@ -125,13 +126,19 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 	let lc = 0;
 	// Chain-legal seed (envelope: seq 0 is genesis, prev links the author's
 	// prior id): one author, contiguous seq from 0, prev chained. lc stays
-	// the per-file tiebreak clock (ids embed it); seq is the author chain.
+	// the per-file tiebreak clock; ids are content hashes (bi#38), so the
+	// clock is carried in `lc`, not embedded in the id. seq is the author chain.
 	const seedAuthor = "did:key:bais-seed";
 	let seedSeq = 0;
 	let seedPrev: string | null = null;
-	const seedEvent = (id: string, entity: string, type: string, body: any): void => {
-		wireEvents.push({
-			id,
+	const seedEvent = (entity: string, type: string, body: any): void => {
+		// Causal order rides on lc, not on id order: the reducer applies in
+		// total (lc, id) order, and content-hash ids (bi#38) sort randomly —
+		// the old dev ids (create < edge < status lexically) carried order
+		// implicitly. One lc tick per emitted event keeps create < edge <
+		// status causally ordered within and across files.
+		lc += 1;
+		const fields = {
 			author: seedAuthor,
 			seq: seedSeq,
 			prev: seedPrev,
@@ -142,9 +149,9 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 			ts: new Date().toISOString(),
 			type,
 			body,
-			admitted: true,
-			drop_reason: null,
-		});
+		};
+		const id = eventId(fields);
+		wireEvents.push({ ...fields, id, admitted: true, drop_reason: null });
 		seedPrev = id;
 		seedSeq += 1;
 	};
@@ -155,8 +162,7 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 			// tables in Phase 4; until then every query stays in user space
 			// and no alias map is needed anywhere downstream.
 			const parsed = (await parseBaisFile(readFileSync(join(issuesDir, f), "utf8"))) as any;
-			lc += 1;
-			seedEvent(`seed:${project}:${lc}:create`, parsed.issue.id, "TaskCreate", {
+			seedEvent(parsed.issue.id, "TaskCreate", {
 				title: parsed.issue.title,
 				kind: parsed.issue.kind,
 				area: parsed.issue.area,
@@ -165,7 +171,7 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 				body: parsed.issue.body,
 			});
 			for (const [j, e] of parsed.edges.entries()) {
-				seedEvent(`seed:${project}:${lc}:edge:${j}`, parsed.issue.id, "RelAdd", {
+				seedEvent(parsed.issue.id, "RelAdd", {
 					rel_id: `rel:seed:${parsed.issue.id}:${j}`,
 					source: e.from,
 					type: e.kind,
@@ -175,7 +181,7 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 			}
 			// Seed status: files already Done/Doing carry it via a transition.
 			if (parsed.issue.status && parsed.issue.status !== "Open") {
-				seedEvent(`seed:${project}:${lc}:status`, parsed.issue.id, "TaskTransition", { to: parsed.issue.status });
+				seedEvent(parsed.issue.id, "TaskTransition", { to: parsed.issue.status });
 			}
 		} catch (e: any) {
 			failures.push({ file: f, error: String(e?.message ?? e).split("\n")[0] });
@@ -199,6 +205,13 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 				ensureSchema(prev);
 				const rows = prev.prepare("SELECT * FROM events").all() as any[];
 				for (const r of rows) {
+					// Seeds are regenerable, never carried: with content-hash
+					// ids (bi#38) the wall-clock ts in the hashed payload gives
+					// every re-ingest fresh seed ids, so id-based dedup can
+					// never match them — carrying seed-authored rows doubles
+					// the log on every ingest. Only non-seed authors (hub,
+					// sync) carry over; the guards below stay for old stores.
+					if (r.author === seedAuthor) continue;
 					if (freshSeedIds.has(r.id) || String(r.id).startsWith("seed:")) continue;
 					hubKept.push({
 						wire: {

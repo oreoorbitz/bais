@@ -65,7 +65,10 @@ function readAllRows(issuesDir) {
 	}
 }
 
-const hubRows = (rows) => rows.filter((r) => !String(r.id).startsWith("seed:"));
+// Seed vs hub is an AUTHOR question, not an id-prefix question: with
+// content-hash ids (bi#38) every id is a bafkrei CID, so seed rows are
+// the ones authored by did:key:bais-seed.
+const hubRows = (rows) => rows.filter((r) => r.author !== "did:key:bais-seed");
 const canon = (rows) => JSON.stringify(rows);
 
 const root = mkdtempSync(join(tmpdir(), "bais-durability-"));
@@ -77,7 +80,7 @@ for (const t of ["d1", "d2", "d3", "d4", "d5"]) writeFileSync(join(issues, `${t}
 const first = await ingestIssues(issues);
 check(first.events > 0, `ingested TOML fixture (${first.events} seed events)`);
 const seedOnly = readAllRows(issues);
-check(seedOnly.every((r) => String(r.id).startsWith("seed:")), "pre-hub log is seed-only");
+check(seedOnly.every((r) => r.author === "did:key:bais-seed"), "pre-hub log is seed-only");
 
 // --- (a) 10 events through the live hub: 5 claims + 5 renews ---
 const { hub } = await createHub(issues, { port: 0 });

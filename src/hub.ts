@@ -19,7 +19,9 @@
 //   Peer replication (POST /sync) verifies sigs when present and enforces
 //   chain continuity always; hubs started with requireSigs reject
 //   unsigned peer events outright. Full sig-required mode is later.
-// - Event ids are `hub:<type>:<lc>` (dev identities, not bafy hashes).
+// - Event ids are content hashes (bi#38): CIDv1-raw over sha256 of the
+//   JCS-canonical payload — see src/ids.ts. Self-verifying; sync dedup
+//   is structural (id equality), never positional.
 // - `expires_at` projects as '' — expiry is lc-derived in the reducer.
 // - Prune is truncation-with-anchor (`POST /prune`), not compaction: the
 //   reducer is whole-log, so post-prune recompute covers surviving rows
@@ -34,6 +36,7 @@ import { resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { event } from "../baml_sdk/index.js";
 import { projectName } from "./graph.js";
+import { eventId } from "./ids.js";
 import { refreshProjectionTables, ensureSchema, exportSnapshot, mergeAnchorReduction, storeOversight } from "./store.js";
 import {
 	generatePeerKey,
@@ -501,8 +504,7 @@ export async function publishCheckpoint(issuesDir: string): Promise<{
 			prev = floor.id;
 		}
 		const body = encodeBodyArrays({ state_root: root, heads, reducer_version: reduction.version, lc });
-		const candidate: WireEvent = {
-			id: `hub:checkpoint:${lc}:${Date.now()}`,
+		const fields = {
 			author: key.did,
 			seq,
 			prev,
@@ -514,6 +516,10 @@ export async function publishCheckpoint(issuesDir: string): Promise<{
 			type: "CheckpointPublish",
 			body,
 			sig: signPayload(key.privateJwk, signableOf({ project: log[0].project, prev, refs: [], type: "CheckpointPublish", entity: heads[heads.length - 1], body })),
+		};
+		const candidate: WireEvent = {
+			...fields,
+			id: eventId(fields),
 			admitted: true,
 			drop_reason: null,
 		};
@@ -921,12 +927,12 @@ export async function createHub(
 				return;
 			}
 			const lc = nextLc();
-			const candidate: WireEvent = {
-				id: `hub:claim:${lc}`, author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
+			const fields = {
+				author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
 				project, entity: task, refs: [], lc, ts: new Date().toISOString(),
 				type: "LeaseClaim", body: encodeBodyArrays(body), sig: null,
-				admitted: true, drop_reason: null,
 			};
+			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
 			const d = await decide(candidate);
 			if (!d.ok) {
 				send(res, 409, { reason: d.reason });
@@ -966,11 +972,12 @@ export async function createHub(
 				return;
 			}
 			const lc = nextLc();
-			const candidate: WireEvent = {
-				id: `hub:renew:${lc}`, author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
+			const fields = {
+				author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
 				project, entity: "", refs: [], lc, ts: new Date().toISOString(),
-				type: "LeaseRenew", body: { lease_ref }, sig: null, admitted: true, drop_reason: null,
+				type: "LeaseRenew", body: { lease_ref }, sig: null,
 			};
+			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
 			// Entity is cosmetic for renew/release; resolve it for the log.
 			const rec = (lastReduction.leases as any[]).find((l) => l.lease_id === lease_ref);
 			candidate.entity = rec.entity;
@@ -1009,11 +1016,12 @@ export async function createHub(
 				return;
 			}
 			const lc = nextLc();
-			const candidate: WireEvent = {
-				id: `hub:release:${lc}`, author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
+			const fields = {
+				author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
 				project, entity: rec.entity, refs: [], lc, ts: new Date().toISOString(),
-				type: "LeaseRelease", body: { lease_ref }, sig: null, admitted: true, drop_reason: null,
+				type: "LeaseRelease", body: { lease_ref }, sig: null,
 			};
+			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
 			const d = await decide(candidate);
 			if (!d.ok) {
 				send(res, 409, { reason: d.reason });
@@ -1198,11 +1206,12 @@ export async function createHub(
 			const body: Record<string, unknown> = { audience, can: JSON.stringify(can), scope, expiry_lc };
 			if (typeof budget_cap_usd === "number") body.budget_cap_usd = budget_cap_usd;
 			if (typeof budget_cap_tokens === "number") body.budget_cap_tokens = budget_cap_tokens;
-			const candidate: WireEvent = {
-				id: `hub:grant:${lc}`, author: by, seq: nextSeq(by), prev: nextPrev(by),
+			const fields = {
+				author: by, seq: nextSeq(by), prev: nextPrev(by),
 				project, entity: audience, refs: [], lc, ts: new Date().toISOString(),
-				type: "CapGrant", body: encodeBodyArrays(body), sig: null, admitted: true, drop_reason: null,
+				type: "CapGrant", body: encodeBodyArrays(body), sig: null,
 			};
+			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
 			const d = await decide(candidate);
 			if (!d.ok) {
 				send(res, 409, { reason: d.reason });
@@ -1225,11 +1234,12 @@ export async function createHub(
 				return;
 			}
 			const lc = nextLc();
-			const candidate: WireEvent = {
-				id: `hub:revoke:${lc}`, author: revoker, seq: nextSeq(revoker), prev: nextPrev(revoker),
+			const fields = {
+				author: revoker, seq: nextSeq(revoker), prev: nextPrev(revoker),
 				project, entity: revoker, refs: [], lc, ts: new Date().toISOString(),
-				type: "CapRevoke", body: { grant_ref }, sig: null, admitted: true, drop_reason: null,
+				type: "CapRevoke", body: { grant_ref }, sig: null,
 			};
+			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
 			const d = await decide(candidate);
 			if (!d.ok) {
 				send(res, 409, { reason: d.reason });

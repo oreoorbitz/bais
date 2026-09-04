@@ -55,7 +55,7 @@ class CapRef {
 
 class Event {
     id: string @description(
-        "version identity: bafy... content hash over canonical CBOR + sig, assigned by the host after signing; 'bafy-test' in tests",
+        "version identity: CIDv1-raw over sha256 of the JCS-canonical payload (all other Event fields, UTF-8; commits to sig) — src/ids.ts; assigned by the host after signing; 'bafy-test' in tests",
     ),
     author: string @description("did:key:... of the writer; one chain per author gives per-writer total order"),
     seq: int @description("author's log sequence; 0 for the first event, prev must be null iff seq == 0"),
