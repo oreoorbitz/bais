@@ -763,3 +763,293 @@ test "non-ordering edge kinds cannot form a cycle" {
     ];
     assert.equal(has_cycle([a, b], edges), false)
 }
+
+// ── Computed urgency (bi#51) ─────────────────────────────────────────────
+// ready_issues answers "what can be worked now" as a SET — every ready issue
+// looks equally important and dispatch degrades to arbitrary choice. urgency
+// is a PURE function over declared + structural + live signals that returns
+// the score WITH its components (never a bare number), e.g.
+//   urgency 8 = severity 3 + blocks 4 + stalled 6d
+// so `--order urgency` (host CLI, out of scope here) and the bi#48 why-not
+// output can answer "why this first" with "why not that".
+//
+// Signals:
+// - Declared: severity 1-5 finally means something. 1-4 count linearly
+//   (capped at 4, below the structural max of 6, so graph leverage can
+//   outweigh a mid-range declaration); 5 is the override hatch (15, above
+//   the max non-override total of 12) that beats any structural score.
+//   Derived only — human severity in the files is never rewritten.
+// - Structural: Blocks fan-out (issues this one directly unblocks), plus a
+//   capped bonus per one-completion-away chain (a downstream blocked SOLELY
+//   by this issue — derivable from edges alone, no status reads).
+// - Live: days parked with saturating decay (a week per point, capped at 2)
+//   so old trivia never outranks fresh breakage.
+//
+// Clocks (bi#42 split): the host owns clocks, BAML owns policy. Issue and
+// CostEntry carry no timestamps, so staleness cannot be derived from declared
+// data — the host stamps each issue's creation day (whole days, e.g. file
+// mtime / git log day) into the live-signal table `costs` and passes
+// wall-clock `now` in the same unit. A missing entry — or a creation day in
+// the future — counts as fresh (parked 0): unknown age must never inflate
+// urgency.
+class Urgency {
+    issue_id: string,
+    score: int @description("severity_part + blocks_part + stalled_part — always read with the parts"),
+    severity_part: int,
+    fan_out: int @description("Blocks edges out of this issue (raw count, pre-cap)"),
+    sole_unblocks: int @description("downstream solely blocked by this issue (raw count, pre-cap)"),
+    blocks_part: int,
+    stalled_days: int @description("parked days actually counted (clamped at 0, uncapped)"),
+    stalled_part: int,
+}
+
+function urgency_severity(issue: Issue) -> int {
+    if let s: int = issue.severity {
+        if (s >= 5) {
+            // Override hatch: 5 + 10, above STRUCT_MAX(6) + STALE_MAX(2) +
+            // normal severity max(4) = 12, so severity 5 always wins.
+            15
+        } else if (s <= 0) {
+            0
+        } else {
+            s
+        }
+    } else {
+        0
+    }
+}
+
+function blocks_fan_out(issue: Issue, edges: Edge[]) -> int {
+    let n = 0;
+    for (let e in edges) {
+        if (e.from == issue.id && e.kind == EdgeKind.Blocks) {
+            n = n + 1;
+        }
+    }
+    n
+}
+
+// True when no OTHER issue blocks `target` — completing `issue` alone
+// unblocks it. Edges only, matching the "derivable from edges today" rule.
+function is_sole_blocker(issue: Issue, target: string, edges: Edge[]) -> bool {
+    for (let e in edges) {
+        if (e.kind == EdgeKind.Blocks && e.to == target && e.from != issue.id) {
+            return false;
+        }
+    }
+    true
+}
+
+function sole_unblocks(issue: Issue, edges: Edge[]) -> int {
+    let n = 0;
+    for (let e in edges) {
+        if (e.from == issue.id && e.kind == EdgeKind.Blocks && is_sole_blocker(issue, e.to, edges)) {
+            n = n + 1;
+        }
+    }
+    n
+}
+
+function urgency_blocks(issue: Issue, edges: Edge[]) -> int {
+    let fan = blocks_fan_out(issue, edges);
+    let capped_fan = if (fan > 4) {
+        4
+    } else {
+        fan
+    };
+    let sole = sole_unblocks(issue, edges);
+    let capped_sole = if (sole > 2) {
+        2
+    } else {
+        sole
+    };
+    capped_fan + capped_sole
+}
+
+function urgency_stalled_days(issue: Issue, costs: map<string, int>, now: int) -> int {
+    let created = costs.get(issue.id) ?? now;
+    let parked = now - created;
+    if (parked < 0) {
+        0
+    } else {
+        parked
+    }
+}
+
+function urgency_stalled(stalled_days: int) -> int {
+    // A week per point, saturating at 2 (int division truncates).
+    let pts = stalled_days / 7;
+    if (pts > 2) {
+        2
+    } else {
+        pts
+    }
+}
+
+function urgency(issue: Issue, edges: Edge[], costs: map<string, int>, now: int) -> Urgency {
+    let sev = urgency_severity(issue);
+    let fan = blocks_fan_out(issue, edges);
+    let sole = sole_unblocks(issue, edges);
+    let blocks = urgency_blocks(issue, edges);
+    let days = urgency_stalled_days(issue, costs, now);
+    let stalled = urgency_stalled(days);
+    Urgency {
+        issue_id: issue.id,
+        score: sev + blocks + stalled,
+        severity_part: sev,
+        fan_out: fan,
+        sole_unblocks: sole,
+        blocks_part: blocks,
+        stalled_days: days,
+        stalled_part: stalled,
+    }
+}
+
+function urgency_issue(id: string, severity: int?) -> Issue {
+    Issue {
+        id: id,
+        title: id,
+        status: Status.Open,
+        kind: Kind.Bug,
+        area: null,
+        severity: severity,
+        source: null,
+        body: "",
+    }
+}
+
+test "urgency orders fan-out hub above leaf" {
+    let hub = urgency_issue("bi#10", 2);
+    let leaves = [
+        urgency_issue("bi#11", 2),
+        urgency_issue("bi#12", 2),
+        urgency_issue("bi#13", 2),
+        urgency_issue("bi#14", 2),
+    ];
+    let edges = [
+        Edge { from: "bi#10", to: "bi#11", kind: EdgeKind.Blocks },
+        Edge { from: "bi#10", to: "bi#12", kind: EdgeKind.Blocks },
+        Edge { from: "bi#10", to: "bi#13", kind: EdgeKind.Blocks },
+        Edge { from: "bi#10", to: "bi#14", kind: EdgeKind.Blocks },
+    ];
+    // No creation days stamped: unknown age counts as fresh (stalled 0).
+    let costs: map<string, int> = {};
+    let hub_u = urgency(hub, edges, costs, 100);
+    assert.equal(hub_u.fan_out, 4);
+    assert.equal(hub_u.sole_unblocks, 4);
+    assert.equal(hub_u.blocks_part, 6);
+    assert.equal(hub_u.score, 8);
+    let leaf_u = urgency(leaves[0], edges, costs, 100);
+    assert.equal(leaf_u.blocks_part, 0);
+    assert.equal(leaf_u.score, 2);
+    assert.equal(hub_u.score > leaf_u.score, true)
+}
+
+test "severity-5 overrides a high structural score" {
+    let hatch = urgency_issue("bi#20", 5);
+    let hub = urgency_issue("bi#21", 3);
+    let edges = [
+        Edge { from: "bi#21", to: "bi#22", kind: EdgeKind.Blocks },
+        Edge { from: "bi#21", to: "bi#23", kind: EdgeKind.Blocks },
+        Edge { from: "bi#21", to: "bi#24", kind: EdgeKind.Blocks },
+        Edge { from: "bi#21", to: "bi#25", kind: EdgeKind.Blocks },
+    ];
+    // Hub is maximally structural AND 60 days stale: 3 + 6 + 2 = 11.
+    let costs: map<string, int> = {};
+    let _ = costs.set("bi#21", 40);
+    let hub_u = urgency(hub, edges, costs, 100);
+    assert.equal(hub_u.score, 11);
+    // Fresh severity-5 leaf: the override hatch alone scores 15.
+    let hatch_u = urgency(hatch, edges, costs, 100);
+    assert.equal(hatch_u.severity_part, 15);
+    assert.equal(hatch_u.score, 15);
+    assert.equal(hatch_u.score > hub_u.score, true)
+}
+
+test "60-day trivia loses to fresh severity-4" {
+    let trivia = urgency_issue("bi#30", 1);
+    let fresh = urgency_issue("bi#31", 4);
+    let edges: Edge[] = [];
+    let costs: map<string, int> = {};
+    let _ = costs.set("bi#30", 40);
+    let old_u = urgency(trivia, edges, costs, 100);
+    assert.equal(old_u.stalled_days, 60);
+    assert.equal(old_u.stalled_part, 2);
+    assert.equal(old_u.score, 3);
+    let fresh_u = urgency(fresh, edges, costs, 100);
+    assert.equal(fresh_u.stalled_part, 0);
+    assert.equal(fresh_u.score, 4);
+    assert.equal(old_u.score < fresh_u.score, true)
+}
+
+test "staleness saturates: older alone never keeps winning" {
+    let a = urgency_issue("bi#40", 2);
+    let b = urgency_issue("bi#41", 2);
+    let edges: Edge[] = [];
+    let costs: map<string, int> = {};
+    let _ = costs.set("bi#40", 70);
+    let _ = costs.set("bi#41", 10);
+    let au = urgency(a, edges, costs, 100);
+    let bu = urgency(b, edges, costs, 100);
+    assert.equal(au.stalled_days, 30);
+    assert.equal(bu.stalled_days, 90);
+    assert.equal(au.stalled_part, 2);
+    assert.equal(bu.stalled_part, 2);
+    assert.equal(au.score, bu.score)
+}
+
+test "urgency receipt adds up and names every component" {
+    let issue = urgency_issue("bi#50", 3);
+    let edges = [Edge { from: "bi#50", to: "bi#51", kind: EdgeKind.Blocks }];
+    let costs: map<string, int> = {};
+    let _ = costs.set("bi#50", 94);
+    let u = urgency(issue, edges, costs, 100);
+    // urgency 5 = severity 3 + blocks 2 + stalled 6d (0 pts).
+    assert.equal(u.issue_id, "bi#50");
+    assert.equal(u.severity_part, 3);
+    assert.equal(u.fan_out, 1);
+    assert.equal(u.sole_unblocks, 1);
+    assert.equal(u.blocks_part, 2);
+    assert.equal(u.stalled_days, 6);
+    assert.equal(u.stalled_part, 0);
+    assert.equal(u.score, u.severity_part + u.blocks_part + u.stalled_part);
+    assert.equal(u.score, 5)
+}
+
+test "missing or future creation day counts as fresh" {
+    let missing = urgency_issue("bi#60", 2);
+    let future = urgency_issue("bi#61", 2);
+    let edges: Edge[] = [];
+    let costs: map<string, int> = {};
+    let _ = costs.set("bi#61", 105);
+    let mu = urgency(missing, edges, costs, 100);
+    assert.equal(mu.stalled_days, 0);
+    assert.equal(mu.stalled_part, 0);
+    let fu = urgency(future, edges, costs, 100);
+    assert.equal(fu.stalled_days, 0);
+    assert.equal(fu.stalled_part, 0)
+}
+
+test "null severity contributes nothing" {
+    let issue = urgency_issue("bi#80", null);
+    let edges: Edge[] = [];
+    let costs: map<string, int> = {};
+    let u = urgency(issue, edges, costs, 100);
+    assert.equal(u.severity_part, 0);
+    assert.equal(u.score, 0)
+}
+
+test "shared blockers split the one-away bonus but keep fan-out" {
+    let hub = urgency_issue("bi#70", 2);
+    let edges = [
+        Edge { from: "bi#70", to: "bi#71", kind: EdgeKind.Blocks },
+        Edge { from: "bi#70", to: "bi#72", kind: EdgeKind.Blocks },
+        Edge { from: "bi#99", to: "bi#72", kind: EdgeKind.Blocks },
+    ];
+    let costs: map<string, int> = {};
+    let u = urgency(hub, edges, costs, 100);
+    assert.equal(u.fan_out, 2);
+    // bi#72 has a second blocker, so only bi#71 is one-completion-away.
+    assert.equal(u.sole_unblocks, 1);
+    assert.equal(u.blocks_part, 3)
+}
