@@ -6,9 +6,10 @@
 // scan when no store exists. `check` validates the *issue files*; it is not
 // `baml check`, which validates bais's own BAML source.
 
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cyclicIds, danglingRefsIn, loadIssues, projectName, readyIssues, whyNotIn } from "./graph.js";
+import { parseBaisFile } from "./toml.js";
 import type { WhyNot } from "./graph.js";
 import { hasStore, ingestIssues, storeCaps, storeCheck, storeEdges, storeGraph, storeList, storeOversight, storeReady, storeSample, storeWhyNot } from "./store.js";
 import { createHub } from "./hub.js";
@@ -26,7 +27,9 @@ Usage:
   bais init
   bais ingest [--json]              # build .bais/store.db from issues/*.toml via the BAML reducer
   bais list [--json]
-  bais ready [--json] [--why-not]   # carries as_of + completeness from the store
+  bais ready [--json] [--why-not] [--wait [--timeout N]]
+                                # carries as_of + completeness from the store
+  bais move <id> <status> [--json]  # prints newly-unblocked set
   bais check [--json]
   bais graph --from <id> [--json]   # recursive CTE from the store, BFS fallback
   bais hub [--port N]               # lease coordinator (Phase 3), serves until SIGINT
@@ -42,7 +45,6 @@ Usage:
 
 Not yet implemented:
   bais new "title" --kind bug [--area bridge/ffi] [--status open]
-  bais move <id> <status>
 
 One Issue = one file in .bais/issues/<id>.toml, git is the hosting.
 `);
@@ -127,11 +129,108 @@ function printWhyNot(reasons: WhyNot[]): void {
 	}
 }
 
+// bi#45: blocking `ready --wait [--timeout N]`. The waiter sleeps until an
+// admitted event touches the store, then re-evaluates readiness exactly once
+// (fall-through to the normal render below). Wake primitive: stat-only watch
+// of store.db (store path) plus the issues directory listing + per-file
+// mtime/size (scan path, and the store-appears flip). The sleep loop performs
+// ZERO readiness evaluations — no storeReady/loadIssues calls, only
+// statSync/readdirSync — so a waiter with no matching work never spin-polls.
+// No hub change was needed: every admission path (hub writes,
+// appendForeignEvents, ingest) rewrites store.db, so its mtime+size is the
+// store-touch signal all writers share. The live-push path (SSE) stays in
+// bi's subscriber (bi#44); this is the offline/poll-confirm counterpart.
+const sleepMs = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+function storeTouchSig(): string {
+	const parts: string[] = [];
+	try {
+		const st = statSync(join(root, "store.db"));
+		parts.push(`db:${st.mtimeMs}:${st.size}`);
+	} catch {
+		parts.push("db:absent");
+	}
+	let names: string[] = [];
+	try {
+		names = readdirSync(issuesDir).filter((f) => f.endsWith(".toml")).sort();
+	} catch {
+		names = [];
+	}
+	for (const n of names) {
+		try {
+			const s = statSync(join(issuesDir, n));
+			parts.push(`${n}@${s.mtimeMs}:${s.size}`);
+		} catch {
+			parts.push(`${n}@?`);
+		}
+	}
+	return parts.join(",");
+}
+
+function optValue(name: string): string | undefined {
+	const i = argv.indexOf(name);
+	if (i !== -1 && i + 1 < argv.length) return argv[i + 1];
+	const pref = argv.find((a) => a.startsWith(`${name}=`));
+	return pref ? pref.slice(name.length + 1) : undefined;
+}
+
 if (cmd === "ready") {
 	ensureInit();
 	// --why-not is a pure addition: without it every line below is exactly the
 	// old output. With it, each Open-but-unready issue carries its reason.
 	const whyNot = argv.includes("--why-not");
+	const wait = argv.includes("--wait");
+	if (wait) {
+		// Timeout is seconds; expiry prints the (empty) result with exit 0.
+		const rawTimeout = optValue("--timeout");
+		let timeoutMs = Infinity;
+		if (rawTimeout !== undefined) {
+			const secs = Number(rawTimeout);
+			if (!Number.isFinite(secs) || secs < 0) {
+				console.error("bais ready --wait needs --timeout <non-negative seconds>");
+				process.exit(1);
+			}
+			timeoutMs = secs * 1000;
+		}
+		// One predicate eval up front to decide whether waiting is needed;
+		// a non-empty set prints immediately with no sleep at all.
+		let isEmpty: boolean;
+		if (useStore) isEmpty = storeReady(issuesDir).ready.length === 0;
+		else isEmpty = readyIssues((await loadIssues(issuesDir)).issues).length === 0;
+		if (isEmpty) {
+			const before = storeTouchSig();
+			const t0 = Date.now();
+			let delay = 25;
+			let lastSig = before;
+			let stable = 0;
+			for (;;) {
+				const elapsed = Date.now() - t0;
+				if (elapsed >= timeoutMs) break;
+				await sleepMs(Math.min(delay, timeoutMs - elapsed));
+				delay = Math.min(delay * 1.5, 250);
+				const sig = storeTouchSig();
+				if (sig === before) continue;
+				// Touched — but the writer (ingest/hub/sync) may still hold
+				// the SQLite lock mid-rebuild. Settle: require the signature
+				// stable across 3 consecutive polls, then one grace beat so
+				// the writer can exit and release the lock before the single
+				// fresh evaluation below. Timeout still bounds the whole wait.
+				if (sig === lastSig) {
+					stable += 1;
+					if (stable >= 3) {
+						await sleepMs(Math.min(150, Math.max(0, timeoutMs - (Date.now() - t0))));
+						break;
+					}
+				} else {
+					stable = 0;
+					lastSig = sig;
+					delay = 25;
+				}
+			}
+		}
+		// Fall through: the normal render below re-evaluates exactly once
+		// over the fresh store (or the unchanged one on timeout expiry).
+	}
 	if (useStore) {
 		// The one agent-dispatch query, indexed — not a readdir scan.
 		const { ready, as_of, completeness } = storeReady(issuesDir);
@@ -266,6 +365,74 @@ if (cmd === "check") {
 		// unresolvable from one directory. Applies to --json too: the old check
 		// exited 0 in JSON mode, which made it useless as a CI gate.
 		if (failures.length || missing.length || cycles.length) process.exit(1);
+	}
+	process.exit(0);
+}
+
+// bi#49: `bais move <id> <status>` prints what the transition unblocked.
+// Read-only derivation, no new policy: the readiness predicate is BAML-owned
+// (mirrored by readyIssues/storeReady, reused unchanged), evaluated before
+// and after the edit; the newly-unblocked set is after-minus-before by id.
+// The move itself is a surgical `status = "..."` line edit (comments and
+// formatting elsewhere in the file are preserved), validated by re-parsing
+// through the BAML parser with restore-on-failure. When a store exists it is
+// rebuilt via ingest so the projection never goes stale behind the files
+// (same documented v1 limit as any ingest: hub/sync-appended events are
+// dropped by a seed rebuild — back up store.db on a live hub first).
+// Output follows the tab-separated conventions (`list`, `ready --why-not`):
+// `moved\t<id>\t<old>\t<new>` plus one `unblocked\t<id>\t<title>` line
+// per freed issue (sorted by id; nothing extra when the set is empty), and
+// --json carries the unblocked ids for scripting.
+if (cmd === "move") {
+	ensureInit();
+	const id = argv[1];
+	const to = argv[2];
+	const valid = ["Open", "Doing", "Blocked", "Done", "Dropped"];
+	if (!id || !to || !valid.includes(to)) {
+		console.error(`bais move <id> <status> — status one of ${valid.join("|")}`);
+		process.exit(1);
+	}
+	const readyIds = async (): Promise<Set<string>> => {
+		if (useStore) return new Set(storeReady(issuesDir).ready.map((t) => t.entity));
+		const { issues } = await loadIssues(issuesDir);
+		return new Set(readyIssues(issues).map((f) => f.issue.id));
+	};
+	const readyList = async (): Promise<{ id: string; title: string }[]> => {
+		if (useStore) return storeReady(issuesDir).ready.map((t) => ({ id: t.entity, title: t.title }));
+		const { issues } = await loadIssues(issuesDir);
+		return readyIssues(issues).map((f) => ({ id: f.issue.id, title: f.issue.title }));
+	};
+	const before = await readyIds();
+	const file = join(issuesDir, `${id}.toml`);
+	if (!existsSync(file)) {
+		console.error(`bais move: unknown issue ${id}`);
+		process.exit(1);
+	}
+	const orig = readFileSync(file, "utf8");
+	const statusMatch = /^\s*status\s*=\s*"[^"]*"/m.exec(orig);
+	if (!statusMatch) {
+		console.error(`bais move: ${id}.toml has no status line`);
+		process.exit(1);
+	}
+	const from = /"([^"]*)"/.exec(statusMatch[0])?.[1] ?? "";
+	const next = orig.replace(statusMatch[0], `status = "${to}"`);
+	writeFileSync(file, next);
+	try {
+		await parseBaisFile(next);
+	} catch (e: any) {
+		writeFileSync(file, orig);
+		console.error(`bais move: edited ${id}.toml rejected (${String(e?.message ?? e).split("\n")[0]}) — restored`);
+		process.exit(1);
+	}
+	if (useStore) await ingestIssues(issuesDir);
+	const unblocked = (await readyList())
+		.filter((r) => !before.has(r.id))
+		.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+	if (asJson) {
+		console.log(JSON.stringify({ moved: { id, from, to }, unblocked }, null, 2));
+	} else {
+		console.log(`moved\t${id}\t${from}\t${to}`);
+		for (const u of unblocked) console.log(`unblocked\t${u.id}\t${u.title}`);
 	}
 	process.exit(0);
 }

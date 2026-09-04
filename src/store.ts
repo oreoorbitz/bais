@@ -3,9 +3,10 @@
 // BAML owns event -> datom reduction (ns_event/reduce.baml, pure); the host
 // owns storage. This file seeds a log from .bais/issues/*.toml (one
 // task.create + rel.add per file — no migration lock, the TOML stays
-// readable), reduces via the BAML SDK, and serves ready/graph/list/check from
-// indexed tables. Queries carry as_of + completeness so "empty" is
-// distinguishable from "not synced".
+// readable), merges surviving hub/sync-appended history over the seed
+// (bi#34: ingest never drops hub events), reduces via the BAML SDK, and
+// serves ready/graph/list/check from indexed tables. Queries carry as_of +
+// completeness so "empty" is distinguishable from "not synced".
 //
 // node:sqlite (built-in, no deps). DB lives at .bais/store.db; every read
 // command falls back to the readdir scan when it is absent.
@@ -105,8 +106,17 @@ function setMeta(db: DatabaseSync, k: string, v: string): void {
 }
 
 // Seed one task.create + one rel.add per issue file, reduce through BAML, and
-// persist events + materialization + failures. Rebuilds from scratch: dropping
-// store.db and re-ingesting is always safe (log seeding is append-only).
+// persist events + materialization + failures.
+//
+// Merge-on-ingest (bi#34): the rebuild preserves hub/sync-appended history.
+// Prior event rows outside the seed namespace (id not starting with "seed:")
+// are carried over VERBATIM (every column, including sig/admitted/drop_reason)
+// and reduced OVER the fresh TOML seed — the log, not the TOML alone, is the
+// durable truth. Stale seed rows (TOML shrank) are dropped: the fresh seed
+// regenerates them, and a fresh-seed id always wins a collision. No BAML
+// policy change: the merge is host-side log concatenation, reduction is
+// untouched (ingest-from-TOML == replay-from-log still holds, extended to
+// seed + replayed hub history).
 export async function ingestIssues(issuesDir: string): Promise<{ events: number; failures: number }> {
 	const project = projectName(issuesDir);
 	const files = existsSync(issuesDir) ? readdirSync(issuesDir).filter((f) => f.endsWith(".toml")).sort() : [];
@@ -171,52 +181,101 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 			failures.push({ file: f, error: String(e?.message ?? e).split("\n")[0] });
 		}
 	}
-	const reduction = (await event.reduce(wireEvents)) as any;
+	// Merge-on-ingest: carry over prior hub/sync-appended rows verbatim.
+	// A row survives iff it is NOT regenerable from the TOML seed (id
+	// outside the fresh seed set AND outside the seed namespace, so stale
+	// seed rows from a shrunk TOML are dropped, not preserved). Raw
+	// refs/body TEXT is kept for byte-identical reinsert; parsed copies
+	// feed the reducer. A damaged store.db falls back to seed-only (same
+	// as the old rebuild) instead of failing the ingest.
+	const freshSeedIds = new Set(wireEvents.map((e) => e.id));
+	const hubKept: { wire: any; rawRefs: string; rawBody: string }[] = [];
+	let anchorLc = 0;
+	const dbPath = dbPathFor(issuesDir);
+	if (existsSync(dbPath)) {
+		try {
+			const prev = new DatabaseSync(dbPath);
+			try {
+				ensureSchema(prev);
+				const rows = prev.prepare("SELECT * FROM events").all() as any[];
+				for (const r of rows) {
+					if (freshSeedIds.has(r.id) || String(r.id).startsWith("seed:")) continue;
+					hubKept.push({
+						wire: {
+							id: r.id,
+							author: r.author,
+							seq: r.seq,
+							prev: r.prev,
+							project: r.project,
+							entity: r.entity,
+							refs: JSON.parse(r.refs),
+							lc: r.lc,
+							ts: r.ts,
+							type: r.type,
+							body: JSON.parse(r.body),
+							sig: r.sig ?? null,
+							admitted: r.admitted === 1,
+							drop_reason: r.drop_reason ?? null,
+						},
+						rawRefs: r.refs,
+						rawBody: r.body,
+					});
+				}
+				hubKept.sort((a, b) => a.wire.lc - b.wire.lc || (a.wire.id < b.wire.id ? -1 : 1));
+				try {
+					const rawAnchor = (prev.prepare("SELECT v FROM meta WHERE k = 'prune_anchor'").get() as any)?.v;
+					if (rawAnchor) anchorLc = (JSON.parse(rawAnchor) as any).lc ?? 0;
+				} catch {
+					anchorLc = 0;
+				}
+			} finally {
+				prev.close();
+			}
+		} catch {
+			hubKept.length = 0;
+			anchorLc = 0;
+		}
+	}
+	// Prune-aware: fresh seed rows at/below the truncation floor are
+	// covered by the preserved anchor reduction (refreshProjectionTables
+	// merges it) — re-adding them would resurrect pruned rows and
+	// double-count anchored state. Hub survivors always sit above the
+	// floor (prune deletes lc <= floor), so they pass through untouched.
+	// Assumes a stable TOML across prune+ingest (lc numbering restarts at
+	// 1 per ingest); prune + edit-TOML + ingest stays operator territory.
+	const seedKept = anchorLc > 0 ? wireEvents.filter((e) => e.lc > anchorLc) : wireEvents;
+	const fullLog = [...seedKept, ...hubKept.map((h) => h.wire)];
+	const reduction = (await event.reduce(fullLog)) as any;
 	if (reduction.version !== "bais.reduce@1") throw new Error(`reducer version skew: ${reduction.version}`);
 	const db = openDb(issuesDir);
 	try {
-		// Rebuild-from-seed wipes hub/sync-appended state too: the seed
-		// carries no lease/verify/budget/checkpoint events, so keeping those
-		// rows would orphan them from the events they reduced from. Back up
-		// store.db (or export a snapshot) before re-ingesting a live hub.
 		db.exec("DELETE FROM events; DELETE FROM tasks; DELETE FROM rels; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM failures; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM checkpoints; DELETE FROM submissions; DELETE FROM caps;");
-		// Reseed orphans prune floors and bootstrap locks (they reference
-		// deleted event rows) — drop them with the rows.
-		db.exec("DELETE FROM meta WHERE k IN ('prune_anchor', 'author_cursors', 'anchor_reduction', 'bootstrap');");
+		// Prune floors, the anchor reduction, and bootstrap locks are
+		// PRESERVED (they still describe the surviving rows): only the
+		// regenerable tables are rebuilt. refreshProjectionTables re-derives
+		// every materialized table from the merged log — including the
+		// lease/verify/budget/submission/cap tables the old seed-only
+		// rebuild dropped — and merges the anchor reduction when present.
 		const insEv = db.prepare(
-			"INSERT INTO events(id, author, seq, prev, project, entity, refs, lc, ts, type, body, admitted, drop_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+			"INSERT INTO events(id, author, seq, prev, project, entity, refs, lc, ts, type, body, sig, admitted, drop_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		);
-		for (const e of wireEvents) {
-			insEv.run(e.id, e.author, e.seq, e.prev, e.project, e.entity, JSON.stringify(e.refs), e.lc, e.ts, e.type, JSON.stringify(e.body), e.admitted ? 1 : 0, e.drop_reason);
-		}
-		const insTask = db.prepare(
-			"INSERT INTO tasks(entity, title, status, kind, area, severity, source, body, labels, comments) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		);
-		for (const t of reduction.issues) {
-			insTask.run(t.entity, t.title, t.status, t.kind, t.area, t.severity, t.source, t.body, JSON.stringify(t.labels), JSON.stringify(t.comments));
-		}
-		const insRel = db.prepare("INSERT INTO rels(id, source, type, target) VALUES (?, ?, ?, ?)");
-		for (const r of reduction.rels) insRel.run(r.id, r.source, r.type, r.target);
-		const insConf = db.prepare("INSERT INTO conflicts(entity, field, options, winner, event_ids, at_lc) VALUES (?, ?, ?, ?, ?, ?)");
-		for (const c of reduction.conflicts) insConf.run(c.entity, c.field, JSON.stringify(c.options), c.winner, JSON.stringify(c.event_ids), c.at_lc);
-		const insExcl = db.prepare("INSERT INTO excluded(event_id, reason) VALUES (?, ?)");
-		for (const x of reduction.excluded) insExcl.run(x.event_id, x.reason);
+		const putRow = (e: any, refsText: string, bodyText: string): void => {
+			insEv.run(e.id, e.author, e.seq, e.prev, e.project, e.entity, refsText, e.lc, e.ts, e.type, bodyText, e.sig ?? null, e.admitted ? 1 : 0, e.drop_reason ?? null);
+		};
+		for (const e of seedKept) putRow(e, JSON.stringify(e.refs), JSON.stringify(e.body));
+		for (const h of hubKept) putRow(h.wire, h.rawRefs, h.rawBody);
+		const heads = fullLog.map((e) => e.id);
+		const maxLc = fullLog.reduce((m, e) => Math.max(m, e.lc), 0);
+		refreshProjectionTables(db, reduction, heads, maxLc);
 		const insFail = db.prepare("INSERT INTO failures(file, error) VALUES (?, ?)");
 		for (const fl of failures) insFail.run(fl.file, fl.error);
-		db.exec("DELETE FROM checkpoints;");
-		const insCp = db.prepare("INSERT INTO checkpoints(id, publisher, lc, state_root, heads, reducer_version) VALUES (?, ?, ?, ?, ?, ?)");
-		for (const c of (reduction as any).checkpoints ?? []) {
-			insCp.run(c.id, c.publisher, c.lc, c.state_root, JSON.stringify(c.heads), c.reducer_version);
-		}
-		const maxLc = wireEvents.reduce((m, e) => Math.max(m, e.lc), 0);
-		setMeta(db, "as_of", JSON.stringify({ heads: wireEvents.map((e) => e.id), lc: maxLc, wall_ts: new Date().toISOString() }));
 		setMeta(db, "completeness", failures.length ? "partial" : "complete");
 		setMeta(db, "reducer_version", reduction.version);
 		setMeta(db, "project", project);
 	} finally {
 		db.close();
 	}
-	return { events: wireEvents.length, failures: failures.length };
+	return { events: fullLog.length, failures: failures.length };
 }
 
 export function hasStore(issuesDir: string): boolean {
