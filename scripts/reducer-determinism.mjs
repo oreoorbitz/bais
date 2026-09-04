@@ -149,7 +149,7 @@ writeFileSync(
 	),
 );
 const ing = await ingestIssues(seedDir);
-check(ing.events > 0, `ingested TOML fixture (${ing.events} seed events)`);
+check(ing.events === 9, `ingested TOML fixture (${ing.events} seed events)`); // bi#58: exact — 2+1+2+4 from the four fixture files
 const seedEvents = readLogEvents(seedDir);
 check(seedEvents.length === ing.events, `log holds every seeded event (${seedEvents.length})`);
 
@@ -247,12 +247,19 @@ function buildFuzzLog() {
 	const probe = await replayInto(probeDir, fuzzLog);
 	check(probe.rejected.length === 0, `fuzz log chain-legal as a set (0 host rejects)`);
 	const snap = exportSnapshot(probeDir);
-	check(snap.tables.conflicts.length > 0, `fuzz hits the conflict path (${snap.tables.conflicts.length} conflict(s))`);
-	check(snap.tables.excluded.length > 0, `fuzz hits evidence paths (${snap.tables.excluded.length} excluded)`);
+	// bi#58: exact counts — the fuzz log is deterministic, so 1 conflict /
+	// 4 excluded is the equality form; `> 0` would still pass if a reducer
+	// change silently dropped half the evidence paths.
+	if (!Array.isArray(snap.tables.conflicts) || !Array.isArray(snap.tables.excluded)) {
+		failures++;
+		console.error(`FAIL: fuzz tables missing conflicts/excluded arrays`);
+	}
+	check(snap.tables.conflicts.length === 1, `fuzz hits the conflict path (${snap.tables.conflicts.length} conflict(s))`);
+	check(snap.tables.excluded.length === 4, `fuzz hits evidence paths (${snap.tables.excluded.length} excluded)`);
 	const fuzzBase = fingerprint(probeDir);
 	console.log(`fuzz projection: ${fuzzBase}`);
 	const rand = rng32(FUZZ_SEED);
-	let converged = true;
+	let convergedCount = 0; // bi#58: count, not boolean — every round must converge, and the count says how many did
 	for (let r = 0; r < FUZZ_ROUNDS; r++) {
 		const dir = join(root, `fuzz-${r}`, ".bais", "issues");
 		const order = shuffled(fuzzLog, rand);
@@ -260,16 +267,16 @@ function buildFuzzLog() {
 		if (res.rejected.length !== 0) {
 			failures++;
 			console.error(`FAIL: (c) round ${r}: ${res.rejected.length} host rejects (${JSON.stringify(res.rejected)})`);
-			converged = false;
 			continue;
 		}
 		const fp = fingerprint(dir);
 		if (fp !== fuzzBase) {
-			converged = false;
 			console.error(`DIVERGENCE (c/round ${r}, seed ${FUZZ_SEED}): ${fuzzBase} vs ${fp}`);
+			continue;
 		}
+		convergedCount++;
 	}
-	check(converged, `(c) ${FUZZ_ROUNDS} seeded interleavings (seed ${FUZZ_SEED}) converge`);
+	check(convergedCount === FUZZ_ROUNDS, `(c) ${convergedCount}/${FUZZ_ROUNDS} seeded interleavings (seed ${FUZZ_SEED}) converge`);
 }
 
 if (failures) {

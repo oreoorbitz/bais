@@ -56,7 +56,7 @@ const ing = await ingestIssues(issues);
 check(ing.events > 0, `ingested fixture store (${ing.events} events)`);
 const db = new DatabaseSync(join(dir, ".bais", "store.db"));
 const rows = db.prepare("SELECT id, author, seq, prev, project, entity, refs, lc, ts, type, body FROM events").all();
-check(rows.length > 0, `events table non-empty (${rows.length})`);
+check(rows.length === 3, `events table holds the whole seed log (${rows.length})`); // bi#58: exact — 2 creates + 1 transition from the 2-file fixture
 let devIds = 0;
 let unverified = 0;
 for (const r of rows) {
@@ -83,16 +83,18 @@ const claim = await fetch(base + "/claim", {
 	headers: { "content-type": "application/json" },
 	body: JSON.stringify({ task: "t1", holder: "did:key:a", ttl: 1000, epoch: 0, idem: "a1" }),
 }).then((r) => r.json());
-check(typeof claim.lease_id === "string" && BID.test(claim.lease_id), `claim returns content-hash lease_id (${String(claim.lease_id).slice(0, 16)}…)`);
+check(typeof claim.lease_id === "string" && claim.lease_id.length === 59 && BID.test(claim.lease_id), `claim returns content-hash lease_id (${String(claim.lease_id).slice(0, 16)}…)`); // bi#58: full 59-char CID shape, as in step 2
 const db2 = new DatabaseSync(join(dir, ".bais", "store.db"));
 const stored = db2.prepare("SELECT id, author, seq, prev, project, entity, refs, lc, ts, type, body, sig FROM events WHERE id = ?").get(claim.lease_id);
-check(!!stored, "claimed event persisted under its hash id");
+check(!!stored && stored.id === claim.lease_id, "claimed event persisted under its hash id"); // bi#58: id equality, not mere presence
 if (stored) {
 	const ok = verifyEventId({
 		author: stored.author, seq: stored.seq, prev: stored.prev, project: stored.project, entity: stored.entity,
 		refs: JSON.parse(stored.refs), lc: stored.lc, ts: stored.ts, type: stored.type,
 		body: JSON.parse(stored.body), sig: stored.sig ? stored.sig : null, id: stored.id,
 	});
+	// bi#58: boolean is inherent — crypto verification returns bool; the
+	// assertion is id-equality over the committed payload, which is exact.
 	check(ok, "hub-issued claim event re-verifies by id equality (structural dedup, no lc comparison)");
 }
 db2.close();

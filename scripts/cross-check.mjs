@@ -29,6 +29,38 @@ const fmt = (xs) => (xs.length ? xs.join(", ") : "(none)");
 const sorted = (xs) => [...new Set(xs)].sort();
 const asSet = (xs) => new Set(xs);
 
+// ---------------------------------------------------------------- G-strict (bi#60)
+// Injected-violation proof for the strict-TOML unknown-key gate
+// (bais/baml_src/ns_toml/toml.baml:399 `unknown top-level key`): a file that
+// is graph-valid in every other respect plus one unknown key must be (a)
+// caught by the strict gate and (b) missed by every pre-existing check.
+// Observed 2026-09-04 (tmp fixture, in-process): scan failures name the
+// file while the surviving graph stays clean — the graph layer cannot even
+// see the violation, which is exactly the gap the gate closes.
+{
+	const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const gd = mkdtempSync(join(tmpdir(), "bais-gstrict-"));
+	const gi = join(gd, ".bais", "issues");
+	mkdirSync(gi, { recursive: true });
+	writeFileSync(join(gi, "g#01.toml"), `id = "g#01"\ntitle = "good"\nstatus = "Open"\nkind = "Feat"\nbody = "x"\n`);
+	// Graph-valid (resolvable Blocks edge, exact-case enums) + one unknown key.
+	writeFileSync(join(gi, "bad.toml"),
+		`id = "g#02"\ntitle = "sneaky"\nstatus = "Open"\nkind = "Feat"\nbody = "x"\nfrobnicate = "evil"\n\n[[edge]]\nfrom = "g#01"\nto = "g#02"\nkind = "Blocks"\n`);
+	const got = await loadIssues(gi);
+	// (a) the new gate catches it: the strict parser rejects the file.
+	check(got.failures.length === 1 && got.failures[0].file === "bad.toml" && /unknown top-level key/.test(got.failures[0].error),
+		`G-strict(a): strict gate rejects the unknown-key file (${got.failures.map((f) => f.file).join(",")})`);
+	// (b) every pre-existing check misses it: the surviving graph is a clean
+	// world — g#01 parses, nothing dangles (the bad edge died with the bad
+	// file), nothing cycles, g#01 even reads ready. The graph layer reports
+	// zero problems while the unknown-key violation slips past it entirely.
+	const gSurvivorsReady = readyIssues(got.issues).map((f) => f.issue.id);
+	check(got.issues.length === 1 && JSON.stringify(gSurvivorsReady) === '["g#01"]',
+		`G-strict(b): pre-existing graph checks see a clean world (ready ${gSurvivorsReady.join(",")}, zero problems)`);
+}
+
 if (!existsSync(issuesDir)) {
 	console.error(`FAIL: issues dir missing: ${issuesDir}`);
 	process.exit(1);
@@ -125,6 +157,9 @@ const storeById = new Map(storeed.tasks.map((t) => [t.entity, t]));
 }
 
 // 4. graph: global edge sets (source|type|target triples — what traversal acts on).
+// bi#58: the ?? arms are not membership-where-equality-belongs — scan edges
+// carry from/to/kind while store rows carry source/type/target (documented
+// wire-shape bridge); both arms feed the same exact-triple comparison below.
 const triple = (e) => `${e.from ?? e.source}|${e.kind ?? e.type}|${e.to ?? e.target}`;
 {
 	const scanT = sorted(scanEdges.map(triple));

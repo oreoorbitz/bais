@@ -78,8 +78,9 @@ const toml = (id, title) => `id = "${id}"\ntitle = "${title}"\nstatus = "Open"\n
 for (const t of ["d1", "d2", "d3", "d4", "d5"]) writeFileSync(join(issues, `${t}.toml`), toml(t, `task ${t}`));
 
 const first = await ingestIssues(issues);
-check(first.events > 0, `ingested TOML fixture (${first.events} seed events)`);
+check(first.events === 5, `ingested TOML fixture (${first.events} seed events)`); // bi#58: exact — 5 Open edgeless issues seed exactly 5 events
 const seedOnly = readAllRows(issues);
+// bi#58: every() is the equality form for "all rows share one author" — inherently boolean.
 check(seedOnly.every((r) => r.author === "did:key:bais-seed"), "pre-hub log is seed-only");
 
 // --- (a) 10 events through the live hub: 5 claims + 5 renews ---
@@ -96,13 +97,13 @@ const post = async (path, body) => {
 const leaseIds = [];
 for (let i = 1; i <= 5; i++) {
 	const c = await post("/claim", { task: `d${i}`, holder: `did:key:h${i}`, ttl: 100000, epoch: 0, idem: `dur-${i}` });
-	check(c.status === 200, `claim d${i} admitted`);
+	check(c.status === 200 && c.json.holder === `did:key:h${i}` && c.json.task === `d${i}`, `claim d${i} admitted`); // bi#58: pin holder+task, not just the code
 	leaseIds.push(c.json.lease_id);
 }
 for (let i = 1; i <= 5; i++) {
 	const holder = `did:key:h${i}`;
 	const rn = await post("/renew", { lease_ref: leaseIds[i - 1], holder });
-	check(rn.status === 200, `renew d${i} admitted`);
+	check(rn.status === 200 && rn.json.lease_id === leaseIds[i - 1], `renew d${i} admitted`); // bi#58: pin lease continuity
 }
 await hub.close();
 
@@ -125,11 +126,12 @@ check(fingerprint(issues) === preFp, "projection identical across ingest (tasks 
 
 // --- (b) snapshot export/import round-trip ---
 const cp = await publishCheckpoint(issues);
-check(!!cp.id && cp.state_root.length === 64, `checkpoint published (${cp.id})`);
+const BID = /^b[abcdefghijklmnopqrstuvwxyz234567]+$/;
+check(typeof cp.id === "string" && BID.test(cp.id) && cp.state_root.length === 64, `checkpoint published (${cp.id})`); // bi#58: CID shape, not truthy
 const srcHubRows = canon(hubRows(readAllRows(issues)));
 const srcFp = fingerprint(issues);
 const snap = exportSnapshot(issues);
-check(!!snap.checkpoint, "snapshot carries the checkpoint");
+check(snap.checkpoint.id === cp.id, "snapshot carries the checkpoint"); // bi#58: exact linkage, not truthy
 
 const issuesB = join(root, "b", ".bais", "issues");
 mkdirSync(issuesB, { recursive: true });

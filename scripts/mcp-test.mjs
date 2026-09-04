@@ -44,6 +44,11 @@ console.log("oversight keys:", Object.keys(over).join(","));
 const samp = JSON.parse(byId[4]?.result?.content?.[0]?.text ?? "{}");
 console.log("sample:", samp.total, samp.sample?.map((t) => t.entity).join(","));
 console.log("bad tool error:", byId[5]?.error?.code, byId[5]?.error?.message);
-const ok = byId[1]?.result && byId[2]?.result?.tools?.length === 6 && over.as_of && samp.total === 1 && byId[5]?.error?.code === -32602;
+// bi#58: every conjunct is now equality — server name + protocol version
+// (not truthy `result`), oversight completeness + lc type (not truthy
+// `as_of`), exact tool count, exact sample total, exact JSON-RPC code.
+const ok = byId[1]?.result?.serverInfo?.name === "bais" && byId[1]?.result?.protocolVersion === "2024-11-05"
+	&& byId[2]?.result?.tools?.length === 6 && over.completeness === "complete" && typeof over.as_of?.lc === "number"
+	&& samp.total === 1 && byId[5]?.error?.code === -32602;
 console.log(ok ? "MCP: all green" : "MCP: FAILURES");
 process.exit(ok ? 0 : 1);

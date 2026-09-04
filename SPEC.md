@@ -482,3 +482,30 @@ different edges MUST NOT clobber each other.
 conventions documented here (`Kind.NewKind`, `Issue.new_field?: type`); the
 grammar never forks, so existing TOML training data keeps applying. The event
 log versions via wire `@<n>` suffixes and `schema.register`, never renames.
+
+## 8. Gate-authoring checklist (bi#55/bi#60)
+
+(No new fail-closed path lands without these. Note: bi#55 ordered this rule
+into SPEC.md but no such section existed — this checklist is its first home.)
+
+- [ ] (a) Named reason: every reject/exclude/park path returns a
+  machine-readable reason code (`cap-denied`, `stale-fence`, `chain-break`,
+  `store-integrity-mismatch`, `budget-exhausted`, `sig-required`, …).
+- [ ] (b) Surface: the reason appears in `oversight --json` or CLI output —
+  conservatism without a reporter is silence.
+- [ ] (c) Test: a test asserts the reason fires when deliberately triggered
+  (one triggered rejection per path shows its reason).
+- [ ] (d) Injection proof (bi#60): ship an injected violation showing (i) the
+  new gate catches it and (ii) every pre-existing check misses it. If the
+  existing checks already catch it, the gate is redundant — document it as
+  rejected and do not ship it. Current proofs: strict-TOML unknown-key
+  (`cross-check.mjs` G-strict), hasStore fallback (`fault-drills.mjs`
+  G-fallback), fencing refuse (`lease-race.mjs` G-fencing), budget cap
+  (`lease-race.mjs` G-budget-claim claim-path 402, `fault-drills.mjs`
+  G-budget-sync sync path), sig requirement (`fault-drills.mjs` G-sig).
+- [ ] Rejected (redundant — do not ship): ingress reject of unknown event
+  types on `POST /sync`. The reducer already quarantines unknown types as
+  evidence excluded from state (`reducer-determinism.mjs` pins the exact
+  excluded count) and sync persists them as evidence rows; a reject would
+  add no new catch and would destroy the audit trail the evidence feeds
+  depend on.

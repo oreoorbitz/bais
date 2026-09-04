@@ -39,9 +39,9 @@ const mkfix = () => {
 	const r = run(d, ["move", "t#01", "Done"]);
 	check("49.scan.blocker.exit0", r.code === 0, JSON.stringify(r));
 	check("49.scan.blocker.exact", r.out === "moved\tt#01\tOpen\tDone\nunblocked\tt#02\tdownstream work\n", JSON.stringify(r.out));
-	check("49.scan.blocker.file-updated", readFileSync(join(is, "t#01.toml"), "utf8").includes('status = "Done"'));
+	check("49.scan.blocker.file-updated", /^status = "Done"$/m.test(readFileSync(join(is, "t#01.toml"), "utf8"))); // bi#58: line-anchored, not substring
 	const r2 = run(d, ["ready"]);
-	check("49.scan.blocker.ready-consistent", r2.out.includes("t#02\tdownstream work") && r2.out.includes("t#03\tlone"), JSON.stringify(r2.out));
+	check("49.scan.blocker.ready-consistent", r2.code === 0 && r2.out === "t#02\tdownstream work\nt#03\tlone\n", JSON.stringify(r2.out)); // bi#58: exact ready set+order, not two includes
 }
 // --- scan path: non-blocker move prints nothing extra ---
 {
@@ -71,22 +71,27 @@ const mkfix = () => {
 	writeFileSync(join(is, "t#01.toml"), issue("t#01", "blocker", "Open"));
 	writeFileSync(join(is, "t#02.toml"), issue("t#02", "downstream work", "Open", [["t#01", "t#02", "Blocks"]]));
 	const ing = run(d, ["ingest"]);
-	check("49.store.ingest", ing.code === 0, JSON.stringify(ing));
+	check("49.store.ingest", ing.code === 0 && ing.out === "ingested 3 events (0 unparseable) → .bais/store.db\n", JSON.stringify(ing)); // bi#58: exact ingest report — 2 creates + 1 RelAdd from the Blocks edge
 	const r = run(d, ["move", "t#01", "Done"]);
 	check("49.store.blocker.exact", r.code === 0 && r.out === "moved\tt#01\tOpen\tDone\nunblocked\tt#02\tdownstream work\n", JSON.stringify(r));
 	const rj = run(d, ["ready", "--json"]);
 	const ready = JSON.parse(rj.out).ready.map((f) => f.issue.id);
-	check("49.store.projection-consistent", ready.includes("t#02") && !ready.includes("t#01"), rj.out);
+	check("49.store.projection-consistent", JSON.stringify(ready) === '["t#02"]', rj.out); // bi#58: exact ready array, not includes-pair
 }
 // --- errors ---
 {
 	const d = mkfix();
 	const is = join(d, ".bais", "issues");
 	writeFileSync(join(is, "t#01.toml"), issue("t#01", "blocker", "Open"));
-	check("49.err.unknown-id", run(d, ["move", "t#99", "Done"]).code === 1);
-	check("49.err.bad-status", run(d, ["move", "t#01", "Finished"]).code === 1);
-	check("49.err.missing-args", run(d, ["move", "t#01"]).code === 1);
-	check("49.err.file-untouched", readFileSync(join(is, "t#01.toml"), "utf8").includes('status = "Open"'));
+	// bi#58: exit codes mask stderr — each error pins its exact message (a
+	// silent `process.exit(1)` with no reason would pass the old checks).
+	const e1 = run(d, ["move", "t#99", "Done"]);
+	check("49.err.unknown-id", e1.code === 1 && e1.out === "bais move: unknown issue t#99\n", JSON.stringify(e1));
+	const e2 = run(d, ["move", "t#01", "Finished"]);
+	check("49.err.bad-status", e2.code === 1 && e2.out === "bais move <id> <status> — status one of Open|Doing|Blocked|Done|Dropped\n", JSON.stringify(e2));
+	const e3 = run(d, ["move", "t#01"]);
+	check("49.err.missing-args", e3.code === 1 && e3.out === "bais move <id> <status> — status one of Open|Doing|Blocked|Done|Dropped\n", JSON.stringify(e3));
+	check("49.err.file-untouched", /^status = "Open"$/m.test(readFileSync(join(is, "t#01.toml"), "utf8")));
 }
 console.log(`\nprobe49: ${pass} pass, ${fail} fail`);
 process.exit(fail ? 1 : 0);

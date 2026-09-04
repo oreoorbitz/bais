@@ -39,12 +39,15 @@ const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], {
 	const child = spawn("node", [CLI, "ready", "--wait", "--timeout", "20"], { cwd: d, stdio: ["ignore", "pipe", "pipe"] });
 	const done = waitForExit(child);
 	await new Promise((r) => setTimeout(r, 1500));
+	// bi#58: liveness is inherently boolean — the process is either waiting or exited.
 	check("45.store.sleeps", alive(child), `exited early code=${child.exitCode}`);
 	freeBlocker(d); // admit: TaskTransition equivalent — frees t#02, touches store
 	const t0 = Date.now();
 	const res = await done;
 	const dt = Date.now() - t0;
 	check("45.store.wakes-exit0", res.code === 0, JSON.stringify(res));
+	// bi#58: the bound binds — a waiter that sleeps through the change wakes
+	// only at the 20s timeout (dt ≈ 20000); 5000 separates wake from timeout.
 	check("45.store.wakes-fast", dt < 5000, `${dt}ms`);
 	check("45.store.fresh-set", res.out === "t#02\tdownstream work\n", JSON.stringify(res.out));
 }
@@ -69,6 +72,8 @@ const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], {
 	const dt = Date.now() - t0;
 	check("45.timeout.exit0", res.code === 0, JSON.stringify(res));
 	check("45.timeout.empty-text", res.out === "(no ready issues)\n", JSON.stringify(res.out));
+	// bi#58: both sides bind — dt >= 900 proves it actually waited the
+	// --timeout 1 (no instant empty), dt < 8000 proves it did not hang.
 	check("45.timeout.timing", dt >= 900 && dt < 8000, `${dt}ms`);
 }
 {
@@ -87,6 +92,7 @@ const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], {
 	const res = await waitForExit(child);
 	const dt = Date.now() - t0;
 	check("45.immediate.fresh", res.code === 0 && res.out === "t#02\tdownstream work\n", JSON.stringify(res.out));
+	// bi#58: binds — a waiter that always sleeps takes >= 1500ms+timeout ramp; 3000 separates immediate from waiting.
 	check("45.immediate.no-sleep", dt < 3000, `${dt}ms`);
 }
 // --- bad timeout rejected ---
@@ -94,7 +100,8 @@ const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], {
 	const d = mkfix(false);
 	const child = spawn("node", [CLI, "ready", "--wait", "--timeout", "abc"], { cwd: d, stdio: ["ignore", "pipe", "pipe"] });
 	const res = await waitForExit(child);
-	check("45.bad-timeout.exit1", res.code === 1, JSON.stringify(res));
+	// bi#58: exit codes mask stderr — pin the usage reason, not just code 1.
+	check("45.bad-timeout.exit1", res.code === 1 && res.out === "bais ready --wait needs --timeout <non-negative seconds>\n", JSON.stringify(res));
 }
 console.log(`\nprobe45: ${pass} pass, ${fail} fail`);
 process.exit(fail ? 1 : 0);
