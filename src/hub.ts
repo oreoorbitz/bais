@@ -37,7 +37,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { event } from "../baml_sdk/index.js";
 import { projectName } from "./graph.js";
 import { eventId } from "./ids.js";
-import { refreshProjectionTables, ensureSchema, exportSnapshot, mergeAnchorReduction, storeOversight } from "./store.js";
+import { refreshProjectionTables, ensureSchema, exportSnapshot, mergeAnchorReduction, storeOversight, sealProjection, verifyProjection } from "./store.js";
 import {
 	generatePeerKey,
 	signPayload,
@@ -684,6 +684,8 @@ export async function pruneBelowCheckpoint(
 		upsert.run("prune_anchor", JSON.stringify(anchor));
 		upsert.run("author_cursors", JSON.stringify(cursors));
 		upsert.run("anchor_reduction", JSON.stringify(anchorReduction));
+		// Anchor meta is fingerprinted: reseal after pruning.
+		sealProjection(db);
 		return { pruned: Number((del as any).changes ?? 0), anchor };
 	} finally {
 		db.close();
@@ -712,6 +714,14 @@ export async function createHub(
 	if (!usable) {
 		db.close();
 		throw new Error(`no log to coordinate: run \`bais ingest\` in ${issuesDir} first`);
+	}
+	// Fail-stop on content rot (bi#41): the hub holds this connection for
+	// its lifetime, so per-open verification never re-runs — check once at
+	// boot. A flipped store must never coordinate.
+	const bootCheck = verifyProjection(db);
+	if (!bootCheck.ok) {
+		db.close();
+		throw new Error(`store-integrity-mismatch at hub boot (${bootCheck.detail}) — restore store.db or re-ingest before coordinating`);
 	}
 	const project = opts.project ?? projectName(issuesDir);
 	const limits = {
@@ -972,15 +982,15 @@ export async function createHub(
 				return;
 			}
 			const lc = nextLc();
+			// Entity is resolved BEFORE id assignment: the content hash must
+			// commit to the stored bytes (bi#41 caught a post-id mutation here).
+			const rec = (lastReduction.leases as any[]).find((l) => l.lease_id === lease_ref);
 			const fields = {
 				author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
-				project, entity: "", refs: [], lc, ts: new Date().toISOString(),
+				project, entity: rec.entity, refs: [], lc, ts: new Date().toISOString(),
 				type: "LeaseRenew", body: { lease_ref }, sig: null,
 			};
 			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
-			// Entity is cosmetic for renew/release; resolve it for the log.
-			const rec = (lastReduction.leases as any[]).find((l) => l.lease_id === lease_ref);
-			candidate.entity = rec.entity;
 			if (needsCap(holder, "lease.renew", rec.entity)) {
 				send(res, 403, { reason: "cap-denied", action: "lease.renew", scope: rec.entity });
 				return;

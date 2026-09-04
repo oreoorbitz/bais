@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { cyclicIds, danglingRefsIn, loadIssues, projectName, readyIssues, whyNotIn } from "./graph.js";
 import { parseBaisFile } from "./toml.js";
 import type { WhyNot } from "./graph.js";
-import { hasStore, ingestIssues, storeCaps, storeCheck, storeEdges, storeGraph, storeList, storeOversight, storeReady, storeSample, storeWhyNot } from "./store.js";
+import { hasStore, ingestIssues, storeCaps, storeCheck, storeEdges, storeGraph, storeList, storeOversight, storeReady, storeSample, storeWhyNot, verifyStore, deepVerify } from "./store.js";
 import { createHub } from "./hub.js";
 import { loadPeerKey, appendForeignEvents, publishCheckpoint, verifyCheckpointRoot } from "./hub.js";
 import { exportSnapshot, importSnapshot, markBootstrapComplete, recordImportedAnchor } from "./store.js";
@@ -31,6 +31,7 @@ Usage:
                                 # carries as_of + completeness from the store
   bais move <id> <status> [--json]  # prints newly-unblocked set
   bais check [--json]
+  bais verify [--deep] [--json]  # content fingerprint (deep: full BAML re-reduce + id sweep)
   bais graph --from <id> [--json]   # recursive CTE from the store, BFS fallback
   bais hub [--port N]               # lease coordinator (Phase 3), serves until SIGINT
   bais keygen [--force]             # peer ed25519 identity (.bais/key.json)
@@ -322,6 +323,41 @@ if (cmd === "graph") {
 		else for (const f of files) console.log(`${f.issue.id}\t${f.issue.title}`);
 	}
 	process.exit(0);
+}
+
+if (cmd === "verify") {
+	ensureInit();
+	if (!existsSync(join(root, "store.db"))) {
+		console.error("verify needs .bais/store.db — run bais ingest");
+		process.exit(1);
+	}
+	let fp: { ok: boolean; detail: string };
+	try {
+		fp = verifyStore(issuesDir);
+	} catch (e) {
+		// Structurally unreadable (not just content-flipped): name it.
+		fp = { ok: false, detail: `unreadable: ${e instanceof Error ? e.message : e}` };
+	}
+	if (!fp.ok && fp.detail.startsWith("unsealed-legacy")) {
+		// Legacy stores predate fingerprints — that is a state, not a failure.
+		if (!asJson) console.log(`verify\tok\t${fp.detail}`);
+		else console.log(JSON.stringify({ ok: true, fingerprint: fp.detail, problems: [] }, null, 2));
+		process.exit(0);
+	}
+	let problems: string[] = [];
+	if (!fp.ok) problems.push(`fingerprint: ${fp.detail}`);
+	if (argv.includes("--deep")) {
+		const deep = await deepVerify(issuesDir);
+		problems.push(...deep.problems);
+	}
+	if (asJson) {
+		console.log(JSON.stringify({ ok: problems.length === 0, fingerprint: fp.detail, problems }, null, 2));
+	} else if (problems.length === 0) {
+		console.log(`verify\tok\tfingerprint ${fp.detail}`);
+	} else {
+		for (const p of problems) console.log(`verify\tFAIL\t${p}`);
+	}
+	process.exit(problems.length === 0 ? 0 : 1);
 }
 
 if (cmd === "check") {

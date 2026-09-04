@@ -16,7 +16,8 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { event } from "../baml_sdk/index.js";
 import { parseBaisFile } from "./toml.js";
-import { eventId } from "./ids.js";
+import { eventId, verifyEventId } from "./ids.js";
+import { createHash } from "node:crypto";
 import { projectName } from "./graph.js";
 import { whyNotIn } from "./graph.js";
 import type { BaisEdge, BaisFile, HostLease, WhyNot } from "./graph.js";
@@ -91,9 +92,123 @@ export function ensureSchema(db: DatabaseSync): void {
 	if (!leaseCols.has("expires_lc")) db.exec("ALTER TABLE leases ADD COLUMN expires_lc INTEGER");
 }
 
-function openDb(issuesDir: string): DatabaseSync {
+// Content verification (bi#41): every projection table + the anchor meta
+// that feeds reads is hashed at every write (sealProjection, called at the
+// end of refreshProjectionTables) and re-hashed on every open. A mismatch
+// THROWS — a silently flipped bit must never become a confident answer.
+// Missing seal = pre-fingerprint legacy store: warn once, proceed, and let
+// `bais ingest` (which reseals) be the upgrade path. Threat model is rot,
+// not an active adversary (TOCTOU between verify and read is accepted).
+const FP_TABLES = [
+	"events",
+	"tasks",
+	"rels",
+	"conflicts",
+	"excluded",
+	"leases",
+	"verifies",
+	"budgets",
+	"checkpoints",
+	"submissions",
+	"caps",
+];
+// Anchor meta feeds merged reads, so it is fingerprinted too. Volatile
+// operational keys (bootstrap, as_of wall clock is sealed at write) stay out.
+const FP_META = ["anchor_reduction", "prune_anchor", "author_cursors"];
+
+export function fingerprintProjection(db: DatabaseSync): string {
+	const h = createHash("sha256");
+	for (const t of FP_TABLES) {
+		// SELECT * column order is schema order — deterministic across runs.
+		for (const r of db.prepare(`SELECT * FROM ${t} ORDER BY rowid`).all() as any[]) {
+			h.update(JSON.stringify(r));
+		}
+		h.update(`|${t}|`);
+	}
+	for (const k of FP_META) {
+		h.update(`${k}=${getMeta(db, k) ?? ""}`);
+	}
+	return h.digest("hex");
+}
+
+export function sealProjection(db: DatabaseSync): void {
+	setMeta(db, "projection_fp", fingerprintProjection(db));
+}
+
+// Deep verification (bi#41, for `bais verify --deep`): full BAML
+// re-reduction over the stored log plus per-event id re-verification,
+// compared field-by-field against the materialized tables. Slow
+// (whole-log reduce) — the fingerprint above is the per-open fast path.
+// Entry point for `bais verify`: fingerprint check on a throwaway connection.
+export function verifyStore(issuesDir: string): { ok: boolean; detail: string } {
+	const db = openDb(issuesDir, { skipVerify: true });
+	try {
+		return verifyProjection(db);
+	} finally {
+		db.close();
+	}
+}
+
+export async function deepVerify(issuesDir: string): Promise<{ ok: boolean; problems: string[] }> {
+	const problems: string[] = [];
+	const db = openDb(issuesDir, { skipVerify: true });
+	try {
+		const rows = db.prepare("SELECT * FROM events ORDER BY lc, id").all() as any[];
+		const wire = rows.map((r) => ({
+			id: r.id, author: r.author, seq: r.seq, prev: r.prev, project: r.project,
+			entity: r.entity, refs: JSON.parse(r.refs), lc: r.lc, ts: r.ts, type: r.type,
+			body: JSON.parse(r.body), sig: r.sig ?? null,
+			admitted: r.admitted === 1, drop_reason: r.drop_reason ?? null,
+		}));
+		for (const e of wire) {
+			if (!verifyEventId(e)) problems.push(`id-mismatch: stored id does not re-hash (entity ${e.entity}, type ${e.type}, id ${String(e.id).slice(0, 16)}…)`);
+		}
+		const reduction = (await event.reduce(wire)) as any;
+		const issues = new Map((reduction.issues as any[]).map((t: any) => [t.entity, t]));
+		for (const r of db.prepare("SELECT entity, title, status FROM tasks").all() as any[]) {
+			const t = issues.get(r.entity);
+			if (!t) problems.push(`phantom-task: tasks row with no reduced issue (${r.entity})`);
+			else if (t.status !== r.status || t.title !== r.title) {
+				problems.push(`drift: ${r.entity} table=(${r.status}) reduced=(${t.status})`);
+			}
+		}
+		for (const t of issues.values() as any) {
+			const row = db.prepare("SELECT entity FROM tasks WHERE entity = ?").get((t as any).entity);
+			if (!row) problems.push(`missing-task: reduced issue with no tasks row (${(t as any).entity})`);
+		}
+		return { ok: problems.length === 0, problems };
+	} finally {
+		db.close();
+	}
+}
+
+export function verifyProjection(db: DatabaseSync): { ok: boolean; detail: string } {
+	const sealed = getMeta(db, "projection_fp");
+	if (!sealed) return { ok: true, detail: "unsealed-legacy (re-ingest to seal)" };
+	const now = fingerprintProjection(db);
+	if (now === sealed) return { ok: true, detail: "match" };
+	return { ok: false, detail: "fingerprint-mismatch: store.db content changed outside a sealed write" };
+}
+
+const warnedUnsealed = new Set<string>();
+
+function openDb(issuesDir: string, opts?: { skipVerify?: boolean }): DatabaseSync {
 	const db = new DatabaseSync(dbPathFor(issuesDir));
 	ensureSchema(db);
+	if (!opts?.skipVerify) {
+		const v = verifyProjection(db);
+		if (!v.ok) {
+			db.close();
+			throw new Error(`store-integrity-mismatch (${v.detail}) — refusing to serve ${dbPathFor(issuesDir)}; restore store.db or re-ingest`);
+		}
+		if (v.detail.startsWith("unsealed-legacy")) {
+			const p = dbPathFor(issuesDir);
+			if (!warnedUnsealed.has(p)) {
+				warnedUnsealed.add(p);
+				console.error(`warn: ${p} predates content fingerprints — reads proceed unverified; run \`bais ingest\` to seal`);
+			}
+		}
+	}
 	return db;
 }
 
@@ -213,6 +328,15 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 					// sync) carry over; the guards below stay for old stores.
 					if (r.author === seedAuthor) continue;
 					if (freshSeedIds.has(r.id) || String(r.id).startsWith("seed:")) continue;
+					// Legacy dev-id rows (pre-bi#38) cannot self-verify and
+					// would trip the build-time sweep below: drop with a
+					// LOUD record (completeness goes partial, failures table
+					// names the row) instead of failing the whole ingest or
+					// — worse — sealing the unverifiable.
+					if (!/^b[abcdefghijklmnopqrstuvwxyz234567]+$/.test(String(r.id))) {
+						failures.push({ file: `store.db:${r.id}`, error: "legacy dev-id row dropped on merge (cannot self-verify; re-issue via hub)" });
+						continue;
+					}
 					hubKept.push({
 						wire: {
 							id: r.id,
@@ -258,9 +382,19 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 	// 1 per ingest); prune + edit-TOML + ingest stays operator territory.
 	const seedKept = anchorLc > 0 ? wireEvents.filter((e) => e.lc > anchorLc) : wireEvents;
 	const fullLog = [...seedKept, ...hubKept.map((h) => h.wire)];
+	// Self-verifying ids (bi#38) are checked at build time: every event
+	// must re-hash to its id, or the log is corrupt — fail closed here
+	// rather than sealing a lie.
+	for (const e of fullLog) {
+		if (!verifyEventId(e)) {
+			throw new Error(`ingest refusing: event id does not verify (entity ${e.entity}, type ${e.type}) — log corrupt, not sealing`);
+		}
+	}
 	const reduction = (await event.reduce(fullLog)) as any;
 	if (reduction.version !== "bais.reduce@1") throw new Error(`reducer version skew: ${reduction.version}`);
-	const db = openDb(issuesDir);
+	// skipVerify: ingest wipes and rebuilds every fingerprinted table, then
+	// reseals via refreshProjectionTables below — there is nothing to check yet.
+	const db = openDb(issuesDir, { skipVerify: true });
 	try {
 		db.exec("DELETE FROM events; DELETE FROM tasks; DELETE FROM rels; DELETE FROM conflicts; DELETE FROM excluded; DELETE FROM failures; DELETE FROM leases; DELETE FROM verifies; DELETE FROM budgets; DELETE FROM checkpoints; DELETE FROM submissions; DELETE FROM caps;");
 		// Prune floors, the anchor reduction, and bootstrap locks are
@@ -292,10 +426,9 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 }
 
 export function hasStore(issuesDir: string): boolean {
-	// Existence-only is not enough: a structurally damaged store.db must read
-	// as absent so every caller falls back to the directory scan (fail-closed).
-	// Silent *content* flips pass quick_check — those are bi#41 (content
-	// verification via the hash-chained log), not this function.
+	// A store counts as present only if it is structurally sound AND its
+	// content fingerprint verifies (bi#41) — anything else reads as absent
+	// so every caller falls back to the directory scan (fail-closed).
 	const p = dbPathFor(issuesDir);
 	try {
 		if (!existsSync(p)) return false;
@@ -303,7 +436,8 @@ export function hasStore(issuesDir: string): boolean {
 		const db = new DatabaseSync(p);
 		try {
 			const rows = db.prepare("PRAGMA quick_check").all() as { quick_check: string }[];
-			return rows.length === 1 && rows[0].quick_check === "ok";
+			if (!(rows.length === 1 && rows[0].quick_check === "ok")) return false;
+			return verifyProjection(db).ok;
 		} finally {
 			db.close();
 		}
@@ -885,6 +1019,8 @@ export function refreshProjectionTables(db: DatabaseSync, reduction: any, heads:
 		insCap.run(c.grant_id, c.issuer, c.audience, JSON.stringify(c.can), c.scope, c.expiry_lc, c.budget_cap_usd ?? null, c.budget_cap_tokens ?? null, c.revoked ? 1 : 0, c.revoked_by ?? null);
 	}
 	setMeta(db, "as_of", JSON.stringify({ heads, lc: maxLc, wall_ts: new Date().toISOString() }));
+	// Seal LAST: the fingerprint commits to every table + anchor meta above.
+	sealProjection(db);
 }
 
 // Anchor inherited from a snapshot import (signature-trust bootstrap):
@@ -902,6 +1038,8 @@ export function recordImportedAnchor(
 		const upsert = db.prepare("INSERT INTO meta(k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v");
 		upsert.run("prune_anchor", JSON.stringify({ ...anchor, source: "snapshot-import" }));
 		upsert.run("anchor_reduction", JSON.stringify(reduction));
+		// Anchor meta is fingerprinted: reseal after writing it.
+		sealProjection(db);
 		const floors: Record<string, { seq: number; id: string }> = {};
 		for (const c of cursors) {
 			const cur = floors[c.author];
