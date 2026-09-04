@@ -11,7 +11,7 @@
 // command falls back to the readdir scan when it is absent.
 
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { event } from "../baml_sdk/index.js";
 import { parseBaisFile } from "./toml.js";
@@ -218,7 +218,25 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 }
 
 export function hasStore(issuesDir: string): boolean {
-	return existsSync(dbPathFor(issuesDir));
+	// Existence-only is not enough: a structurally damaged store.db must read
+	// as absent so every caller falls back to the directory scan (fail-closed).
+	// Silent *content* flips pass quick_check — those are bi#41 (content
+	// verification via the hash-chained log), not this function.
+	const p = dbPathFor(issuesDir);
+	try {
+		if (!existsSync(p)) return false;
+		if (statSync(p).size === 0) return false;
+		const db = new DatabaseSync(p);
+		try {
+			const rows = db.prepare("PRAGMA quick_check").all() as { quick_check: string }[];
+			return rows.length === 1 && rows[0].quick_check === "ok";
+		} finally {
+			db.close();
+		}
+	} catch (e) {
+		console.error(`warn: store.db failed verification (${e instanceof Error ? e.message : e}) — falling back to directory scan`);
+		return false;
+	}
 }
 
 export function readAsOf(issuesDir: string): { as_of: AsOf; completeness: Completeness } {
