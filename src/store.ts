@@ -16,6 +16,8 @@ import { join, resolve } from "node:path";
 import { event } from "../baml_sdk/index.js";
 import { parseBaisFile } from "./toml.js";
 import { projectName } from "./graph.js";
+import { whyNotIn } from "./graph.js";
+import type { BaisEdge, BaisFile, HostLease, WhyNot } from "./graph.js";
 
 export type AsOf = { heads: string[]; lc: number; wall_ts: string };
 export type Completeness = "complete" | "partial";
@@ -323,6 +325,61 @@ export function storeReady(issuesDir: string): { ready: StoredTask[]; as_of: AsO
 function readAsOfFrom(db: DatabaseSync): { as_of: AsOf; completeness: Completeness } {
 	const as_of = JSON.parse(getMeta(db, "as_of") ?? '{"heads":[],"lc":0,"wall_ts":""}') as AsOf;
 	return { as_of, completeness: (getMeta(db, "completeness") ?? "partial") as Completeness };
+}
+
+// Leases materialize what BAML current_lease derives (ns_event/lease.baml):
+// one row per live claim. Mirrors storeReady's exclusion exactly — any row
+// for the task keeps it out of ready, so any row earns a Leased reason. At
+// most one row per task survives the projection (only active leases are
+// stored); the latest-expiring row wins if history ever lands here.
+export function storeLeases(issuesDir: string): HostLease[] {
+	const db = openDb(issuesDir);
+	try {
+		return (
+			db
+				.prepare(
+					`SELECT task AS entity, holder, expires_lc FROM leases ORDER BY expires_lc DESC`,
+				)
+				.all() as { entity: string; holder: string; expires_lc: number | null }[]
+		).filter((r, i, rows) => rows.findIndex((o) => o.entity === r.entity) === i);
+	} finally {
+		db.close();
+	}
+}
+
+// Store-backed `ready --why-not`: the same whyNotIn mirror over the
+// projection (tasks + rels + leases), so the store and scan paths agree the
+// way storeReady/readyIssues do. Read-only; existing queries are untouched.
+export function storeWhyNot(issuesDir: string): { reasons: WhyNot[]; as_of: AsOf; completeness: Completeness } {
+	const { tasks, as_of, completeness } = storeList(issuesDir);
+	const edges = storeEdges(issuesDir);
+	const byDeclarer = new Map<string, BaisEdge[]>();
+	for (const e of edges) {
+		const list = byDeclarer.get(e.declaredBy) ?? [];
+		list.push({ from: e.source, to: e.target, kind: e.type });
+		byDeclarer.set(e.declaredBy, list);
+	}
+	const files: BaisFile[] = tasks.map((t) => ({
+		issue: {
+			id: t.entity,
+			title: t.title,
+			status: t.status,
+			kind: t.kind,
+			area: t.area,
+			severity: t.severity,
+			source: t.source,
+			body: t.body,
+		},
+		edges: byDeclarer.get(t.entity) ?? [],
+	}));
+	const db = openDb(issuesDir);
+	let project = "";
+	try {
+		project = getMeta(db, "project") ?? "";
+	} finally {
+		db.close();
+	}
+	return { reasons: whyNotIn(files, project, storeLeases(issuesDir)), as_of, completeness };
 }
 
 // Recursive CTE over rels (both directions — the traversal callers expect).

@@ -1053,3 +1053,275 @@ test "shared blockers split the one-away bonus but keep fan-out" {
     assert.equal(u.sole_unblocks, 1);
     assert.equal(u.blocks_part, 3)
 }
+
+// ── ready --why-not ─────────────────────────────────────────────────────────
+// `ready` omits blocked issues silently — "nothing ready" is indistinguishable
+// from "everything parked behind one stuck node". why_not shapes the existing
+// classifiers (is_blocked, dangling_edge_refs/classify_ref, cyclic_ids, and
+// the lease state current_lease derives) into one reason per omission, so
+// every Open-but-unready issue carries the exact edge/lease/cycle.
+//
+// Scope: only Open issues are reasoned about, and only when they are omitted
+// from ready — every omission carries its reason, and every reason marks an
+// omission. Done/Dropped are finished, not jammed (an all-Done backlog reports
+// empty with no reasons); Doing/Blocked are worker states whose status is
+// self-describing in `list`. An Open issue that is still listed as ready
+// carries no reason even when it sits in a dependency cycle (a DependsOn-only
+// cycle never blocks, so both members stay ready): `check` remains the cycle
+// diagnosis there, and why-not stays purely omission-explaining.
+//
+// Leases arrive as plain IssueLease data, not via ns_event: namespaces do not
+// import each other, and the host's leases table already materializes what
+// current_lease derives. The scan path (no store, no leases) passes [].
+enum WhyNotKind {
+    BlockedBy,
+    DanglingRef,
+    InCycle,
+    Leased,
+}
+
+class IssueLease {
+    entity: string @description("issue id under lease, e.g. bi#09"),
+    holder: string @description("did:key:... holding the lease"),
+    expires_lc: int? @description("lease expiry in lc ticks, null when unknown"),
+}
+
+// One omission, one reason. Exactly the fields for `kind` are set; the rest
+// are null. Field names are the host JSON contract (`--json` reasons
+// round-trip through the generated SDK types unchanged).
+class WhyNot {
+    id: string @description("the Open-but-unready issue"),
+    kind: WhyNotKind,
+    blocker: string? @description("BlockedBy: the blocking issue id"),
+    blocker_status: string? @description("BlockedBy: blocker status via to_string"),
+    edge_from: string? @description("BlockedBy/DanglingRef: the exact edge"),
+    edge_to: string? @description("BlockedBy/DanglingRef: the exact edge"),
+    edge_kind: string? @description("BlockedBy/DanglingRef: the exact edge"),
+    ref_id: string? @description("DanglingRef: the unresolvable id"),
+    ref_side: string? @description("\"from\" or \"to\": which end `ref_id` came from"),
+    ref_status: string? @description("DanglingRef: Missing or External via to_string"),
+    cycle: string[]? @description("InCycle: the leftover members naming the cycle"),
+    holder: string? @description("Leased: lease holder"),
+    expires_lc: int? @description("Leased: lease expiry in lc ticks"),
+}
+
+// Test helper: the verbose literal is the spec, this is just brevity.
+function mk_issue(id: string, status: Status) -> Issue {
+    Issue {
+        id: id,
+        title: id,
+        status: status,
+        kind: Kind.Bug,
+        area: null,
+        severity: null,
+        source: null,
+        body: "",
+    }
+}
+
+function lease_for(entity: string, leases: IssueLease[]) -> IssueLease? {
+    for (let l in leases) {
+        if (l.entity == entity) {
+            return l;
+        }
+    }
+    null
+}
+
+function why_not(issues: Issue[], edges: Edge[], project: string, leases: IssueLease[]) -> WhyNot[] {
+    let out: WhyNot[] = [];
+    let cyclic = cyclic_ids(issues, edges);
+    for (let issue in issues) {
+        // Omission gate: ready on every path is Open + unblocked (+ unleased
+        // where the store knows leases — the scan path passes []). An issue
+        // that survives it is listed as ready and carries no reason.
+        if (issue.status == Status.Open && (is_blocked(issue, edges, issues) || lease_for(issue.id, leases) != null)) {
+            // Each still-blocking Blocks edge contributes its own reason: a
+            // resolved-but-unclosed blocker names the blocker + its status, an
+            // unresolvable blocker names the dangling end + Missing/External.
+            for (let e in edges) {
+                if (e.to == issue.id && e.kind == EdgeKind.Blocks) {
+                    let resolved = false;
+                    for (let b in issues) {
+                        if (b.id == e.from) {
+                            resolved = true;
+                            if (b.status != Status.Done && b.status != Status.Dropped) {
+                                out.push(
+                                    WhyNot {
+                                        id: issue.id,
+                                        kind: WhyNotKind.BlockedBy,
+                                        blocker: b.id,
+                                        blocker_status: b.status.to_string(),
+                                        edge_from: e.from,
+                                        edge_to: e.to,
+                                        edge_kind: e.kind.to_string(),
+                                        ref_id: null,
+                                        ref_side: null,
+                                        ref_status: null,
+                                        cycle: null,
+                                        holder: null,
+                                        expires_lc: null,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if (!resolved) {
+                        out.push(
+                            WhyNot {
+                                id: issue.id,
+                                kind: WhyNotKind.DanglingRef,
+                                blocker: null,
+                                blocker_status: null,
+                                edge_from: e.from,
+                                edge_to: e.to,
+                                edge_kind: e.kind.to_string(),
+                                ref_id: e.from,
+                                ref_side: "from",
+                                ref_status: classify_ref(e.from, issues, project).to_string(),
+                                cycle: null,
+                                holder: null,
+                                expires_lc: null,
+                            },
+                        );
+                    }
+                }
+            }
+            if (contains_id(cyclic, issue.id)) {
+                out.push(
+                    WhyNot {
+                        id: issue.id,
+                        kind: WhyNotKind.InCycle,
+                        blocker: null,
+                        blocker_status: null,
+                        edge_from: null,
+                        edge_to: null,
+                        edge_kind: null,
+                        ref_id: null,
+                        ref_side: null,
+                        ref_status: null,
+                        cycle: cyclic,
+                        holder: null,
+                        expires_lc: null,
+                    },
+                );
+            }
+            if let l: IssueLease = lease_for(issue.id, leases) {
+                out.push(
+                    WhyNot {
+                        id: issue.id,
+                        kind: WhyNotKind.Leased,
+                        blocker: null,
+                        blocker_status: null,
+                        edge_from: null,
+                        edge_to: null,
+                        edge_kind: null,
+                        ref_id: null,
+                        ref_side: null,
+                        ref_status: null,
+                        cycle: null,
+                        holder: l.holder,
+                        expires_lc: l.expires_lc,
+                    },
+                );
+            }
+        }
+    }
+    out
+}
+
+test "why-not blocked-by names the blocker, its status, and the edge" {
+    let issues = [mk_issue("bi#01", Status.Open), mk_issue("bi#02", Status.Open)];
+    let edges = [Edge { from: "bi#01", to: "bi#02", kind: EdgeKind.Blocks }];
+    let reasons = why_not(issues, edges, "bi", []);
+    assert.equal(reasons.length(), 1);
+    assert.equal(reasons[0].id, "bi#02");
+    assert.equal(reasons[0].kind, WhyNotKind.BlockedBy);
+    assert.equal(reasons[0].blocker, "bi#01");
+    assert.equal(reasons[0].blocker_status, "Open");
+    assert.equal(reasons[0].edge_from, "bi#01");
+    assert.equal(reasons[0].edge_to, "bi#02");
+    assert.equal(reasons[0].edge_kind, "Blocks");
+    // The blocker itself is ready, so it carries no reason.
+    assert.equal(contains_id(reasons.map((r) -> { r.id }), "bi#01"), false)
+}
+
+test "why-not is empty for ready issues and resolved blockers free silently" {
+    let issues = [mk_issue("bi#01", Status.Done), mk_issue("bi#02", Status.Open)];
+    let edges = [Edge { from: "bi#01", to: "bi#02", kind: EdgeKind.Blocks }];
+    assert.equal(why_not(issues, edges, "bi", []).length(), 0);
+    assert.equal(why_not([mk_issue("bi#03", Status.Open)], [], "bi", []).length(), 0)
+}
+
+test "why-not dangling blocker names the end and Missing vs External" {
+    let issues = [mk_issue("bi#02", Status.Open)];
+    let missing_edges = [Edge { from: "bi#99", to: "bi#02", kind: EdgeKind.Blocks }];
+    let missing = why_not(issues, missing_edges, "bi", []);
+    assert.equal(missing.length(), 1);
+    assert.equal(missing[0].kind, WhyNotKind.DanglingRef);
+    assert.equal(missing[0].ref_id, "bi#99");
+    assert.equal(missing[0].ref_side, "from");
+    assert.equal(missing[0].ref_status, "Missing");
+    assert.equal(missing[0].edge_to, "bi#02");
+    let ext_edges = [Edge { from: "bagl#02", to: "bi#02", kind: EdgeKind.Blocks }];
+    let ext = why_not(issues, ext_edges, "bi", []);
+    assert.equal(ext.length(), 1);
+    assert.equal(ext[0].ref_id, "bagl#02");
+    assert.equal(ext[0].ref_status, "External")
+}
+
+test "why-not in-cycle names the cycle alongside blocked-by" {
+    let issues = [mk_issue("bi#01", Status.Open), mk_issue("bi#02", Status.Open)];
+    // A Blocks cycle parks both members, so each carries the blocker and the
+    // cycle it is stuck in.
+    let edges = [
+        Edge { from: "bi#01", to: "bi#02", kind: EdgeKind.Blocks },
+        Edge { from: "bi#02", to: "bi#01", kind: EdgeKind.Blocks },
+    ];
+    let reasons = why_not(issues, edges, "bi", []);
+    assert.equal(reasons.length(), 4);
+    assert.equal(reasons[0].kind, WhyNotKind.BlockedBy);
+    assert.equal(reasons[0].blocker, "bi#02");
+    assert.equal(reasons[1].kind, WhyNotKind.InCycle);
+    assert.equal(reasons[1].cycle, ["bi#01", "bi#02"]);
+    assert.equal(reasons[2].id, "bi#02");
+    assert.equal(reasons[2].kind, WhyNotKind.BlockedBy);
+    assert.equal(reasons[3].kind, WhyNotKind.InCycle);
+    assert.equal(reasons[3].cycle, ["bi#01", "bi#02"])
+}
+
+test "why-not is silent for a DependsOn-only cycle: both stay ready" {
+    let issues = [mk_issue("bi#01", Status.Open), mk_issue("bi#02", Status.Open)];
+    // DependsOn carries ordering but never blocks, so the pair is still listed
+    // as ready — no omission, no reason. `check` stays the cycle diagnosis.
+    let edges = [
+        Edge { from: "bi#01", to: "bi#02", kind: EdgeKind.DependsOn },
+        Edge { from: "bi#02", to: "bi#01", kind: EdgeKind.DependsOn },
+    ];
+    assert.equal(ready_issues(issues, edges).length(), 2);
+    assert.equal(why_not(issues, edges, "bi", []).length(), 0)
+}
+
+test "why-not leased names the holder and expiry" {
+    let issues = [mk_issue("bi#09", Status.Open)];
+    let leases = [IssueLease { entity: "bi#09", holder: "did:key:z6Mk-alice", expires_lc: 42 }];
+    let reasons = why_not(issues, [], "bi", leases);
+    assert.equal(reasons.length(), 1);
+    assert.equal(reasons[0].kind, WhyNotKind.Leased);
+    assert.equal(reasons[0].holder, "did:key:z6Mk-alice");
+    assert.equal(reasons[0].expires_lc, 42);
+    // A lease on another issue is not this issue's reason.
+    assert.equal(why_not(issues, [], "bi", []).length(), 0)
+}
+
+test "why-not all-Done backlog is empty with no reasons" {
+    let issues = [mk_issue("bi#01", Status.Done), mk_issue("bi#02", Status.Dropped)];
+    assert.equal(why_not(issues, [], "bi", []).length(), 0)
+}
+
+test "why-not skips non-Open issues: status is self-describing" {
+    // Doing/Blocked are worker states visible in `list`, not omissions that
+    // need an edge/lease/cycle to justify them.
+    let issues = [mk_issue("bi#01", Status.Doing), mk_issue("bi#02", Status.Blocked)];
+    assert.equal(why_not(issues, [], "bi", []).length(), 0)
+}

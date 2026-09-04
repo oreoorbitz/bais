@@ -201,6 +201,19 @@ without a store).
 `check` (§4.3): cycles and Missing blockers explain silence. Exit code is 0
 even when empty.
 
+`bais ready --why-not [--json]` accounts for every omission: each
+Open-but-unready issue carries at least one reason naming the exact
+edge/lease/cycle, and no listed-ready issue carries one. Reasons are shaped
+by BAML `why_not` (`WhyNotKind` =
+`BlockedBy` (blocker id + status + edge) | `DanglingRef` (end + `Missing` /
+`External` + edge) | `InCycle` (cycle members) | `Leased` (holder +
+`expires_lc`)); the host renders text + `--json` from `baml_sdk` types, so
+`why_not` JSON round-trips through them unchanged. Non-Open issues carry no
+reason (their status is the explanation); an all-Done backlog reports empty
+with no reasons — finished, not jammed. The scan path (no store) reasons over
+the graph alone; the store path adds lease reasons. Without the flag, `ready`
+output is byte-identical to before. Exit code is 0 even with reasons.
+
 ### 4.3 `bais check --json`
 
 ```json

@@ -163,3 +163,107 @@ export function cyclicIds(all: BaisFile[]): string[] {
 		remaining = next;
 	}
 }
+
+// Mirror of BAML WhyNotKind/IssueLease/WhyNot/why_not (`ready --why-not`).
+// Field names match the BAML classes exactly (snake_case on both sides —
+// preserve-case SDK) so `--json` reasons round-trip through the generated
+// baml_sdk types unchanged: only the fields for `kind` are set, the rest are
+// null. Only Open issues omitted from ready are reasoned about: Done/Dropped
+// are finished, not jammed, Doing/Blocked statuses are self-describing in
+// `list`, and an issue still listed as ready carries no reason (a
+// DependsOn-only cycle never blocks, so `check` stays its diagnosis).
+export type WhyNotKind = "BlockedBy" | "DanglingRef" | "InCycle" | "Leased";
+export type HostLease = { entity: string; holder: string; expires_lc: number | null };
+export type WhyNot = {
+	id: string;
+	kind: WhyNotKind;
+	blocker: string | null;
+	blocker_status: string | null;
+	edge_from: string | null;
+	edge_to: string | null;
+	edge_kind: string | null;
+	ref_id: string | null;
+	ref_side: "from" | "to" | null;
+	ref_status: "Missing" | "External" | null;
+	cycle: string[] | null;
+	holder: string | null;
+	expires_lc: number | null;
+};
+
+const nullWhyNot = (id: string, kind: WhyNotKind): WhyNot => ({
+	id,
+	kind,
+	blocker: null,
+	blocker_status: null,
+	edge_from: null,
+	edge_to: null,
+	edge_kind: null,
+	ref_id: null,
+	ref_side: null,
+	ref_status: null,
+	cycle: null,
+	holder: null,
+	expires_lc: null,
+});
+
+export function whyNotIn(all: BaisFile[], project: string, leases: HostLease[] = []): WhyNot[] {
+	const byId = new Map(all.map((f) => [f.issue.id, f.issue]));
+	const edges = all.flatMap((f) => f.edges);
+	const cyclicList = cyclicIds(all);
+	const cyclic = new Set(cyclicList);
+	const leaseByEntity = new Map(leases.map((l) => [l.entity, l]));
+	// Omission gate, same rule as readyIssues plus the lease exclusion the
+	// store path applies: an issue listed as ready carries no reason, so every
+	// reason marks an omission (and, with the loops below, every omission of
+	// an Open issue carries a reason).
+	const blocked = new Set<string>();
+	for (const f of all) {
+		for (const e of f.edges) {
+			if (e.kind !== "Blocks") continue;
+			const blocker = byId.get(e.from);
+			if (!blocker || (blocker.status !== "Done" && blocker.status !== "Dropped")) {
+				blocked.add(e.to);
+			}
+		}
+	}
+	const out: WhyNot[] = [];
+	for (const f of all) {
+		if (f.issue.status !== "Open") continue;
+		if (!blocked.has(f.issue.id) && !leaseByEntity.has(f.issue.id)) continue;
+		for (const e of edges) {
+			if (e.to !== f.issue.id || e.kind !== "Blocks") continue;
+			const blocker = byId.get(e.from);
+			if (blocker) {
+				if (blocker.status !== "Done" && blocker.status !== "Dropped") {
+					out.push({
+						...nullWhyNot(f.issue.id, "BlockedBy"),
+						blocker: blocker.id,
+						blocker_status: blocker.status,
+						edge_from: e.from,
+						edge_to: e.to,
+						edge_kind: e.kind,
+					});
+				}
+			} else {
+				const scope = idProject(e.from);
+				out.push({
+					...nullWhyNot(f.issue.id, "DanglingRef"),
+					edge_from: e.from,
+					edge_to: e.to,
+					edge_kind: e.kind,
+					ref_id: e.from,
+					ref_side: "from",
+					ref_status: scope !== "" && scope !== project ? "External" : "Missing",
+				});
+			}
+		}
+		if (cyclic.has(f.issue.id)) {
+			out.push({ ...nullWhyNot(f.issue.id, "InCycle"), cycle: [...cyclicList] });
+		}
+		const lease = leaseByEntity.get(f.issue.id);
+		if (lease) {
+			out.push({ ...nullWhyNot(f.issue.id, "Leased"), holder: lease.holder, expires_lc: lease.expires_lc });
+		}
+	}
+	return out;
+}

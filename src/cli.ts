@@ -8,8 +8,9 @@
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cyclicIds, danglingRefsIn, loadIssues, projectName, readyIssues } from "./graph.js";
-import { hasStore, ingestIssues, storeCaps, storeCheck, storeEdges, storeGraph, storeList, storeOversight, storeReady, storeSample } from "./store.js";
+import { cyclicIds, danglingRefsIn, loadIssues, projectName, readyIssues, whyNotIn } from "./graph.js";
+import type { WhyNot } from "./graph.js";
+import { hasStore, ingestIssues, storeCaps, storeCheck, storeEdges, storeGraph, storeList, storeOversight, storeReady, storeSample, storeWhyNot } from "./store.js";
 import { createHub } from "./hub.js";
 import { loadPeerKey, appendForeignEvents, publishCheckpoint, verifyCheckpointRoot } from "./hub.js";
 import { exportSnapshot, importSnapshot, markBootstrapComplete, recordImportedAnchor } from "./store.js";
@@ -25,7 +26,7 @@ Usage:
   bais init
   bais ingest [--json]              # build .bais/store.db from issues/*.toml via the BAML reducer
   bais list [--json]
-  bais ready [--json]               # carries as_of + completeness from the store
+  bais ready [--json] [--why-not]   # carries as_of + completeness from the store
   bais check [--json]
   bais graph --from <id> [--json]   # recursive CTE from the store, BFS fallback
   bais hub [--port N]               # lease coordinator (Phase 3), serves until SIGINT
@@ -110,8 +111,27 @@ if (cmd === "list") {
 	process.exit(0);
 }
 
+// One omission, one tab-separated line. Kinds mirror BAML WhyNotKind; each
+// line names the exact edge/lease/cycle behind the omission.
+function printWhyNot(reasons: WhyNot[]): void {
+	for (const r of reasons) {
+		if (r.kind === "BlockedBy") {
+			console.log(`why-not\t${r.id}\tblocked-by ${r.blocker} (${r.blocker_status}) [${r.edge_from} -> ${r.edge_to} ${r.edge_kind}]`);
+		} else if (r.kind === "DanglingRef") {
+			console.log(`why-not\t${r.id}\tdangling-ref ${r.ref_side}=${r.ref_id} (${r.ref_status}) [${r.edge_from} -> ${r.edge_to} ${r.edge_kind}]`);
+		} else if (r.kind === "InCycle") {
+			console.log(`why-not\t${r.id}\tin-cycle [${(r.cycle ?? []).join(", ")}]`);
+		} else {
+			console.log(`why-not\t${r.id}\tleased-to ${r.holder} (expires_lc ${r.expires_lc ?? "null"})`);
+		}
+	}
+}
+
 if (cmd === "ready") {
 	ensureInit();
+	// --why-not is a pure addition: without it every line below is exactly the
+	// old output. With it, each Open-but-unready issue carries its reason.
+	const whyNot = argv.includes("--why-not");
 	if (useStore) {
 		// The one agent-dispatch query, indexed — not a readdir scan.
 		const { ready, as_of, completeness } = storeReady(issuesDir);
@@ -120,20 +140,40 @@ if (cmd === "ready") {
 			issue: { id: t.entity, title: t.title, status: t.status, kind: t.kind, area: t.area, severity: t.severity, source: t.source, body: t.body },
 			edges: edges.filter((e) => e.declaredBy === t.entity).map((e) => ({ from: e.source, to: e.target, kind: e.type })),
 		}));
+		const reasons = whyNot ? storeWhyNot(issuesDir).reasons : [];
 		if (asJson) {
-			console.log(JSON.stringify({ ready: files, unparseable: [], as_of, completeness }, null, 2));
+			console.log(
+				JSON.stringify(
+					whyNot
+						? { ready: files, why_not: reasons, unparseable: [], as_of, completeness }
+						: { ready: files, unparseable: [], as_of, completeness },
+					null,
+					2,
+				),
+			);
 		} else {
 			for (const f of files) console.log(`${f.issue.id}\t${f.issue.title}`);
 			if (!files.length) console.log("(no ready issues)");
+			printWhyNot(reasons);
 		}
 	} else {
 		const { issues, failures } = await loadIssues(issuesDir);
 		const ready = readyIssues(issues);
+		// No store means no leases table, so the scan path reasons over the
+		// graph alone (leases only exist once a store is ingested).
+		const reasons = whyNot ? whyNotIn(issues, projectName(issuesDir)) : [];
 		if (asJson) {
-			console.log(JSON.stringify({ ready, unparseable: failures }, null, 2));
+			console.log(
+				JSON.stringify(
+					whyNot ? { ready, why_not: reasons, unparseable: failures } : { ready, unparseable: failures },
+					null,
+					2,
+				),
+			);
 		} else {
 			for (const f of ready) console.log(`${f.issue.id}\t${f.issue.title}`);
 			if (!ready.length) console.log("(no ready issues)");
+			printWhyNot(reasons);
 			// A file that failed to parse is absent from the graph, so both the
 			// ready set and the edges that would have constrained it are short.
 			if (failures.length) {
