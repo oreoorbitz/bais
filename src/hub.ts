@@ -36,7 +36,7 @@ import { resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { event } from "../baml_sdk/index.js";
 import { projectName } from "./graph.js";
-import { eventId } from "./ids.js";
+import { eventId, verifyEventId } from "./ids.js";
 import { refreshProjectionTables, ensureSchema, exportSnapshot, mergeAnchorReduction, storeOversight, sealProjection, verifyProjection } from "./store.js";
 import {
 	generatePeerKey,
@@ -237,7 +237,6 @@ export async function appendForeignEvents(
 	try {
 		ensureSchema(db);
 		const log = loadLog(db);
-		const known = new Set(log.map((e) => e.id));
 		const accepted: string[] = [];
 		const rejected: { id: string; reason: string }[] = [];
 		const staged: WireEvent[] = [];
@@ -248,7 +247,64 @@ export async function appendForeignEvents(
 			if ((refs ?? []).length > maxRefs) return "over-fanout";
 			return null;
 		};
-		const checkSig = (e: any): string | null => {
+		// bi#37: future-dated events. History replays old timestamps
+	// legitimately (backfill, re-pull), so only the future is bounded:
+	// NTP-scale drift plus slow peers fit in an hour; anything beyond
+	// is a skewed or hostile clock.
+	const MAX_FUTURE_SKEW_MS = 3_600_000;
+	const checkClock = (ts: unknown): string | null => {
+		if (typeof ts !== "string") return null;
+		const ms = Date.parse(ts);
+		if (Number.isNaN(ms)) return null; // unparseable: shape-legal, skew-unprovable
+		return ms - Date.now() > MAX_FUTURE_SKEW_MS ? "clock-skew" : null;
+	};
+	// Canonical body fingerprint for replay comparison (key-order and
+	// whitespace-insensitive — JSON.stringify would false-positive on
+	// reordered keys). Stored bodies are already encodeBodyArrays form;
+	// incoming bodies are compared post-toWire, same form.
+	const bodyHash = (body: unknown): string => sha256Hex(canonicalize(body ?? {}));
+	const knownHash = new Map<string, string>();
+	for (const e of log) knownHash.set(e.id, bodyHash(e.body));
+	const stagedHash = new Map<string, string>();
+	// bi#37: structural self-verification on the ENCODED body (creation
+	// hashes post-encodeBodyArrays — ids.ts — so raw arrays normalize
+	// first; callers pass the wire form). Top-level cost/cap/sig ride
+	// along when present (creation hashes them when non-null).
+	const checkId = (wire: WireEvent, raw: any): boolean => {
+		try {
+			return verifyEventId({
+				author: wire.author, seq: wire.seq, prev: wire.prev, project: wire.project,
+				entity: wire.entity, refs: wire.refs, lc: wire.lc, ts: wire.ts, type: wire.type,
+				body: wire.body, id: wire.id,
+				...(raw.cost !== undefined && raw.cost !== null ? { cost: raw.cost } : {}),
+				...(raw.cap !== undefined && raw.cap !== null ? { cap: raw.cap } : {}),
+				...(typeof raw.sig === "string" && raw.sig !== "" ? { sig: raw.sig } : {}),
+			});
+		} catch {
+			return false;
+		}
+	};
+	// bi#37: shared per-event gates (both modes), ordered authenticity
+	// first. A known id with identical bytes is the benign re-pull
+	// (silent no-op, bi#38 — pinned by R-b); same id with different
+	// bytes is a tampered replay and gets a named reason + evidence.
+	// For unknown ids: clock, then sig (bad-sig stays the verdict for
+	// signed tampering, pinned by sync-test), then structural id.
+	// Returns the rejection reason, "silent-skip", or null to continue.
+	const checkEarly = (raw: any, wire: WireEvent): string | null => {
+		const seen = knownHash.get(wire.id) ?? stagedHash.get(wire.id);
+		if (seen !== undefined) {
+			if (seen === bodyHash(wire.body)) return "silent-skip";
+			return "replay-tamper";
+		}
+		const skew = checkClock(wire.ts);
+		if (skew) return skew;
+		const sig = checkSig(raw);
+		if (sig) return sig;
+		if (!checkId(wire, raw)) return "id-mismatch";
+		return null;
+	};
+	const checkSig = (e: any): string | null => {
 			if (e.sig != null) {
 				// Signatures cover the wire form: list bodies must already
 				// be JSON-encoded (encode-before-sign, SPEC §5.3), because
@@ -265,31 +321,43 @@ export async function appendForeignEvents(
 		if (opts.mode === "backfill") {
 			// Whole-set chain verification; coverage of the anchor heads is
 			// the caller's job (CLI sync checks checkpoint.heads explicitly).
-			const clean = incoming.filter((e) => !checkEventShape(e));
-			const breaks = verifyChain(clean as any[]);
-			const broken = new Set(breaks.map((b) => b.id));
+			// Pass one runs the per-event gates (shape/clock/replay/sig/id);
+			// chain analysis sees only the survivors, so a tampered event
+			// cannot poison attribution for its neighbors.
+			const pending: { raw: any; wire: WireEvent }[] = [];
 			for (const raw of incoming) {
 				const shape = checkEventShape(raw);
 				if (shape || raw == null || typeof raw.id !== "string") {
 					rejected.push({ id: String(raw?.id ?? "?"), reason: shape ?? "malformed" });
 					continue;
 				}
-				if (known.has(raw.id)) continue; // idempotent re-pull
+				const wire = toWire(raw);
+				const early = checkEarly(raw, wire);
+				if (early === "silent-skip") continue;
+				if (early) {
+					rejected.push({ id: wire.id, reason: early });
+					evidence.push({ e: wire, reason: early });
+					continue;
+				}
+				pending.push({ raw, wire });
+			}
+			const breaks = verifyChain(pending.map((p) => p.raw) as any[]);
+			const broken = new Set(breaks.map((b) => b.id));
+			for (const { raw, wire } of pending) {
 				if (broken.has(raw.id)) {
 					const reason = breaks.find((b) => b.id === raw.id)?.reason ?? "chain-break";
 					rejected.push({ id: raw.id, reason });
-					evidence.push({ e: toWire(raw), reason });
+					evidence.push({ e: wire, reason });
 					continue;
 				}
-				const sig = checkSig(raw);
 				const bounds = checkBounds(raw.body, raw.refs);
-				if (sig || bounds) {
-					const reason = sig ?? bounds ?? "rejected";
-					rejected.push({ id: raw.id, reason });
-					evidence.push({ e: toWire(raw), reason });
+				if (bounds) {
+					rejected.push({ id: raw.id, reason: bounds });
+					evidence.push({ e: wire, reason: bounds });
 					continue;
 				}
-				staged.push(toWire(raw));
+				staged.push(wire);
+				stagedHash.set(wire.id, bodyHash(wire.body));
 				accepted.push(raw.id);
 			}
 		} else {
@@ -299,7 +367,20 @@ export async function appendForeignEvents(
 			const nextSeq = new Map<string, number>();
 			const lastId = new Map<string, string>();
 			const maxSeq = new Map<string, number>();
+			// bi#37 slice A: which evidence rows seed continuity. An event
+			// that PASSED chain validation then failed a downstream gate
+			// (budget, cap, bounds) still occupied its sequence slot —
+			// the author's next emission must continue past it, or every
+			// honest retry looks like a fork (drill G-budget precision).
+			// Linkage failures (chain-break, prev-mismatch, genesis-prev)
+			// and pre-chain rejections (shape, replay-tamper, id-mismatch,
+			// clock-skew, sig verdicts) never advance: building on them is
+			// the fork the prev-mismatch gate exists to catch (drill
+			// G-fork(a2)). Allowlist — an unknown future reason defaults
+			// to no-advance (fail closed: loud fork, caught by drills).
+			const SLOT_CONSUMING = new Set(["cap-denied", "over-size", "over-fanout", "budget-exhausted"]);
 			for (const e of log) {
+				if (!e.admitted && !(e.drop_reason && SLOT_CONSUMING.has(e.drop_reason))) continue;
 				nextSeq.set(e.author, Math.max(nextSeq.get(e.author) ?? 0, e.seq + 1));
 				if (e.seq >= (maxSeq.get(e.author) ?? -1)) {
 					maxSeq.set(e.author, e.seq);
@@ -323,7 +404,14 @@ export async function appendForeignEvents(
 					rejected.push({ id: String(raw?.id ?? "?"), reason: shape ?? "malformed" });
 					continue;
 				}
-				if (known.has(raw.id) || staged.some((s) => s.id === raw.id)) continue; // idempotent
+				const wire = toWire(raw);
+				const early = checkEarly(raw, wire);
+				if (early === "silent-skip") continue; // idempotent re-pull
+				if (early) {
+					rejected.push({ id: wire.id, reason: early });
+					evidence.push({ e: wire, reason: early });
+					continue;
+				}
 				let want = nextSeq.get(raw.author) ?? 0;
 				let lastKnown = lastId.get(raw.author);
 				// History replay: the event IS the floor's head (a surviving
@@ -347,7 +435,7 @@ export async function appendForeignEvents(
 						lastKnown = raw.prev;
 					} else {
 						rejected.push({ id: raw.id, reason: "chain-break" });
-						evidence.push({ e: toWire(raw), reason: "chain-break" });
+						evidence.push({ e: wire, reason: "chain-break" });
 						continue;
 					}
 				}
@@ -357,7 +445,7 @@ export async function appendForeignEvents(
 				// replays skip the check — their linkage is counted.)
 				if (!isReplay && (want === 0 ? raw.prev !== null : raw.prev !== lastKnown)) {
 					rejected.push({ id: raw.id, reason: want === 0 ? "genesis-prev" : "prev-mismatch" });
-					evidence.push({ e: toWire(raw), reason: want === 0 ? "genesis-prev" : "prev-mismatch" });
+					evidence.push({ e: wire, reason: want === 0 ? "genesis-prev" : "prev-mismatch" });
 					continue;
 				}
 				// Capability gate (backfill history is exempt — it is
@@ -371,15 +459,15 @@ export async function appendForeignEvents(
 						continue;
 					}
 				}
-				const sig = checkSig(raw);
+				// Sig/id already gated by checkEarly above; bounds apply last.
 				const bounds = checkBounds(raw.body, raw.refs);
-				if (sig || bounds) {
-					const reason = sig ?? bounds ?? "rejected";
-					rejected.push({ id: raw.id, reason });
-					evidence.push({ e: toWire(raw), reason });
+				if (bounds) {
+					rejected.push({ id: raw.id, reason: bounds });
+					evidence.push({ e: wire, reason: bounds });
 					continue;
 				}
-				staged.push(toWire(raw));
+				staged.push(wire);
+				stagedHash.set(wire.id, bodyHash(wire.body));
 				accepted.push(raw.id);
 				nextSeq.set(raw.author, want + 1);
 				lastId.set(raw.author, raw.id);
@@ -415,6 +503,9 @@ export async function appendForeignEvents(
 		for (const e of staged) {
 			ins.run(e.id, e.author, e.seq, e.prev, e.project, e.entity, JSON.stringify(e.refs), e.lc, e.ts, e.type, JSON.stringify(e.body), e.sig, 1, null);
 		}
+		const evIns = db.prepare(
+			"INSERT INTO rejected_evidence(event_id, author, seq, prev, project, entity, refs, lc, ts, type, body, sig, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		);
 		for (const { e, reason } of evidence) {
 			try {
 				ins.run(
@@ -422,7 +513,23 @@ export async function appendForeignEvents(
 					JSON.stringify(e.body), e.sig, 0, reason,
 				);
 			} catch {
-				// Evidence insert races (same id twice): the first copy stands.
+				// bi#37 slice A: the id PK collides when the event id is
+				// already stored — same-id-different-bytes is the
+				// replay-tamper case, and swallowing it loses the only
+				// record of the attack. A pure duplicate (same id, same
+				// verdict already stored) is a no-op, first copy stands;
+				// anything else parks the full wire copy in
+				// rejected_evidence so oversight still sees it.
+				const existing = db.prepare("SELECT admitted, drop_reason FROM events WHERE id = ?").get(e.id) as any;
+				if (existing && existing.admitted === 0 && existing.drop_reason === reason) continue;
+				try {
+					evIns.run(
+						e.id, e.author, e.seq, e.prev, e.project, e.entity, JSON.stringify(e.refs), e.lc, e.ts, e.type,
+						JSON.stringify(e.body), e.sig, reason, new Date().toISOString(),
+					);
+				} catch {
+					// Same colliding evidence twice: the first copy stands.
+				}
 			}
 		}
 		const full = loadLog(db);

@@ -20,6 +20,8 @@ import { eventId, verifyEventId } from "./ids.js";
 import { createHash } from "node:crypto";
 import { projectName } from "./graph.js";
 import { whyNotIn } from "./graph.js";
+import { closeEvidenceIn, knownDrillNames, scriptsDirFor } from "./graph.js";
+import type { CloseEvidenceProblem } from "./graph.js";
 import type { BaisEdge, BaisFile, HostLease, WhyNot } from "./graph.js";
 
 export type AsOf = { heads: string[]; lc: number; wall_ts: string };
@@ -71,6 +73,22 @@ CREATE TABLE IF NOT EXISTS submissions (submit_id TEXT PRIMARY KEY, task TEXT NO
 CREATE TABLE IF NOT EXISTS caps (grant_id TEXT PRIMARY KEY, issuer TEXT NOT NULL, audience TEXT NOT NULL, can TEXT NOT NULL, scope TEXT NOT NULL, expiry_lc INTEGER NOT NULL, budget_cap_usd REAL, budget_cap_tokens INTEGER, revoked INTEGER NOT NULL, revoked_by TEXT);
 CREATE TABLE IF NOT EXISTS budgets (principal TEXT PRIMARY KEY, cap REAL NOT NULL, incurred REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS checkpoints (id TEXT PRIMARY KEY, publisher TEXT NOT NULL, lc INTEGER NOT NULL, state_root TEXT NOT NULL, heads TEXT NOT NULL, reducer_version TEXT NOT NULL);
+-- bi#37 slice A: collision-parked rejection evidence. Most rejections land
+-- in events (admitted=0 + drop_reason), but same-id-different-bytes
+-- (replay-tamper) collides with the stored id PK — the full wire copy is
+-- parked here instead of being swallowed. Advisory forensics, NOT
+-- projection state: excluded from the content fingerprint (tampering with
+-- it cannot change reads, only oversight history), NOT replicated over
+-- /sync (peers re-derive their own verdict when the attack replicates),
+-- and NOT wiped by ingest rebuilds (append-only; rows outlive the log).
+CREATE TABLE IF NOT EXISTS rejected_evidence (
+  event_id TEXT NOT NULL, author TEXT NOT NULL, seq INTEGER NOT NULL,
+  prev TEXT, project TEXT NOT NULL, entity TEXT NOT NULL,
+  refs TEXT NOT NULL, lc INTEGER NOT NULL, ts TEXT NOT NULL,
+  type TEXT NOT NULL, body TEXT NOT NULL, sig TEXT,
+  reason TEXT NOT NULL, at TEXT NOT NULL,
+  PRIMARY KEY (event_id, reason)
+);
 CREATE INDEX IF NOT EXISTS idx_events_entity ON events(entity);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_rels_source ON rels(source);
@@ -649,6 +667,9 @@ export type Oversight = {
 	unverified_submits: StoredSubmit[];
 	stalled_leases: { id: string; task: string; holder: string; epoch: number; expires_lc: number | null }[];
 	caps_over_budget: { grant_id: string; audience: string; budget_cap_usd: number; incurred: number }[];
+	// bi#37: rejected-with-evidence rows (admitted=0 + drop_reason) so
+	// every named rejection is visible here, not just in the raw log.
+	rejected_events: { id: string; author: string; type: string; reason: string; lc: number }[];
 	as_of: AsOf;
 	completeness: Completeness;
 };
@@ -676,7 +697,18 @@ export function storeOversight(issuesDir: string): Oversight {
 			`SELECT c.grant_id, c.audience, c.budget_cap_usd, b.incurred FROM caps c JOIN budgets b ON b.principal = c.audience
 			 WHERE c.revoked = 0 AND c.budget_cap_usd IS NOT NULL AND b.incurred > c.budget_cap_usd ORDER BY c.grant_id`,
 		).all() as Oversight["caps_over_budget"];
-		return { conflicts, budget_overruns, unverified_submits, stalled_leases, caps_over_budget, as_of, completeness };
+		// bi#37 slice A: union the collision-parked evidence
+		// (rejected_evidence) with the in-log evidence rows. UNION
+		// dedupes a verdict recorded in both homes; lc-ordered since
+		// rowid is meaningless across the union.
+		const rejected_events = db.prepare(
+			`SELECT id, author, type, reason, lc FROM (
+				SELECT id, author, type, drop_reason AS reason, lc FROM events WHERE admitted = 0 AND drop_reason IS NOT NULL
+				UNION
+				SELECT event_id AS id, author, type, reason, lc FROM rejected_evidence
+			) ORDER BY lc DESC, id`,
+		).all() as Oversight["rejected_events"];
+		return { conflicts, budget_overruns, unverified_submits, stalled_leases, caps_over_budget, rejected_events, as_of, completeness };
 	} finally {
 		db.close();
 	}
@@ -1081,17 +1113,26 @@ export function storeCheck(issuesDir: string): {
 	bad: { file: string; error: string }[];
 	dangling: { declaredBy: string; from: string; to: string; kind: string; id: string; side: "from" | "to"; status: "Missing" | "External" }[];
 	cycles: string[];
+	// bi#83: close-evidence problems for Done tasks (Missing = check
+	// failure; External verdict refs are advisory, never fatal).
+	evidence: CloseEvidenceProblem[];
 } {
 	const db = openDb(issuesDir);
 	let ok = 0;
 	let bad: { file: string; error: string }[] = [];
 	let project = "";
 	let known = new Set<string>();
+	let entries: { id: string; status: string; body: string }[] = [];
 	try {
 		ok = (db.prepare("SELECT COUNT(*) AS n FROM tasks").get() as any).n as number;
 		bad = db.prepare("SELECT file, error FROM failures ORDER BY file").all() as { file: string; error: string }[];
 		project = getMeta(db, "project") ?? "";
 		known = new Set((db.prepare("SELECT entity FROM tasks").all() as any[]).map((r) => r.entity as string));
+		entries = (db.prepare("SELECT entity AS id, status, body FROM tasks").all() as any[]).map((r) => ({
+			id: r.id as string,
+			status: r.status as string,
+			body: (r.body ?? "") as string,
+		}));
 	} finally {
 		db.close();
 	}
@@ -1131,5 +1172,7 @@ export function storeCheck(issuesDir: string): {
 		if (next.length === remaining.length) break;
 		remaining = next;
 	}
-	return { ok, bad, dangling, cycles: remaining };
+	// bi#83: Done tasks must carry resolvable close-evidence refs.
+	const evidence = closeEvidenceIn(entries, project, knownDrillNames(scriptsDirFor(issuesDir)));
+	return { ok, bad, dangling, cycles: remaining, evidence };
 }

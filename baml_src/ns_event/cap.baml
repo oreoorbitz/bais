@@ -222,6 +222,9 @@ test "revoke by issuer sticks, re-revoke is a no-op" {
     assert.equal(r.excluded.length(), 0);
     assert.equal(only_cap(r).revoked, true);
     assert.equal(only_cap(r).revoked_by, "did:key:z6Mk-alice");
+    // Revocation kills authorization (bi#37): the live check the sync
+    // cap gate consults must go false the moment revoked flips.
+    assert.equal(cap_live(r.caps, "did:key:z6Mk-bob", "task.write", "*", 50), false);
 }
 
 test "revoke by audience works, by stranger is denied" {
