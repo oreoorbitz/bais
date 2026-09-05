@@ -29,7 +29,12 @@ Usage:
   bais list [--json]
   bais ready [--json] [--why-not] [--wait [--timeout N]]
                                 # carries as_of + completeness from the store
-  bais move <id> <status> [--json]  # prints newly-unblocked set
+  bais move <id> <status> [--json] [--as <owner> --for 4h]
+                                # Doing without --as is an anonymous
+                                # claim: allowed, instantly stale
+  bais renew <id> --as <owner> [--for 4h]  # extend a live claim (heartbeat)
+  bais reap [--now <instant>] [--json]     # expired Doing -> Open
+  bais list [--json] [--claims]            # --claims appends holder/lease cols
   bais check [--json]
   bais verify [--deep] [--json]  # content fingerprint (deep: full BAML re-reduce + id sweep)
   bais graph --from <id> [--json]   # recursive CTE from the store, BFS fallback
@@ -89,6 +94,18 @@ if (cmd === "ingest") {
 
 if (cmd === "list") {
 	ensureInit();
+	// Claims are file-envelope: the store projection predates them, so
+	// --claims merges the scan truth over either read path.
+	const withClaims = argv.includes("--claims");
+	const claimById = new Map<string, { holder: string | null; lease: string | null }>();
+	if (withClaims) {
+		for (const f of (await loadIssues(issuesDir)).issues) claimById.set(f.issue.id, { holder: f.holder, lease: f.lease });
+	}
+	const claimCols = (id: string): string => {
+		if (!withClaims) return "";
+		const c = claimById.get(id);
+		return `\t${c?.holder ?? ""}\t${c?.lease ?? ""}`;
+	};
 	if (useStore) {
 		const { tasks, as_of, completeness } = storeList(issuesDir);
 		const edges = storeEdges(issuesDir);
@@ -99,14 +116,14 @@ if (cmd === "list") {
 		if (asJson) {
 			console.log(JSON.stringify({ issues, unparseable: [], as_of, completeness }, null, 2));
 		} else {
-			for (const f of issues) console.log(`${f.issue.id}\t${f.issue.status}\t${f.issue.kind}\t${f.issue.title}`);
+			for (const f of issues) console.log(`${f.issue.id}\t${f.issue.status}\t${f.issue.kind}\t${f.issue.title}${claimCols(f.issue.id)}`);
 		}
 	} else {
 		const { issues, failures } = await loadIssues(issuesDir);
 		if (asJson) {
 			console.log(JSON.stringify({ issues, unparseable: failures }, null, 2));
 		} else {
-			for (const f of issues) console.log(`${f.issue.id}\t${f.issue.status}\t${f.issue.kind}\t${f.issue.title}`);
+			for (const f of issues) console.log(`${f.issue.id}\t${f.issue.status}\t${f.issue.kind}\t${f.issue.title}${claimCols(f.issue.id)}`);
 			for (const b of failures) console.log(`bad\t${b.file}\t${b.error}`);
 			if (!issues.length && !failures.length) console.error("(no .bais/issues/*.toml — run bais init or add issues)");
 		}
@@ -384,11 +401,20 @@ if (cmd === "check") {
 		const missing = dangling.filter((d) => d.status === "Missing");
 		const external = dangling.filter((d) => d.status === "External");
 		if (asJson) {
-			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence }, null, 2));
+			const staleClaims = (await loadIssues(issuesDir)).issues
+				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
+				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
+			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence, staleClaims }, null, 2));
 		} else {
 			for (const d of missing) console.log(`dangling\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			for (const d of external) console.log(`external\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			if (cycles.length) console.log(`cycle\t${cycles.join(", ")}`);
+			// Claims are file-envelope (the projection predates them):
+			// stale-claim always reads the scan truth. Advisory only.
+			for (const f of (await loadIssues(issuesDir)).issues) {
+				if (f.issue.status !== "Doing" || !leaseExpired(f.lease, Date.now())) continue;
+				console.log(`stale-claim\t${f.issue.id}\t${f.holder ?? "unknown"}\t${f.lease ?? "no-lease"}`);
+			}
 			const fatalEvidence = printEvidence(evidence);
 			console.log(`ok\t${ok} issues, ${bad.length} bad`);
 			if (bad.length || missing.length || cycles.length || fatalEvidence) process.exit(1);
@@ -409,7 +435,10 @@ if (cmd === "check") {
 		);
 
 		if (asJson) {
-			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence }, null, 2));
+			const staleClaims = issues
+				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
+				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
+			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence, staleClaims }, null, 2));
 		} else {
 			for (const f of issues) console.log(`ok\t${f.issue.id}`);
 			for (const b of failures) console.log(`bad\t${b.file}\t${b.error}`);
@@ -421,6 +450,13 @@ if (cmd === "check") {
 			for (const d of external) console.log(`external\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			// Nothing in a dependency cycle can ever become ready.
 			if (cycles.length) console.log(`cycle\t${cycles.join(", ")}`);
+			// Dead-agent claims: Doing with an expired (or missing)
+			// lease is loud here and reaped by `bais reap`. Advisory,
+			// never fatal — reap is the fix, not this gate.
+			for (const f of issues) {
+				if (f.issue.status !== "Doing" || !leaseExpired(f.lease, Date.now())) continue;
+				console.log(`stale-claim\t${f.issue.id}\t${f.holder ?? "unknown"}\t${f.lease ?? "no-lease"}`);
+			}
 			// bi#83: prose-only closes refuse loudly — Done with no (or
 			// unresolvable) Evidence: refs names the missing evidence here.
 			const fatalEvidence = printEvidence(evidence);
@@ -434,6 +470,135 @@ if (cmd === "check") {
 		// External verdict refs (bi#83): reported, never fatal.
 		const fatalEvidence = evidence.filter((p) => p.status === "Missing").length;
 		if (failures.length || missing.length || cycles.length || fatalEvidence) process.exit(1);
+	}
+	process.exit(0);
+}
+
+// Lease-bound Doing (dead-agent reclamation): a Doing without a live
+// claim is stale. Claims live on the file envelope (holder + RFC3339
+// UTC lease), set by `move <id> Doing --as <owner> [--for 4h]` and
+// cleared on any move out of Doing. `renew` extends (heartbeat),
+// `reap` flips expired Doing back to Open. Pure function of (files,
+// now): --now injects the instant for deterministic tests, and every
+// writer re-validates through the BAML parser with restore-on-failure.
+// An unparseable lease reads as expired (reclaim, never jam).
+function flagVal(name: string): string | null {
+	const i = argv.indexOf(name);
+	return i === -1 || i + 1 >= argv.length ? null : argv[i + 1];
+}
+function parseDuration(s: string): number | null {
+	const m = /^(\d+)(s|m|h|d)$/.exec(s);
+	if (!m) return null;
+	const mult = m[2] === "s" ? 1000 : m[2] === "m" ? 60000 : m[2] === "h" ? 3600000 : 86400000;
+	return Number(m[1]) * mult;
+}
+function claimNowMs(): number {
+	const n = flagVal("--now");
+	if (n == null) return Date.now();
+	const t = Date.parse(n);
+	if (Number.isNaN(t)) {
+		console.error(`bais: --now ${JSON.stringify(n)} does not parse as an instant`);
+		process.exit(1);
+	}
+	return t;
+}
+function leaseExpired(lease: string | null, at: number): boolean {
+	if (lease == null) return true;
+	const t = Date.parse(lease);
+	if (Number.isNaN(t)) return true;
+	return t <= at;
+}
+// Millis-stripped ISO: the BAML shape is exactly 20 chars (`...SSZ`).
+function toLeaseIso(at: number): string {
+	return new Date(at).toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+function validHolder(h: string): boolean {
+	return /^[A-Za-z0-9][A-Za-z0-9.:@/_-]*$/.test(h);
+}
+// Surgical claim edit: strip existing holder/lease lines, then insert
+// after the status line (claim sits with state). Null holder clears.
+function setClaimLines(text: string, holder: string | null, lease: string | null): string {
+	const stripped = text
+		.split("\n")
+		.filter((l) => !/^\s*holder\s*=/.test(l) && !/^\s*lease\s*=/.test(l))
+		.join("\n");
+	if (holder == null) return stripped;
+	const m = /(^\s*status\s*=\s*"[^"]*".*$)/m.exec(stripped);
+	if (!m) {
+		console.error("bais: file has no status line");
+		process.exit(1);
+	}
+	return stripped.replace(m[0], `${m[0]}\nholder = "${holder}"\nlease = "${lease ?? ""}"`);
+}
+async function writeClaimedFile(file: string, next: string): Promise<void> {
+	const orig = readFileSync(file, "utf8");
+	writeFileSync(file, next);
+	try {
+		await parseBaisFile(next);
+	} catch (e: any) {
+		writeFileSync(file, orig);
+		console.error(`bais: edited ${file} rejected (${String(e?.message ?? e).split("\n")[0]}) — restored`);
+		process.exit(1);
+	}
+	if (useStore) await ingestIssues(issuesDir);
+}
+
+if (cmd === "renew") {
+	ensureInit();
+	const id = argv[1];
+	const asOwner = flagVal("--as");
+	const dur = parseDuration(flagVal("--for") ?? "4h");
+	if (!id || !asOwner) {
+		console.error("bais renew <id> --as <owner> [--for 4h] [--now <instant>]");
+		process.exit(1);
+	}
+	if (dur == null) {
+		console.error(`bais renew: --for ${JSON.stringify(flagVal("--for"))} needs <n>s|m|h|d`);
+		process.exit(1);
+	}
+	const file = join(issuesDir, `${id}.toml`);
+	if (!existsSync(file)) {
+		console.error(`bais renew: unknown issue ${id}`);
+		process.exit(1);
+	}
+	const cur = (await parseBaisFile(readFileSync(file, "utf8"))) as { issue: { status: string }; holder: string | null };
+	if (cur.issue.status !== "Doing") {
+		console.error(`bais renew: ${id} is ${cur.issue.status}, not Doing (nothing to renew)`);
+		process.exit(1);
+	}
+	if (cur.holder !== asOwner) {
+		console.error(`bais renew: ${id} held by ${JSON.stringify(cur.holder)}, not ${JSON.stringify(asOwner)} (strangers cannot renew)`);
+		process.exit(1);
+	}
+	const lease = toLeaseIso(claimNowMs() + dur);
+	await writeClaimedFile(file, setClaimLines(readFileSync(file, "utf8"), asOwner, lease));
+	console.log(`renewed\t${id}\t${asOwner}\t${lease}`);
+	process.exit(0);
+}
+
+if (cmd === "reap") {
+	ensureInit();
+	const at = claimNowMs();
+	const { issues } = await loadIssues(issuesDir);
+	const reaped: { id: string; holder: string | null; lease: string | null }[] = [];
+	for (const f of issues) {
+		if (f.issue.status !== "Doing" || !leaseExpired(f.lease, at)) continue;
+		const file = join(issuesDir, `${f.issue.id}.toml`);
+		const orig = readFileSync(file, "utf8");
+		const statusMatch = /^\s*status\s*=\s*"[^"]*"/m.exec(orig);
+		if (!statusMatch) {
+			console.error(`bais reap: ${f.issue.id}.toml has no status line`);
+			process.exit(1);
+		}
+		await writeClaimedFile(file, setClaimLines(orig.replace(statusMatch[0], `status = "Open"`), null, null));
+		reaped.push({ id: f.issue.id, holder: f.holder, lease: f.lease });
+	}
+	reaped.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+	if (asJson) {
+		console.log(JSON.stringify({ reaped, now: new Date(at).toISOString() }, null, 2));
+	} else {
+		if (!reaped.length) console.log("reaped\t0");
+		for (const r of reaped) console.log(`reaped\t${r.id}\t${r.holder ?? "unknown"}\t${r.lease ?? "no-lease"}`);
 	}
 	process.exit(0);
 }
@@ -484,7 +649,31 @@ if (cmd === "move") {
 		process.exit(1);
 	}
 	const from = /"([^"]*)"/.exec(statusMatch[0])?.[1] ?? "";
-	const next = orig.replace(statusMatch[0], `status = "${to}"`);
+	// Doing is lease-bound: no anonymous claims (a dead agent's Doing
+	// must name its holder, or reap cannot tell it apart from live work).
+	let next = orig.replace(statusMatch[0], `status = "${to}"`);
+	if (to === "Doing") {
+		const asOwner = flagVal("--as");
+		if (asOwner == null) {
+			// Anonymous claim: allowed (bi#49 bare-move contract), but
+			// instantly stale — no lease means reap reclaims on sight.
+			// Pass --as for a live claim.
+			next = setClaimLines(next, null, null);
+		} else {
+			if (!validHolder(asOwner)) {
+				console.error(`bais move: --as ${JSON.stringify(asOwner)} is not an owner id (letters/digits/.:@/_/-)`);
+				process.exit(1);
+			}
+			const dur = parseDuration(flagVal("--for") ?? "4h");
+			if (dur == null) {
+				console.error(`bais move: --for ${JSON.stringify(flagVal("--for"))} needs <n>s|m|h|d`);
+				process.exit(1);
+			}
+			next = setClaimLines(next, asOwner, toLeaseIso(claimNowMs() + dur));
+		}
+	} else if (from === "Doing") {
+		next = setClaimLines(next, null, null);
+	}
 	writeFileSync(file, next);
 	try {
 		await parseBaisFile(next);

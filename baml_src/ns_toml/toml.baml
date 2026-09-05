@@ -7,6 +7,8 @@
 class BaisFile {
     issue: root.Issue,
     edges: root.Edge[],
+    holder: string?,
+    lease: string?,
 }
 
 class ParseState {
@@ -20,6 +22,8 @@ class ParseState {
     area: string?,
     severity_s: string?,
     source: string?,
+    holder: string?,
+    lease: string?,
     body: string?,
     edges: root.Edge[],
     cur_from: string?,
@@ -40,6 +44,8 @@ function state_new(lines: string[]) -> ParseState {
         area: null,
         severity_s: null,
         source: null,
+        holder: null,
+        lease: null,
         body: null,
         edges: [],
         cur_from: null,
@@ -298,6 +304,26 @@ function parse_value_string(raw: string) -> string throws baml.errors.ParseError
     }
 }
 
+// Claim lease shape: strict RFC3339 UTC (`YYYY-MM-DDTHH:MM:SSZ`, 20
+// chars). Syntax here, semantics at use: the host compares instants,
+// and an unparseable instant reads as expired (reclaim, never jam).
+function is_valid_lease_utc(s: string) -> bool {
+    if (s.length() != 20) {
+        false
+    } else if (
+        s.slice(4, 5) != "-" || s.slice(7, 8) != "-" || s.slice(10, 11) != "T" ||
+        s.slice(13, 14) != ":" || s.slice(16, 17) != ":" || s.slice(19, 20) != "Z"
+    ) {
+        false
+    } else {
+        let digits = s.slice(0, 4) + s.slice(5, 7) + s.slice(8, 10) + s.slice(11, 13) + s.slice(14, 16) + s.slice(17, 19);
+        digits.chars().every((c) -> {
+            let cp = c.code_point_at(0) ?? -1;
+            cp >= 48 && cp <= 57
+        })
+    }
+}
+
 function parse_status(s: string) -> root.Status throws baml.errors.ParseError {
     if (s == "Open") {
         root.Status.Open
@@ -393,6 +419,14 @@ function set_top_level(
         }
     } else if (key == "source") {
         st.source = parse_value_string(v);
+    } else if (key == "holder") {
+        st.holder = parse_value_string(v);
+    } else if (key == "lease") {
+        let ls = parse_value_string(v);
+        if (!is_valid_lease_utc(ls)) {
+            throw baml.errors.ParseError { message: "bad lease " + ls }
+        };
+        st.lease = ls;
     } else if (key == "body") {
         st.body = parse_value_string(v);
     } else {
@@ -441,6 +475,14 @@ function serialize_bais_file(f: BaisFile) -> string {
     if (f.issue.source != null) {
         let s: string = f.issue.source ?? "";
         out = out + "source = \"" + escape_basic_string(s) + "\"\n";
+    }
+    if (f.holder != null) {
+        let h: string = f.holder ?? "";
+        out = out + "holder = \"" + escape_basic_string(h) + "\"\n";
+    }
+    if (f.lease != null) {
+        let l: string = f.lease ?? "";
+        out = out + "lease = \"" + escape_basic_string(l) + "\"\n";
     }
     let body = f.issue.body;
     if (body.includes("\"\"\"")) {
@@ -698,7 +740,7 @@ function parse_bais_file(text: string) -> BaisFile throws baml.errors.ParseError
         source: st.source,
         body: bdy,
     };
-    BaisFile { issue: issue, edges: st.edges }
+    BaisFile { issue: issue, edges: st.edges, holder: st.holder, lease: st.lease }
 }
 
 function parse_bais_issue(text: string) -> root.Issue throws baml.errors.ParseError {
@@ -709,7 +751,7 @@ function roundtrip_issue(
     issue: root.Issue,
     edges: root.Edge[],
 ) -> BaisFile throws baml.errors.ParseError {
-    let f = BaisFile { issue: issue, edges: edges };
+    let f = BaisFile { issue: issue, edges: edges, holder: null, lease: null };
     let s = serialize_bais_file(f);
     parse_bais_file(s)
 }
@@ -723,6 +765,51 @@ test "parse minimal issue" {
     assert.equal(f.issue.kind, root.Kind.Proposal);
     assert.equal(f.issue.body, "hello");
     assert.equal(f.edges.length(), 0);
+}
+
+test "claim fields parse, default null, and roundtrip" {
+    let toml = "id = \"bi#09\"\ntitle = \"t\"\nstatus = \"Doing\"\nkind = \"Bug\"\nholder = \"agent-1\"\nlease = \"2026-09-06T00:00:00Z\"\nbody = \"b\"\n";
+    let f = parse_bais_file(toml);
+    assert.equal(f.holder, "agent-1");
+    assert.equal(f.lease, "2026-09-06T00:00:00Z");
+    let s = serialize_bais_file(f);
+    assert.contains(s, "holder = \"agent-1\"");
+    assert.contains(s, "lease = \"2026-09-06T00:00:00Z\"");
+    let g = parse_bais_file(s);
+    assert.equal(g.holder, "agent-1");
+    assert.equal(g.lease, "2026-09-06T00:00:00Z");
+    let bare = parse_bais_file("id = \"bi#09\"\ntitle = \"t\"\nstatus = \"Open\"\nkind = \"Bug\"\nbody = \"b\"\n");
+    assert.is_true(bare.holder is null);
+    assert.is_true(bare.lease is null);
+    assert.is_true(!serialize_bais_file(bare).includes("holder"));
+}
+
+test "bad lease shape rejects" {
+    for (let bad in ["tomorrow", "2026-9-6T0:0:0Z", "2026-09-06 00:00:00", "2026-09-06T00:00:00+00:00"]) {
+        let toml = "id = \"bi#09\"\ntitle = \"t\"\nstatus = \"Doing\"\nkind = \"Bug\"\nlease = \"" + bad + "\"\nbody = \"b\"\n";
+        let threw = false;
+        let _ = parse_bais_file(toml) catch (e) {
+            baml.errors.ParseError => {
+                threw = true;
+                BaisFile {
+                    issue: root.Issue {
+                        id: "",
+                        title: "",
+                        status: root.Status.Open,
+                        kind: root.Kind.Bug,
+                        area: null,
+                        severity: null,
+                        source: null,
+                        body: "",
+                    },
+                    edges: [],
+                    holder: null,
+                    lease: null,
+                }
+            }
+        };
+        assert.is_true(threw);
+    }
 }
 
 test "parse with area severity source and comment" {
@@ -796,6 +883,8 @@ test "reject unknown key strict" {
                     body: "",
                 },
                 edges: [],
+                holder: null,
+                lease: null,
             }
         }
     };

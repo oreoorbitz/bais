@@ -36,7 +36,10 @@ export type BaisIssue = {
 };
 
 export type BaisEdge = { from: string; to: string; kind: string };
-export type BaisFile = { issue: BaisIssue; edges: BaisEdge[] };
+// File-envelope claim (lease-bound Doing): holder + RFC3339 UTC lease.
+// Null when unclaimed. The BAML parser owns the shape; the host owns
+// the instant comparison (unparseable lease reads as expired).
+export type BaisFile = { issue: BaisIssue; edges: BaisEdge[]; holder: string | null; lease: string | null };
 
 // A file the parser rejected. Kept as its own shape rather than coerced into a
 // BaisIssue: an unparseable file has no trustworthy id, status or edges, and

@@ -17,7 +17,7 @@ All of these are *legal TOML* — they just constrain *which* TOML you write:
 
 | TOML construct | BAIS convention |
 |---|---|
-| top-level `key = value` | `id`, `title`, `status`, `kind`, `body` required; `area`, `severity`, `source` optional. Values are TOML `string | integer | boolean` (BAIS uses `string`/`int`). `status`/`kind` map to BAML `enum Status`/`Kind`. |
+| top-level `key = value` | `id`, `title`, `status`, `kind`, `body` required; `area`, `severity`, `source`, `holder`, `lease` optional. Values are TOML `string | integer | boolean` (BAIS uses `string`/`int`). `status`/`kind` map to BAML `enum Status`/`Kind`. `holder` (owner id) + `lease` (strict RFC3339 UTC `YYYY-MM-DDTHH:MM:SSZ`) form the file-envelope claim — see Claim protocol below. |
 | multiline strings | `body` is `"""` or `'''` multiline basic/literal string (Markdown). |
 | array of tables `[[edge]]` | zero or more `[[edge]]` tables, each `{ from: string, to: string, kind: EdgeKind }`. Graph edges for the directory-local DAG. |
 | `[table]` | reserved for future per-project config (`[bais]` in `config.toml`), not used in issue files. `bais check` rejects unknown top-level tables in issue files. |
@@ -38,6 +38,18 @@ No new delimiters, no new value types, no alternative quoting.
 - **BAML source of truth:** `baml_src/ns_toml/toml.baml` — line-oriented parser over `string` stdlib (`lines()`, `trim()`, `split()`, `slice()`, `starts_with()`, etc.). Parses the subset above and returns typed `root.Issue` / `root.Edge` (from `baml_src/main.baml`). `baml check` + `baml test` prove it.
 - **TS interop:** `baml generate` → `baml_sdk`; `src/toml.ts` re-exports BAML parser for `bais` CLI (`bais check`, `bais list --json`, `bais graph`). For speed, CLI may also use a JS TOML lib (`smol-toml`) but must round-trip through BAML types — BAML is the validator.
 - **LLM interop:** `CreateIssue(raw: string) -> Issue` in `main.baml` uses `${ctx.output_format}` — return type *is* the schema, not prose.
+
+## Claim protocol (lease-bound Doing)
+
+`Doing` without a live claim is stale — a dead agent's claim must never park an issue. Claims live on the file envelope (`holder` + `lease`), not in `Issue`:
+
+- **Claim:** `bais move <id> Doing --as <owner> [--for 4h]` (default TTL 4h, `--for <n>s|m|h|d`). Bare `move <id> Doing` stays allowed (bi#49 contract) but claims anonymously — no lease, instantly stale, reaped on sight. Pass `--as` for a live claim.
+- **Heartbeat:** `bais renew <id> --as <owner> [--for 4h]` extends. Only the recorded holder can renew (strangers are refused with the holder named).
+- **Reclaim:** `bais reap [--now <instant>]` flips every `Doing` with an expired (or missing/unparseable) lease back to `Open`, clearing the claim. Pure function of (files, now); `--now` injects the instant for deterministic tests.
+- **Surface:** `bais list --claims` appends holder/lease columns; `bais check` reports `stale-claim` lines (advisory, never fatal — reap is the fix).
+- Moving out of `Doing` clears the claim. `ready` never hands out `Doing` either way.
+
+Agent rule: claim with a stable owner id before starting, renew (heartbeat) while working, release by moving on completion. If you die, your lease expires and anyone may reap.
 
 ## Evolving BAIS without deviating from training data
 

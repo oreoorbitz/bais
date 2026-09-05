@@ -595,6 +595,10 @@ export function storeWhyNot(issuesDir: string): { reasons: WhyNot[]; as_of: AsOf
 			body: t.body,
 		},
 		edges: byDeclarer.get(t.entity) ?? [],
+		// Claims are file-envelope: the store projection predates them
+		// (null here); stale-claim always reads the scan truth.
+		holder: null,
+		lease: null,
 	}));
 	const db = openDb(issuesDir);
 	let project = "";
