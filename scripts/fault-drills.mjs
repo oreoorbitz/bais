@@ -21,15 +21,24 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, copyFileSync, rmSy
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { createHub, appendForeignEvents, publishCheckpoint, pruneBelowCheckpoint } from "../dist/src/hub.js";
+import { createHub, appendForeignEvents, publishCheckpoint, pruneBelowCheckpoint, encodeBodyArrays } from "../dist/src/hub.js";
+import { eventId } from "../dist/src/ids.js";
 import {
-	ingestIssues, storeList, hasStore, dbPathFor,
+	ingestIssues, storeList, hasStore, dbPathFor, storeOversight,
 	exportSnapshot, importSnapshot, recordImportedAnchor,
 	readBootstrap, markBootstrapComplete,
 } from "../dist/src/store.js";
 import { loadIssues } from "../dist/src/graph.js";
+import { clockFromArgv } from "./clock.mjs";
 void createHub; // imported to pin the hub surface; drills use hub.js pure
 // functions only (createHub binds a port — a socket — so it is NOT used).
+
+// bi#82: injectable wall-clock. --now <ISO|epoch-ms> (or BAIS_NOW) pins
+// Date.now + no-arg new Date() in-process, so fixture timestamps AND the
+// dist hub gates (checkClock future bound) see the same fixed time.
+// Absent: live passthrough, zero behavior change.
+const { clock } = clockFromArgv(process.argv);
+console.log(`info: wall-clock ${clock.fixed ? `pinned at ${clock.nowISO()}` : "live"}`);
 
 let failures = 0;
 const drillFailures = { a: 0, b: 0, c: 0, d: 0, r: 0 };
@@ -46,6 +55,21 @@ process.on("uncaughtException", (e) => { failures++; console.error(`FAIL [${dril
 
 const toml = (id, title) => `id = "${id}"\ntitle = "${title}"\nstatus = "Open"\nkind = "Feat"\nbody = "fault-drill fixture"\n`;
 const canonTasks = (issuesDir) => JSON.stringify(storeList(issuesDir).tasks);
+// bi#37: fixtures carry REAL content-hash ids (eventId over the encoded
+// body, sig covered when signed) — dev-style ids are dead by policy
+// (store drops them on merge) and ingest now verifies structurally.
+// Sign FIRST, then hash: the id covers the sig.
+const mkForeign = (o) => {
+	const body = encodeBodyArrays(o.body ?? {});
+	const base = {
+		author: o.author, seq: o.seq, prev: o.prev ?? null, project: o.project ?? "g",
+		entity: o.entity, refs: o.refs ?? [], lc: o.lc, ts: o.ts ?? clock.nowISO(),
+		type: o.type, body,
+	};
+	const sig = o.sign ? o.sign({ project: base.project, prev: base.prev, refs: base.refs, type: base.type, entity: base.entity, body }) : null;
+	const id = eventId(sig ? { ...base, sig } : base);
+	return { ...base, id, sig, admitted: true, drop_reason: null };
+};
 const mkTree = (tag) => {
 	const root = mkdtempSync(join(tmpdir(), `bais-fault-${tag}-`));
 	const issues = join(root, ".bais", "issues");
@@ -163,28 +187,28 @@ drill = "b";
 
 	// Same foreign event delivered twice, in-process via appendForeignEvents
 	// (the POST /sync handler shares this function — no sockets here).
-	const proj = "drill-b";
-	const mkDup = (lc) => ({
-		id: "drill:dup:1", author: "did:key:drill-dup", seq: 0, prev: null,
-		project: proj, entity: "t-dup", refs: [], lc, ts: new Date().toISOString(),
-		type: "TaskCreate", body: { title: "dup", kind: "Feat", body: "x" },
-		sig: null, admitted: true, drop_reason: null,
+	// The SAME object goes twice: same bytes, same id — the benign re-pull.
+	const dup = mkForeign({
+		author: "did:key:drill-dup", seq: 0, project: "drill-b", entity: "t-dup",
+		lc: 9000, type: "TaskCreate", body: { title: "dup", kind: "Feat", body: "x" },
 	});
-	const d1 = await appendForeignEvents(t.issues, [mkDup(9000)]);
-	check(d1.accepted.length === 1 && d1.accepted[0] === "drill:dup:1" && d1.rejected.length === 0, "first delivery accepted"); // bi#58: exact-array, not includes
+	const d1 = await appendForeignEvents(t.issues, [dup]);
+	check(d1.accepted.length === 1 && d1.accepted[0] === dup.id && d1.rejected.length === 0, "first delivery accepted"); // bi#58: exact-array, not includes
 	check(storeList(t.issues).tasks.some((x) => x.entity === "t-dup"), "first delivery projects the new task"); // bi#58: exact entity, not JSON-substring (which also matches t-dup2)
 	const afterFirst = canonTasks(t.issues);
-	const d2 = await appendForeignEvents(t.issues, [mkDup(9000)]);
+	const d2 = await appendForeignEvents(t.issues, [{ ...dup }]);
 	check(d2.accepted.length === 0, "repeat delivery admits nothing (silent skip, accepted-half)"); // bi#58: split halves — a loud-reject mutation trips exactly one
 	check(d2.rejected.length === 0, "repeat delivery rejects nothing (silent skip, rejected-half)");
 	check(canonTasks(t.issues) === afterFirst, "repeat delivery: projections unchanged (idempotent)");
 
 	// Same event twice inside ONE batch — the staged-set dedupes. (Fresh
 	// author: same author+seq under a new id would be a fork, not a dup.)
-	const mkDup2 = () => ({ ...mkDup(9001), id: "drill:dup:2", author: "did:key:drill-dup2", entity: "t-dup2" });
-	const ev2 = mkDup2();
+	const ev2 = mkForeign({
+		author: "did:key:drill-dup2", seq: 0, project: "drill-b", entity: "t-dup2",
+		lc: 9001, type: "TaskCreate", body: { title: "dup", kind: "Feat", body: "x" },
+	});
 	const d3 = await appendForeignEvents(t.issues, [ev2, { ...ev2 }]);
-	check(d3.accepted.length === 1 && d3.accepted[0] === "drill:dup:2", "in-batch duplicate admitted exactly once"); // bi#58: exact-array
+	check(d3.accepted.length === 1 && d3.accepted[0] === ev2.id, "in-batch duplicate admitted exactly once"); // bi#58: exact-array
 	const ids = storeList(t.issues).tasks.filter((x) => x.entity === "t-dup2");
 	check(ids.length === 1, "in-batch duplicate projects exactly one row");
 }
@@ -245,14 +269,12 @@ drill = "c";
 	check(aTasks === bTasks && aEnts(B.issues) === "t1,t2", "pruned-then-resynced peer converged on tasks"); // bi#58: exact entity set tail
 
 	// Post-bootstrap write path stays open (fresh author chains on).
-	const w = await appendForeignEvents(B.issues, [{
-		id: "drill:c:1", author: "did:key:drill-c", seq: 0, prev: null,
-		project: "drill-c",
-		entity: "t-new", refs: [], lc: 9500, ts: new Date().toISOString(),
-		type: "TaskCreate", body: { title: "new", kind: "Feat", body: "x" },
-		sig: null, admitted: true, drop_reason: null,
-	}], { mode: "delta" });
-	check(w.accepted.length === 1 && w.accepted[0] === "drill:c:1", "bootstrapped peer accepts new writes"); // bi#58: exact-array
+	const wc = mkForeign({
+		author: "did:key:drill-c", seq: 0, project: "drill-c", entity: "t-new",
+		lc: 9500, type: "TaskCreate", body: { title: "new", kind: "Feat", body: "x" },
+	});
+	const w = await appendForeignEvents(B.issues, [wc], { mode: "delta" });
+	check(w.accepted.length === 1 && w.accepted[0] === wc.id, "bootstrapped peer accepts new writes"); // bi#58: exact-array
 }
 
 // ---------------------------------------------------------------- (d) gate injection proofs (bi#60)
@@ -268,19 +290,19 @@ drill = "d";
 	// G-sig — hunk: bais/src/hub.ts checkSig
 	// `return opts.requireSigs ? "sig-required" : null`.
 	// Violation: a well-formed but UNSIGNED event under a sig-requiring hub.
-	const mkSigEv = (id, author) => ({
-		id, author, seq: 0, prev: null, project: "g", entity: "task:g-sig",
-		refs: [], lc: 62000, ts: new Date().toISOString(),
-		type: "TaskCreate", body: { title: "sig probe", kind: "Feat", body: "x" },
-		sig: null, admitted: true, drop_reason: null,
+	const mkSigEv = (author) => mkForeign({
+		author, seq: 0, project: "g", entity: "task:g-sig",
+		lc: 62000, type: "TaskCreate", body: { title: "sig probe", kind: "Feat", body: "x" },
 	});
 	// (b) pre-existing checks miss it: without the flag the same shape admits
 	// (chain + shape + bounds all pass — nothing else fires).
-	const open = await appendForeignEvents(t.issues, [mkSigEv("g:sig:1", "did:key:g-sig")]);
-	check(open.accepted.length === 1 && open.accepted[0] === "g:sig:1" && open.rejected.length === 0, "G-sig(b): unsigned event admits when sigs not required");
+	const sigEv1 = mkSigEv("did:key:g-sig");
+	const open = await appendForeignEvents(t.issues, [sigEv1]);
+	check(open.accepted.length === 1 && open.accepted[0] === sigEv1.id && open.rejected.length === 0, "G-sig(b): unsigned event admits when sigs not required");
 	// (a) the new gate catches it: with requireSigs the same shape is refused
 	// with the named reason (fresh author, so chain state cannot interfere).
-	const strict = await appendForeignEvents(t.issues, [mkSigEv("g:sig:2", "did:key:g-sig2")], { requireSigs: true });
+	const sigEv2 = mkSigEv("did:key:g-sig2");
+	const strict = await appendForeignEvents(t.issues, [sigEv2], { requireSigs: true });
 	check(strict.accepted.length === 0 && strict.rejected.length === 1 && strict.rejected[0].reason === "sig-required",
 		`G-sig(a): requireSigs refuses the unsigned event (got ${JSON.stringify(strict.rejected)})`);
 
@@ -288,36 +310,143 @@ drill = "d";
 	// budget gate (exhausted = incurred >= cap in BOTH dims; wind-down,
 	// funding, and protocol types stay OPEN so exhaustion cannot deadlock).
 	const POOR = "did:key:g-poor", RICH = "did:key:g-rich";
-	const bev = (id, author, seq, prev, type, body, entity, lc) => ({
-		id, author, seq, prev, project: "g", entity, refs: [], lc,
-		ts: "2026-09-04T00:00:00Z", type, body, sig: null, admitted: true, drop_reason: null,
+	// Chain links reference REAL predecessor ids (prev must be the hash
+	// of the previous event, not a dev label): build sequentially.
+	const bev = (author, seq, prev, type, body, entity, lc) => mkForeign({
+		author, seq, prev, project: "g", entity, lc, ts: "2026-09-04T00:00:00Z", type, body,
 	});
-	const fund = await appendForeignEvents(t.issues, [
-		bev("g:auth:1", POOR, 0, null, "BudgetAuthorize", { cap_usd: 1.0, cap_tokens: 10 }, POOR, 63000),
-		bev("g:res:1", POOR, 1, "g:auth:1", "CostReserve", { task: "task:g-budget", usd: 1.0, tokens: 10 }, POOR, 63001),
-		bev("g:inc:1", POOR, 2, "g:res:1", "CostIncurred", { reserve_ref: "g:res:1", task: "task:g-budget", usd: 1.0, tokens: 10 }, POOR, 63002),
-	]);
+	const auth = bev(POOR, 0, null, "BudgetAuthorize", { cap_usd: 1.0, cap_tokens: 10 }, POOR, 63000);
+	const res = bev(POOR, 1, auth.id, "CostReserve", { task: "task:g-budget", usd: 1.0, tokens: 10 }, POOR, 63001);
+	const inc = bev(POOR, 2, res.id, "CostIncurred", { reserve_ref: res.id, task: "task:g-budget", usd: 1.0, tokens: 10 }, POOR, 63002);
+	const fund = await appendForeignEvents(t.issues, [auth, res, inc]);
 	check(fund.accepted.length === 3 && fund.rejected.length === 0, `G-budget setup: authorize+reserve+incur admitted (${fund.accepted.length}/3, poor now exhausted 1.0/10)`);
 	// (a) the new gate catches it: the exhausted author opens no new state.
-	const poorWrite = await appendForeignEvents(t.issues, [
-		bev("g:poor:1", POOR, 3, "g:inc:1", "TaskCreate", { title: "poor write", kind: "Feat", body: "x" }, "task:g-poor", 63003),
-	]);
+	const poorWriteEv = bev(POOR, 3, inc.id, "TaskCreate", { title: "poor write", kind: "Feat", body: "x" }, "task:g-poor", 63003);
+	const poorWrite = await appendForeignEvents(t.issues, [poorWriteEv]);
 	check(poorWrite.accepted.length === 0 && poorWrite.rejected.length === 1 && poorWrite.rejected[0].reason === "budget-exhausted",
 		`G-budget(a): exhausted author opens no new state (got ${JSON.stringify(poorWrite.rejected)})`);
 	// (b) pre-existing checks miss it: the identical shape from a funded
 	// author admits — chain/shape/bounds/decide all pass; only the budget
 	// dimension differs.
-	const richWrite = await appendForeignEvents(t.issues, [
-		bev("g:rich:1", RICH, 0, null, "TaskCreate", { title: "rich write", kind: "Feat", body: "x" }, "task:g-rich", 63003),
-	]);
-	check(richWrite.accepted.length === 1 && richWrite.accepted[0] === "g:rich:1", "G-budget(b): funded author admits the identical shape");
+	const richWriteEv = bev(RICH, 0, null, "TaskCreate", { title: "rich write", kind: "Feat", body: "x" }, "task:g-rich", 63003);
+	const richWrite = await appendForeignEvents(t.issues, [richWriteEv]);
+	check(richWrite.accepted.length === 1 && richWrite.accepted[0] === richWriteEv.id, "G-budget(b): funded author admits the identical shape");
 	// Precision: funding stays OPEN — poor can still top up (the gate
 	// cannot deadlock). The rejected write persisted as evidence, so poor's
-	// chain head is g:poor:1 at seq 3; the top-up continues at seq 4.
-	const topup = await appendForeignEvents(t.issues, [
-		bev("g:auth:2", POOR, 4, "g:poor:1", "BudgetAuthorize", { cap_usd: 5.0, cap_tokens: 50 }, POOR, 63004),
-	]);
-	check(topup.accepted.length === 1 && topup.accepted[0] === "g:auth:2", `G-budget precision: exhausted author can still top up (got ${JSON.stringify(topup.rejected)})`);
+	// chain head is the evidence id at seq 3; the top-up continues at seq 4.
+	const topupEv = bev(POOR, 4, poorWriteEv.id, "BudgetAuthorize", { cap_usd: 5.0, cap_tokens: 50 }, POOR, 63004);
+	const topup = await appendForeignEvents(t.issues, [topupEv]);
+	check(topup.accepted.length === 1 && topup.accepted[0] === topupEv.id, `G-budget precision: exhausted author can still top up (got ${JSON.stringify(topup.rejected)})`);
+
+	// G-tamper — hunk: bais/src/hub.ts checkId (verifyEventId on ingest).
+	// Violation: a well-formed event whose body no longer hashes to its
+	// id. Pre-existing checks miss it: shape/chain/sig-null/bounds all
+	// pass on the tampered bytes (nothing else fires).
+	const ADV = "did:key:g-adv";
+	const honest = mkForeign({
+		author: ADV, seq: 0, project: "g", entity: "task:g-tamper",
+		lc: 64000, type: "TaskCreate", body: { title: "honest", kind: "Feat", body: "x" },
+	});
+	const hOk = await appendForeignEvents(t.issues, [honest]);
+	check(hOk.accepted.length === 1 && hOk.accepted[0] === honest.id, "G-tamper setup: honest event admits");
+	// (a1) UNKNOWN id that hashes to nothing: the content does not match
+	// the claimed id — structural rejection, not a silent skip. (A known
+	// id with altered bytes is the replay-tamper case below.)
+	const forged = mkForeign({
+		author: "did:key:g-forg", seq: 0, project: "g", entity: "task:g-forg",
+		lc: 64001, type: "TaskCreate", body: { title: "honest", kind: "Feat", body: "x" },
+	});
+	const forgedUnknown = { ...forged, id: "b" + "0".repeat(50) };
+	const gTamper = await appendForeignEvents(t.issues, [forgedUnknown]);
+	check(gTamper.accepted.length === 0 && gTamper.rejected.length === 1 && gTamper.rejected[0].reason === "id-mismatch",
+		`G-tamper(a): body/id mismatch is evidence, not state (got ${JSON.stringify(gTamper.rejected)})`);
+	// (a2) same id, altered body, KNOWN id: tampered replay of the honest
+	// event — loud replay-tamper, never the silent re-pull.
+	const replayed = { ...honest, body: { ...honest.body, title: "tampered" } };
+	const gReplay = await appendForeignEvents(t.issues, [replayed]);
+	check(gReplay.accepted.length === 0 && gReplay.rejected.length === 1 && gReplay.rejected[0].reason === "replay-tamper",
+		`G-tamper(a2): tampered replay is loud (got ${JSON.stringify(gReplay.rejected)})`);
+	// (b) the benign re-pull stays silent (R-b contract): same bytes twice.
+	const gBenign = await appendForeignEvents(t.issues, [{ ...honest }]);
+	check(gBenign.accepted.length === 0 && gBenign.rejected.length === 0, "G-tamper(b): identical re-pull stays a silent no-op");
+
+	// G-fork — hunk: delta continuity (seq/prev linkage per author).
+	// Violation: same author+seq under two ids (both structurally valid,
+	// so the id gate cannot fire — only continuity sees it).
+	const F = "did:key:g-fork";
+	const f1 = mkForeign({
+		author: F, seq: 0, project: "g", entity: "task:g-fork",
+		lc: 64100, type: "TaskCreate", body: { title: "branch one", kind: "Feat", body: "x" },
+	});
+	const fOk = await appendForeignEvents(t.issues, [f1]);
+	check(fOk.accepted.length === 1, "G-fork setup: first branch admits");
+	const f2 = mkForeign({
+		author: F, seq: 0, project: "g", entity: "task:g-fork",
+		lc: 64101, type: "TaskCreate", body: { title: "branch two", kind: "Feat", body: "x" },
+	});
+	const gFork = await appendForeignEvents(t.issues, [f2]);
+	check(gFork.accepted.length === 0 && gFork.rejected.length === 1 && gFork.rejected[0].reason === "chain-break",
+		`G-fork(a): second seq-0 branch breaks continuity (got ${JSON.stringify(gFork.rejected)})`);
+	const f3 = mkForeign({
+		author: F, seq: 1, prev: f2.id, project: "g", entity: "task:g-fork",
+		lc: 64102, type: "TaskCreate", body: { title: "wrong link", kind: "Feat", body: "x" },
+	});
+	const gLink = await appendForeignEvents(t.issues, [f3]);
+	check(gLink.accepted.length === 0 && gLink.rejected.length === 1 && gLink.rejected[0].reason === "prev-mismatch",
+		`G-fork(a2): link to the rejected branch mismatches (got ${JSON.stringify(gLink.rejected)})`);
+
+	// G-revoke — hunk: needsCap consults BAML cap_live (revoked kills it).
+	// The drill proves the sync plumbing (cap-denied reason + evidence);
+	// BAML unit tests prove revoked grants go non-live. Split by layer,
+	// green by composition: the stub denies exactly one author, so the
+	// identical shape from anyone else must still admit (b).
+	const denyPoor = (author) => author !== "did:key:g-revoked";
+	const revEv = mkForeign({
+		author: "did:key:g-revoked", seq: 0, project: "g", entity: "task:g-rev",
+		lc: 64200, type: "TaskCreate", body: { title: "revoked write", kind: "Feat", body: "x" },
+	});
+	const gRev = await appendForeignEvents(t.issues, [revEv], { capCheck: (author, action, scope) => denyPoor(author) });
+	check(gRev.accepted.length === 0 && gRev.rejected.length === 1 && gRev.rejected[0].reason === "cap-denied",
+		`G-revoke(a): denied author is cap-denied evidence (got ${JSON.stringify(gRev.rejected)})`);
+	const okEv = mkForeign({
+		author: "did:key:g-funded", seq: 0, project: "g", entity: "task:g-ok",
+		lc: 64201, type: "TaskCreate", body: { title: "funded write", kind: "Feat", body: "x" },
+	});
+	const gOk = await appendForeignEvents(t.issues, [okEv], { capCheck: (author, action, scope) => denyPoor(author) });
+	check(gOk.accepted.length === 1 && gOk.accepted[0] === okEv.id, "G-revoke(b): allowed author admits the identical shape");
+
+	// G-skew — hunk: checkClock future bound (MAX_FUTURE_SKEW_MS = 1h,
+	// bais/src/hub.ts). History replays old timestamps legitimately, so
+	// only the future is bounded. bi#82: the boundary is pinned from BOTH
+	// sides against the injected clock — +59min admits, +61min rejects —
+	// so the verdict is identical live and under --now.
+	const skewAt = (author, entity, offsetMs, lc) => mkForeign({
+		author, seq: 0, project: "g", entity, lc,
+		ts: clock.isoAt(clock.nowMs() + offsetMs),
+		type: "TaskCreate", body: { title: "skew probe", kind: "Feat", body: "x" },
+	});
+	const skewIn = skewAt("did:key:g-skew-in", "task:g-skew-in", 59 * 60_000, 64299);
+	const gSkewIn = await appendForeignEvents(t.issues, [skewIn]);
+	check(gSkewIn.accepted.length === 1 && gSkewIn.accepted[0] === skewIn.id && gSkewIn.rejected.length === 0,
+		`G-skew(bound-): +59min event admits inside the 1h bound (got ${JSON.stringify(gSkewIn.rejected)})`);
+	const skewEv = skewAt("did:key:g-skew", "task:g-skew", 61 * 60_000, 64300);
+	const gSkew = await appendForeignEvents(t.issues, [skewEv]);
+	check(gSkew.accepted.length === 0 && gSkew.rejected.length === 1 && gSkew.rejected[0].reason === "clock-skew",
+		`G-skew(a): +61min event is clock-skew evidence (got ${JSON.stringify(gSkew.rejected)})`);
+	const oldEv = mkForeign({
+		author: "did:key:g-old", seq: 0, project: "g", entity: "task:g-old",
+		lc: 64301, ts: "2020-01-01T00:00:00Z",
+		type: "TaskCreate", body: { title: "history", kind: "Feat", body: "x" },
+	});
+	const gOld = await appendForeignEvents(t.issues, [oldEv]);
+	check(gOld.accepted.length === 1 && gOld.accepted[0] === oldEv.id, "G-skew(b): 2020 event admits — the past is unbounded");
+
+	// G-oversight — every named rejection above is visible in oversight,
+	// not just in the raw log.
+	const reasons = new Set(storeOversight(t.issues).rejected_events.map((r) => r.reason));
+	for (const want of ["id-mismatch", "replay-tamper", "chain-break", "prev-mismatch", "cap-denied", "clock-skew", "sig-required", "budget-exhausted"]) {
+		check(reasons.has(want), `G-oversight: ${want} visible in rejected_events`);
+	}
 }
 
 // ---------------------------------------------------------------- red-checks (bi#57)

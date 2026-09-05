@@ -231,6 +231,14 @@ output is byte-identical to before. Exit code is 0 even with reasons.
 - Exit code is 1 if `bad` is non-empty OR any `Missing` exists OR `cycles` is
   non-empty; `External` alone never fails. Human (non-JSON) output uses
   `ok|bad|dangling|external|cycle` tab-separated lines.
+- Close-evidence (bi#83): a `Done` issue must carry machine-resolvable
+  evidence refs in its body, one per line — `Evidence: drill(<name>)`
+  (red-check/injection drill that ran: a fault-drills letter or a script
+  stem in `scripts/`) and/or `Evidence: verdict(<id>)` (reviewer-verdict
+  issue in the same `.bais`). `check` reports one `evidence` problem per
+  missing/unresolvable ref (`missing-close-evidence`, `unresolvable-drill`,
+  `unresolvable-verdict`); any `Missing` fails the check, `External`
+  (cross-project verdict) is advisory only. `move` semantics are unchanged.
 
 ### 4.4 Errors
 

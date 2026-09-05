@@ -20,6 +20,17 @@ const { createHub } = await import(`${BAIS}/dist/src/hub.js`);
 const { ingestIssues, storeList, readBootstrap, appendForeignEvents: _unused } = await import(`${BAIS}/dist/src/store.js`);
 void _unused;
 const keys = await import(`${BAIS}/dist/src/keys.js`);
+const idsUtil = await import(`${BAIS}/dist/src/ids.js`);
+const { clock } = await import(`${BAIS}/scripts/clock.mjs`).then((m) => m.clockFromArgv(process.argv));
+
+// bi#82: injectable wall-clock. --now <ISO|epoch-ms> (or BAIS_NOW) pins
+// Date.now + no-arg new Date() in-process BEFORE the hub boots, so fixture
+// timestamps AND hub gate evaluations (clock-skew future bound, freeze
+// windows, evidence stamps) see the same fixed time. Lease expiries are
+// lc-based (expires_lc), hence already deterministic. Absent: live
+// passthrough. NOTE: the CLI bootstrap children spawned below read the
+// live clock, but they only verify hashes/roots — no wall-clock gates.
+console.log(`info: wall-clock ${clock.fixed ? `pinned at ${clock.nowISO()}` : "live"}`);
 
 let failures = 0;
 const check = (cond, msg) => {
@@ -91,39 +102,39 @@ check(got.verified === true, "checkpoint verifies on recompute");
 // --- signed replication: accept, tamper-evidence, requireSigs ---
 const P = keys.generatePeerKey();
 const proj = (await getA("/sync")).events[0].project;
-const mkEv = (id, seq, prev, bodyExtra = {}) => {
-	const e = {
-		id, author: P.did, seq, prev, project: proj, entity: "t3", refs: [],
-		lc: 9100 + seq, ts: new Date().toISOString(), type: "TaskCreate",
-		body: { title: "gamma", kind: "Feat", body: "signed", ...bodyExtra },
-		sig: null, admitted: true, drop_reason: null,
+// bi#37: fixtures carry real content-hash ids (sign first — the id covers
+// the sig — then hash).
+const mkEv = (seq, prev, bodyExtra = {}, key = P) => {
+	const body = { title: "gamma", kind: "Feat", body: "signed", ...bodyExtra };
+	const base = {
+		author: key.did, seq, prev, project: proj, entity: "t3", refs: [],
+		lc: 9100 + seq, ts: clock.nowISO(), type: "TaskCreate", body,
 	};
-	e.sig = keys.signPayload(P.privateJwk, { project: e.project, prev: e.prev, refs: e.refs, type: e.type, entity: e.entity, body: e.body });
-	return e;
+	const sig = keys.signPayload(key.privateJwk, { project: base.project, prev: base.prev, refs: base.refs, type: base.type, entity: base.entity, body: base.body });
+	const id = idsUtil.eventId({ ...base, sig });
+	return { ...base, id, sig, admitted: true, drop_reason: null };
 };
 {
-	const r = await postA("/sync", { events: [mkEv("sync-t3", 0, null)] });
-	check(r.status === 200 && r.json.accepted.includes("sync-t3"), "signed peer event accepted");
+	const ev0 = mkEv(0, null);
+	const r = await postA("/sync", { events: [ev0] });
+	check(r.status === 200 && r.json.accepted.includes(ev0.id), "signed peer event accepted");
 	// Fresh authors per case: reusing P's seq 0 would trip chain-break
 	// before the signature is even examined.
 	const Q = keys.generatePeerKey();
-	const qev = (id) => {
-		const e = mkEv(id, 0, null);
-		e.author = Q.did;
-		e.sig = keys.signPayload(Q.privateJwk, { project: e.project, prev: e.prev, refs: e.refs, type: e.type, entity: e.entity, body: e.body });
-		return e;
-	};
-	const bad = qev("sync-t3-bad");
-	bad.body = { ...bad.body, title: "tampered" }; // same sig, changed body
+	const bad = mkEv(0, null, {}, Q);
+	bad.body = { ...bad.body, title: "tampered" }; // same sig, same id, changed body
 	const r2 = await postA("/sync", { events: [bad] });
-	check(r2.json.rejected.some((x) => x.id === "sync-t3-bad" && x.reason === "bad-sig"), "tampered event is bad-sig evidence");
+	check(r2.json.rejected.some((x) => x.id === bad.id && x.reason === "bad-sig"), "tampered event is bad-sig evidence");
 	const R = keys.generatePeerKey();
-	const unsigned = mkEv("sync-nous", 0, null);
-	unsigned.author = R.did;
-	unsigned.sig = null;
+	const unsignedBase = {
+		author: R.did, seq: 0, prev: null, project: proj, entity: "t3", refs: [],
+		lc: 9100, ts: clock.nowISO(), type: "TaskCreate",
+		body: { title: "gamma", kind: "Feat", body: "signed" },
+	};
+	const unsigned = { ...unsignedBase, id: idsUtil.eventId(unsignedBase), sig: null, admitted: true, drop_reason: null };
 	const { appendForeignEvents } = await import(`${BAIS}/dist/src/hub.js`);
 	const r3 = await appendForeignEvents(dirA, [unsigned], { requireSigs: true });
-	check(r3.rejected.some((x) => x.id === "sync-nous" && x.reason === "sig-required"), "requireSigs rejects unsigned");
+	check(r3.rejected.some((x) => x.id === unsigned.id && x.reason === "sig-required"), "requireSigs rejects unsigned");
 }
 
 // --- ephemeral split: buffered, streamed, never persisted ---
@@ -144,30 +155,45 @@ const mkEv = (id, seq, prev, bodyExtra = {}) => {
 	const big = await postA("/claim", { task: "t2", holder: "did:key:big", ttl: 10, epoch: 0, idem: "x".repeat(300000) });
 	check(big.status === 413, "oversize write is 413");
 	const sp = "did:key:spammer";
-	const chain = (i, t, b) => ({ id: `sp-${i}`, author: sp, seq: i, prev: i === 0 ? null : `sp-${i - 1}`, project: proj, entity: sp, refs: [], lc: 9200 + i, ts: new Date().toISOString(), type: t, body: b, sig: null, admitted: true, drop_reason: null });
-	const fund = await postA("/sync", {
-		events: [
-			chain(0, "BudgetAuthorize", { cap_usd: 1.0, cap_tokens: 100 }),
-			chain(1, "CostReserve", { task: "t9", usd: 1.0, tokens: 100 }),
-			chain(2, "CostIncurred", { reserve_ref: "sp-1", task: "t9", usd: 1.0, tokens: 100 }),
-		],
-	});
+	// bi#37: real content-hash ids with hash-linked prev (build sequent-
+	// ially — each prev is the predecessor's id, not a dev label).
+	const chain = (i, prev, t, b, entity = sp) => {
+		const base = {
+			author: sp, seq: i, prev, project: proj, entity, refs: [],
+			lc: 9200 + i, ts: clock.nowISO(), type: t, body: b,
+		};
+		return { ...base, id: idsUtil.eventId(base), sig: null, admitted: true, drop_reason: null };
+	};
+	const c0 = chain(0, null, "BudgetAuthorize", { cap_usd: 1.0, cap_tokens: 100 });
+	const c1 = chain(1, c0.id, "CostReserve", { task: "t9", usd: 1.0, tokens: 100 });
+	const c2 = chain(2, c1.id, "CostIncurred", { reserve_ref: c1.id, task: "t9", usd: 1.0, tokens: 100 });
+	const fund = await postA("/sync", { events: [c0, c1, c2] });
 	check(fund.json.rejected.length === 0, "spam budget chain funded");
 	const gated = await postA("/claim", { task: "t2", holder: sp, ttl: 10, epoch: 0, idem: "s9" });
 	check(gated.status === 402 && gated.json.reason === "budget-exhausted", "exhausted author gets 402");
 	// Same lever on the sync path: new state from an exhausted author is
 	// evidence (wind-down/funding/protocol stay open by type allowlist).
-	const gatedSync = await postA("/sync", {
-		events: [{ id: "sp-3", author: sp, seq: 3, prev: "sp-2", project: proj, entity: "t9", refs: [], lc: 9210, ts: new Date().toISOString(), type: "TaskCreate", body: { title: "gated", kind: "Feat", body: "x" }, sig: null, admitted: true, drop_reason: null }],
-	});
-	check(gatedSync.json.rejected.some((x) => x.id === "sp-3" && x.reason === "budget-exhausted"), "sync path gates exhausted authors");
+	const sp3 = chain(3, c2.id, "TaskCreate", { title: "gated", kind: "Feat", body: "x" }, "t9");
+	const gatedSync = await postA("/sync", { events: [sp3] });
+	check(gatedSync.json.rejected.some((x) => x.id === sp3.id && x.reason === "budget-exhausted"), "sync path gates exhausted authors");
 	// Signed content with raw arrays is rejected: the hub normalizes on
-	// store, so the sig could never verify downstream.
+	// store, so the sig could never verify downstream. The id is computed
+	// over the ENCODED body (what ingest verifies) while the event carries
+	// the raw body + a sig over it — so the id gate passes and the
+	// unencoded-lists verdict (not id-mismatch) fires, as pinned.
 	const S = keys.generatePeerKey();
-	const rawList = { id: "sync-raw", author: S.did, seq: 0, prev: null, project: proj, entity: "t3", refs: [], lc: 9220, ts: new Date().toISOString(), type: "WorkSubmit", body: { evidence: ["cid:x"] }, sig: null, admitted: true, drop_reason: null };
-	rawList.sig = keys.signPayload(S.privateJwk, { project: rawList.project, prev: rawList.prev, refs: rawList.refs, type: rawList.type, entity: rawList.entity, body: rawList.body });
+	const rawBody = { evidence: ["cid:x"] };
+	const rawBase = {
+		author: S.did, seq: 0, prev: null, project: proj, entity: "t3", refs: [],
+		lc: 9220, ts: clock.nowISO(), type: "WorkSubmit", body: rawBody,
+	};
+	const rawSig = keys.signPayload(S.privateJwk, { project: rawBase.project, prev: rawBase.prev, refs: rawBase.refs, type: rawBase.type, entity: rawBase.entity, body: rawBase.body });
+	// Encode-first, exactly as the hub's toWire will: the id must match
+	// what ingest verifies, so the unencoded-lists verdict fires (pinned).
+	const { encodeBodyArrays } = await import(`${BAIS}/dist/src/hub.js`);
+	const rawList = { ...rawBase, id: idsUtil.eventId({ ...rawBase, body: encodeBodyArrays(rawBody), sig: rawSig }), sig: rawSig, admitted: true, drop_reason: null };
 	const rawRes = await postA("/sync", { events: [rawList] });
-	check(rawRes.json.rejected.some((x) => x.id === "sync-raw" && x.reason === "unencoded-lists"), "signed raw arrays rejected as unencoded-lists");
+	check(rawRes.json.rejected.some((x) => x.id === rawList.id && x.reason === "unencoded-lists"), "signed raw arrays rejected as unencoded-lists");
 }
 
 // --- real CLI bootstrap: snapshot + backfill-verify + delta ---
@@ -232,13 +258,14 @@ let anchorId = "";
 	// Writes continue from the anchor floor (lc + author chains): extend
 	// the hub-key chain (never budget-exhausted) past the truncation.
 	const anchorEv = afterSync.events.find((e) => e.id === anchorId);
-	const cont = {
-		id: "post-prune-1", author: anchorEv.author, seq: anchorEv.seq + 1, prev: anchorEv.id, project: proj, entity: "t9",
-		refs: [], lc: afterSync.lc + 1, ts: new Date().toISOString(), type: "TaskCreate",
-		body: { title: "after prune", kind: "Feat", body: "x" }, sig: null, admitted: true, drop_reason: null,
+	const contBase = {
+		author: anchorEv.author, seq: anchorEv.seq + 1, prev: anchorEv.id, project: proj, entity: "t9",
+		refs: [], lc: afterSync.lc + 1, ts: clock.nowISO(), type: "TaskCreate",
+		body: { title: "after prune", kind: "Feat", body: "x" },
 	};
+	const cont = { ...contBase, id: idsUtil.eventId(contBase), sig: null, admitted: true, drop_reason: null };
 	const contRes = await postA("/sync", { events: [cont] });
-	check(contRes.json.accepted?.includes("post-prune-1"), "post-prune continuation accepted via floor");
+	check(contRes.json.accepted?.includes(cont.id), "post-prune continuation accepted via floor");
 	const badPrune = await postA("/prune", { checkpoint: "nope" });
 	check(badPrune.status === 400, "prune of unknown checkpoint refused");
 	// Fail-closed: t1's anchor lease (holder did:key:a) still covers it —

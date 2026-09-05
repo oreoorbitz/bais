@@ -164,6 +164,24 @@ export function cyclicIds(all: BaisFile[]): string[] {
 	}
 }
 
+// bi#83: close-evidence — verdicts as types. A Done issue must carry
+// machine-resolvable evidence refs ON the issue itself; `bais check`
+// verifies they resolve and refuses prose-only closes loudly.
+//
+// Encoding: the strict TOML parser rejects unknown top-level keys, so
+// refs ride in `body` markdown, one per line:
+//
+//   Evidence: drill(b)            # red-check / injection drill that ran (bi#57/bi#60)
+//   Evidence: verdict(bi#59)      # reviewer-verdict issue filed in this .bais (bi#59)
+//
+// `drill(NAME)` resolves iff NAME is a known drill: a fault-drills letter
+// (a/b/c/d/r) or a script stem present in scripts/ (knownDrillNames).
+// `verdict(ID)` resolves iff ID is a loaded issue id; a cross-project id
+// is reported External (advisory, never fatal — same convention as
+// dangling refs). A Done issue with zero refs fails as missing-close-
+// evidence. Non-Done issues carry no requirement. Advisory-first: only
+// one resolvable ref is required (not one of each kind); `move` semantics
+// are untouched — this is a `check` failure, not a transition guard.
 // Mirror of BAML WhyNotKind/IssueLease/WhyNot/why_not (`ready --why-not`).
 // Field names match the BAML classes exactly (snake_case on both sides —
 // preserve-case SDK) so `--json` reasons round-trip through the generated
@@ -263,6 +281,83 @@ export function whyNotIn(all: BaisFile[], project: string, leases: HostLease[] =
 		const lease = leaseByEntity.get(f.issue.id);
 		if (lease) {
 			out.push({ ...nullWhyNot(f.issue.id, "Leased"), holder: lease.holder, expires_lc: lease.expires_lc });
+		}
+	}
+	return out;
+}
+
+// bi#83 close-evidence core (dependency-free: no imports beyond node:fs
+// already at top, so it stays probeable without the BAML runtime).
+export type CloseEvidenceKind = "drill" | "verdict";
+export type CloseEvidenceRef = { kind: CloseEvidenceKind; ref: string };
+export type CloseEvidenceProblem = {
+	id: string; // Done issue carrying the bad / missing evidence
+	reason: "missing-close-evidence" | "unresolvable-drill" | "unresolvable-verdict";
+	ref: string | null; // the raw ref text, null when nothing was cited
+	kind: CloseEvidenceKind | null;
+	status: "Missing" | "External"; // External (cross-project verdict) is advisory, never fatal
+};
+
+// Fault-drill letters (scripts/fault-drills.mjs drill (a)/(b)/(c)/(d)/(r))
+// always resolve; script stems resolve iff a matching *.mjs exists in
+// scriptsDir (absent dir = letters only, so other projects still check).
+// issuesDir is <root>/.bais/issues; drill scripts live at <root>/scripts.
+export function scriptsDirFor(issuesDir: string): string {
+	return join(resolve(issuesDir, "..", ".."), "scripts");
+}
+
+export function knownDrillNames(scriptsDir: string): string[] {
+	const names = ["a", "b", "c", "d", "r"];
+	try {
+		for (const f of readdirSync(scriptsDir).filter((f) => f.endsWith(".mjs")).sort()) {
+			const stem = f.slice(0, -4);
+			if (!names.includes(stem)) names.push(stem);
+		}
+	} catch {}
+	return names;
+}
+
+// One `Evidence: drill(x)` / `Evidence: verdict(y)` ref per matching
+// body line (case-sensitive kind, trimmed ref; trailing `#` comment
+// stripped). Anything else on the line is not a ref — prose never counts.
+export function parseCloseEvidence(body: string): CloseEvidenceRef[] {
+	const out: CloseEvidenceRef[] = [];
+	for (const line of (body ?? "").split("\n")) {
+		const m = /^\s*Evidence\s*:\s*(drill|verdict)\s*\(\s*([^)]*?)\s*\)\s*(?:#.*)?$/.exec(line);
+		if (m) out.push({ kind: m[1] as CloseEvidenceKind, ref: m[2].trim() });
+	}
+	return out;
+}
+
+// Done-only gate: every Done entry needs >= 1 evidence ref and every
+// cited ref must resolve. Entries are {id,status,body} so both the scan
+// path (BaisFile) and the store path (tasks rows) share this predicate.
+export function closeEvidenceIn(
+	entries: { id: string; status: string; body: string }[],
+	project: string,
+	drills: string[],
+): CloseEvidenceProblem[] {
+	const known = new Set(entries.map((e) => e.id));
+	const out: CloseEvidenceProblem[] = [];
+	for (const e of entries) {
+		if (e.status !== "Done") continue;
+		const refs = parseCloseEvidence(e.body);
+		if (refs.length === 0) {
+			out.push({ id: e.id, reason: "missing-close-evidence", ref: null, kind: null, status: "Missing" });
+			continue;
+		}
+		for (const r of refs) {
+			if (r.kind === "drill") {
+				if (!drills.includes(r.ref)) {
+					out.push({ id: e.id, reason: "unresolvable-drill", ref: `drill(${r.ref})`, kind: "drill", status: "Missing" });
+				}
+			} else {
+				if (!known.has(r.ref)) {
+					const scope = idProject(r.ref);
+					const external = scope !== "" && scope !== project;
+					out.push({ id: e.id, reason: "unresolvable-verdict", ref: `verdict(${r.ref})`, kind: "verdict", status: external ? "External" : "Missing" });
+				}
+			}
 		}
 	}
 	return out;

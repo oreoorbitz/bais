@@ -8,7 +8,7 @@
 
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cyclicIds, danglingRefsIn, loadIssues, projectName, readyIssues, whyNotIn } from "./graph.js";
+import { cyclicIds, closeEvidenceIn, danglingRefsIn, knownDrillNames, loadIssues, projectName, readyIssues, scriptsDirFor, whyNotIn } from "./graph.js";
 import { parseBaisFile } from "./toml.js";
 import type { WhyNot } from "./graph.js";
 import { hasStore, ingestIssues, storeCaps, storeCheck, storeEdges, storeGraph, storeList, storeOversight, storeReady, storeSample, storeWhyNot, verifyStore, deepVerify } from "./store.js";
@@ -362,28 +362,54 @@ if (cmd === "verify") {
 
 if (cmd === "check") {
 	ensureInit();
+	// bi#83: close-evidence render, shared by both paths. A Done issue with
+	// no Evidence: refs, or refs that do not resolve, is LOUD: one
+	// `evidence` line per problem. Missing (same-project unresolvable) is
+	// fatal; External (cross-project verdict ref) is advisory, never fatal —
+	// the same split dangling refs use.
+	const printEvidence = (evidence: { id: string; reason: string; ref: string | null; kind: string | null; status: string }[]): number => {
+		let fatal = 0;
+		for (const p of evidence) {
+			if (p.reason === "missing-close-evidence") {
+				console.log(`evidence\t${p.id}\tmissing-close-evidence\tDone with no Evidence: refs (add Evidence: drill(<name>) and/or Evidence: verdict(<id>) to the body)`);
+			} else {
+				console.log(`evidence\t${p.id}\t${p.reason}\t${p.ref} does not resolve`);
+			}
+			if (p.status === "Missing") fatal += 1;
+		}
+		return fatal;
+	};
 	if (useStore) {
-		const { ok, bad, dangling, cycles } = storeCheck(issuesDir);
+		const { ok, bad, dangling, cycles, evidence } = storeCheck(issuesDir);
 		const missing = dangling.filter((d) => d.status === "Missing");
 		const external = dangling.filter((d) => d.status === "External");
 		if (asJson) {
-			console.log(JSON.stringify({ ok, bad, dangling, cycles }, null, 2));
+			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence }, null, 2));
 		} else {
 			for (const d of missing) console.log(`dangling\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			for (const d of external) console.log(`external\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			if (cycles.length) console.log(`cycle\t${cycles.join(", ")}`);
+			const fatalEvidence = printEvidence(evidence);
 			console.log(`ok\t${ok} issues, ${bad.length} bad`);
+			if (bad.length || missing.length || cycles.length || fatalEvidence) process.exit(1);
+			process.exit(0);
 		}
-		if (bad.length || missing.length || cycles.length) process.exit(1);
+		const fatalEvidence = evidence.filter((p) => p.status === "Missing").length;
+		if (bad.length || missing.length || cycles.length || fatalEvidence) process.exit(1);
 	} else {
 		const { issues, failures } = await loadIssues(issuesDir);
 		const dangling = danglingRefsIn(issues, projectName(issuesDir));
 		const missing = dangling.filter((d) => d.status === "Missing");
 		const external = dangling.filter((d) => d.status === "External");
 		const cycles = cyclicIds(issues);
+		const evidence = closeEvidenceIn(
+			issues.map((f) => ({ id: f.issue.id, status: f.issue.status, body: f.issue.body })),
+			projectName(issuesDir),
+			knownDrillNames(scriptsDirFor(issuesDir)),
+		);
 
 		if (asJson) {
-			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles }, null, 2));
+			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence }, null, 2));
 		} else {
 			for (const f of issues) console.log(`ok\t${f.issue.id}`);
 			for (const b of failures) console.log(`bad\t${b.file}\t${b.error}`);
@@ -395,12 +421,19 @@ if (cmd === "check") {
 			for (const d of external) console.log(`external\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			// Nothing in a dependency cycle can ever become ready.
 			if (cycles.length) console.log(`cycle\t${cycles.join(", ")}`);
+			// bi#83: prose-only closes refuse loudly — Done with no (or
+			// unresolvable) Evidence: refs names the missing evidence here.
+			const fatalEvidence = printEvidence(evidence);
+			if (failures.length || missing.length || cycles.length || fatalEvidence) process.exit(1);
+			process.exit(0);
 		}
 
 		// External is reported, never fatal — a cross-project edge is legitimate and
 		// unresolvable from one directory. Applies to --json too: the old check
-		// exited 0 in JSON mode, which made it useless as a CI gate.
-		if (failures.length || missing.length || cycles.length) process.exit(1);
+		// exited 0 in JSON mode, which made it useless as a CI gate. Same for
+		// External verdict refs (bi#83): reported, never fatal.
+		const fatalEvidence = evidence.filter((p) => p.status === "Missing").length;
+		if (failures.length || missing.length || cycles.length || fatalEvidence) process.exit(1);
 	}
 	process.exit(0);
 }
@@ -567,6 +600,8 @@ if (cmd === "oversight") {
 		for (const l of o.stalled_leases) console.log(`  ${l.id}\t${l.task}\tholder ${l.holder}`);
 		console.log(`caps_over_budget\t${o.caps_over_budget.length}`);
 		for (const c of o.caps_over_budget) console.log(`  ${c.grant_id}\t${c.audience}\tspent ${c.incurred} > cap ${c.budget_cap_usd}`);
+		console.log(`rejected_events\t${o.rejected_events.length}`);
+		for (const r of o.rejected_events) console.log(`  ${r.id}\t${r.author}\t${r.type}\t${r.reason}`);
 	}
 	process.exit(0);
 }

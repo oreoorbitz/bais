@@ -6,8 +6,19 @@
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createHub } from "../dist/src/hub.js";
+import { createHub, encodeBodyArrays } from "../dist/src/hub.js";
+import { eventId } from "../dist/src/ids.js";
 import { ingestIssues } from "../dist/src/store.js";
+import { clockFromArgv } from "./clock.mjs";
+
+// bi#82: injectable wall-clock. --now <ISO|epoch-ms> (or BAIS_NOW) pins
+// Date.now + no-arg new Date() in-process BEFORE the hub boots, so fixture
+// timestamps AND hub gate evaluations (clock-skew future bound, freeze
+// windows, evidence stamps) see the same fixed time. Lease expiries
+// themselves are lc-based (expires_lc), hence already deterministic; the
+// pin covers the wall-clock remainder. Absent: live passthrough.
+const { clock } = clockFromArgv(process.argv);
+console.log(`info: wall-clock ${clock.fixed ? `pinned at ${clock.nowISO()}` : "live"}`);
 
 let failures = 0;
 const check = (cond, msg) => {
@@ -123,15 +134,21 @@ check(z.status === 409 && zrenew.status === 409 && zold.status === 409,
 // Observed 2026-09-04 (live hub, this probe): 402 {"reason":"budget-exhausted"} / 200 admitted.
 {
 	const POOR = "did:key:poor", RICH = "did:key:rich";
-	const bev = (id, author, seq, prev, type, body, entity, lc) => ({
-		id, author, seq, prev, project: "t", entity, refs: [], lc,
-		ts: "2026-09-04T00:00:00Z", type, body, sig: null,
-	});
-	const fundRes = await post("/sync", { events: [
-		bev("g:auth:1", POOR, 0, null, "BudgetAuthorize", { cap_usd: 1.0, cap_tokens: 10 }, POOR, 64000),
-		bev("g:res:1", POOR, 1, "g:auth:1", "CostReserve", { task: "t2", usd: 1.0, tokens: 10 }, POOR, 64001),
-		bev("g:inc:1", POOR, 2, "g:res:1", "CostIncurred", { reserve_ref: "g:res:1", task: "t2", usd: 1.0, tokens: 10 }, POOR, 64002),
-	] });
+	// bi#38: real content-hash ids (dev-style ids are dead by policy —
+	// ingest verifies structurally). Chain links reference the real
+	// predecessor ids: build sequentially.
+	const bev = (author, seq, prev, type, body, entity, lc) => {
+		const enc = encodeBodyArrays(body);
+		const base = {
+			author, seq, prev, project: "t", entity, refs: [], lc,
+			ts: clock.nowISO(), type, body: enc,
+		};
+		return { ...base, id: eventId(base), sig: null };
+	};
+	const authEv = bev(POOR, 0, null, "BudgetAuthorize", { cap_usd: 1.0, cap_tokens: 10 }, POOR, 64000);
+	const resEv = bev(POOR, 1, authEv.id, "CostReserve", { task: "t2", usd: 1.0, tokens: 10 }, POOR, 64001);
+	const incEv = bev(POOR, 2, resEv.id, "CostIncurred", { reserve_ref: resEv.id, task: "t2", usd: 1.0, tokens: 10 }, POOR, 64002);
+	const fundRes = await post("/sync", { events: [authEv, resEv, incEv] });
 	const fundedIds = fundRes.json.accepted ?? [];
 	check(fundRes.status === 200 && fundedIds.length === 3, `G-budget setup: poor exhausted via hub sync (${fundedIds.length}/3 admitted)`);
 	const poor = await post("/claim", { task: "t2", holder: POOR, ttl: 1000, epoch: 0, idem: "poor1" });

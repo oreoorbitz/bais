@@ -2,7 +2,7 @@
 	"$schema": "https://json-schema.org/draft/2020-12/schema",
 	"$id": "https://oreoorbitz.github.io/bais/schema/check-output.json",
 	"title": "BaisCheckOutput — bais check --json (SPEC §4.3)",
-	"description": "Exit code is 1 when bad is non-empty, any dangling status is Missing, or cycles is non-empty. External alone never fails.",
+	"description": "Exit code is 1 when bad is non-empty, any dangling status is Missing, cycles is non-empty, or any close-evidence problem is Missing. External alone never fails.",
 	"type": "object",
 	"required": ["ok", "bad", "dangling", "cycles"],
 	"additionalProperties": false,
@@ -37,6 +37,22 @@
 				}
 			}
 		},
-		"cycles": { "type": "array", "items": { "type": "string" } }
+		"cycles": { "type": "array", "items": { "type": "string" } },
+		"evidence": {
+			"type": "array",
+			"description": "bi#83 close-evidence problems for Done issues (optional; absent in older outputs)",
+			"items": {
+				"type": "object",
+				"required": ["id", "reason", "ref", "kind", "status"],
+				"additionalProperties": false,
+				"properties": {
+					"id": { "type": "string", "description": "Done issue carrying the bad/missing evidence" },
+					"reason": { "enum": ["missing-close-evidence", "unresolvable-drill", "unresolvable-verdict"] },
+					"ref": { "type": ["string", "null"], "description": "raw ref text, null when nothing was cited" },
+					"kind": { "type": ["string", "null"], "enum": ["drill", "verdict", null] },
+					"status": { "enum": ["Missing", "External"], "description": "Missing is fatal; External (cross-project verdict) is advisory" }
+				}
+			}
+		}
 	}
 }

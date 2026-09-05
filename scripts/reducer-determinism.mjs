@@ -35,7 +35,8 @@ import {
 	exportSnapshot,
 	dbPathFor,
 } from "../dist/src/store.js";
-import { appendForeignEvents } from "../dist/src/hub.js";
+import { appendForeignEvents, encodeBodyArrays } from "../dist/src/hub.js";
+import { eventId } from "../dist/src/ids.js";
 
 // Checked-in fuzz seed — do not change. The determinism proof must
 // reproduce byte-identically on every run.
@@ -196,10 +197,13 @@ console.log(`base projection: ${base}`);
 function buildFuzzLog() {
 	const evs = [];
 	const cursor = {};
-	const emit = (author, entity, lc, id, type, body) => {
+	// bi#38: real content-hash ids (dev-style ids are dead by policy).
+	// Conflict winners are still deterministic — same content hashes
+	// to the same id on every run — only WHICH hash is greater changed.
+	const emit = (author, entity, lc, type, body) => {
 		const seq = cursor[author]?.seq ?? -1;
-		evs.push({
-			id,
+		const enc = encodeBodyArrays(body);
+		const base = {
 			author,
 			seq: seq + 1,
 			prev: cursor[author]?.id ?? null,
@@ -209,35 +213,36 @@ function buildFuzzLog() {
 			lc,
 			ts: "2026-09-04T00:00:00Z",
 			type,
-			body,
-			sig: null,
-		});
+			body: enc,
+		};
+		const id = eventId(base);
+		evs.push({ ...base, id, sig: null });
 		cursor[author] = { seq: seq + 1, id };
 	};
 	const A = "did:key:fuzz-a";
 	const B = "did:key:fuzz-b";
 	const T = (o) => o;
-	emit(A, "task:f0", 1, "fz-001", "TaskCreate", T({ title: "f0", kind: "Feat", body: "x" }));
-	emit(B, "task:f1", 1, "fz-002", "TaskCreate", T({ title: "f1", kind: "Bug", body: "y" }));
-	emit(A, "task:f2", 1, "fz-003", "TaskCreate", T({ title: "f2", kind: "Feat", body: "z" }));
-	emit(A, "task:f0", 2, "fz-004", "LabelAdd", T({ label: "backend" }));
-	emit(B, "task:f0", 2, "fz-005", "LabelRemove", T({ label: "backend" })); // same lc: add wins
-	emit(A, "task:f0", 2, "fz-006", "RelAdd", T({ rel_id: "rel:fz-r1", source: "task:f0", type: "Blocks", target: "task:f1" }));
-	emit(B, "task:f1", 3, "fz-007", "RelAdd", T({ rel_id: "rel:fz-r2", source: "task:f1", type: "DependsOn", target: "task:f2" }));
-	emit(A, "task:f0", 3, "fz-008", "CommentPost", T({ text: "first" }));
-	emit(B, "task:f0", 4, "fz-009", "CommentPost", T({ text: "second" }));
-	emit(A, "task:f0", 5, "fz-010", "TaskTransition", T({ to: "Doing" }));
-	emit(B, "task:f0", 5, "fz-011", "TaskTransition", T({ to: "Blocked" })); // same lc: conflict, greater id wins
-	emit(A, "task:f0", 5, "fz-012", "Teleport", T({})); // unknown type: evidence
-	emit(B, "task:f1", 5, "fz-013", "TaskSet", T({ title: "f1-renamed" }));
-	emit(A, "task:f1", 4, "fz-014", "TaskSet", T({ title: "f1-stale" })); // lower lc loses (LWW)
-	emit(B, "task:f1", 3, "fz-015", "RelRetract", T({ rel_id: "rel:fz-r2" }));
-	emit(A, "task:f0", 6, "fz-016", "TaskCreate", T({ title: "dup", kind: "Feat", body: "x" })); // duplicate create: evidence
-	emit(B, "task:ghost", 6, "fz-017", "TaskSet", T({ title: "x" })); // unknown entity: evidence
-	emit(A, "task:f1", 6, "fz-018", "TaskTransition", T({ to: "Working" })); // unknown status: evidence
-	emit(B, "task:f0", 7, "fz-019", "TaskTransition", T({ to: "Done" }));
-	emit(A, "task:f2", 7, "fz-020", "LabelAdd", T({ label: "frontend" }));
-	emit(B, "task:f2", 8, "fz-021", "LabelRemove", T({ label: "frontend" })); // strictly greater lc: removed
+	emit(A, "task:f0", 1, "TaskCreate", T({ title: "f0", kind: "Feat", body: "x" }));
+	emit(B, "task:f1", 1, "TaskCreate", T({ title: "f1", kind: "Bug", body: "y" }));
+	emit(A, "task:f2", 1, "TaskCreate", T({ title: "f2", kind: "Feat", body: "z" }));
+	emit(A, "task:f0", 2, "LabelAdd", T({ label: "backend" }));
+	emit(B, "task:f0", 2, "LabelRemove", T({ label: "backend" })); // same lc: add wins
+	emit(A, "task:f0", 2, "RelAdd", T({ rel_id: "rel:fz-r1", source: "task:f0", type: "Blocks", target: "task:f1" }));
+	emit(B, "task:f1", 3, "RelAdd", T({ rel_id: "rel:fz-r2", source: "task:f1", type: "DependsOn", target: "task:f2" }));
+	emit(A, "task:f0", 3, "CommentPost", T({ text: "first" }));
+	emit(B, "task:f0", 4, "CommentPost", T({ text: "second" }));
+	emit(A, "task:f0", 5, "TaskTransition", T({ to: "Doing" }));
+	emit(B, "task:f0", 5, "TaskTransition", T({ to: "Blocked" })); // same lc: conflict, greater id wins
+	emit(A, "task:f0", 5, "Teleport", T({})); // unknown type: evidence
+	emit(B, "task:f1", 5, "TaskSet", T({ title: "f1-renamed" }));
+	emit(A, "task:f1", 4, "TaskSet", T({ title: "f1-stale" })); // lower lc loses (LWW)
+	emit(B, "task:f1", 3, "RelRetract", T({ rel_id: "rel:fz-r2" }));
+	emit(A, "task:f0", 6, "TaskCreate", T({ title: "dup", kind: "Feat", body: "x" })); // duplicate create: evidence
+	emit(B, "task:ghost", 6, "TaskSet", T({ title: "x" })); // unknown entity: evidence
+	emit(A, "task:f1", 6, "TaskTransition", T({ to: "Working" })); // unknown status: evidence
+	emit(B, "task:f0", 7, "TaskTransition", T({ to: "Done" }));
+	emit(A, "task:f2", 7, "LabelAdd", T({ label: "frontend" }));
+	emit(B, "task:f2", 8, "LabelRemove", T({ label: "frontend" })); // strictly greater lc: removed
 	return evs;
 }
 
@@ -248,14 +253,18 @@ function buildFuzzLog() {
 	check(probe.rejected.length === 0, `fuzz log chain-legal as a set (0 host rejects)`);
 	const snap = exportSnapshot(probeDir);
 	// bi#58: exact counts — the fuzz log is deterministic, so 1 conflict /
-	// 4 excluded is the equality form; `> 0` would still pass if a reducer
-	// change silently dropped half the evidence paths.
+	// 5 excluded is the equality form; `> 0` would still pass if a reducer
+	// change silently dropped half the evidence paths. The 5th (vs 4 under
+	// dev ids) is unknown-rel: content-hash ids re-sort the lc-3
+	// RelAdd/RelRetract tiebreak so the retract applies first — the (lc,
+	// id) tiebreak is id-sensitive by design, and the unknown-rel record
+	// is the reducer handling that order correctly, not a divergence.
 	if (!Array.isArray(snap.tables.conflicts) || !Array.isArray(snap.tables.excluded)) {
 		failures++;
 		console.error(`FAIL: fuzz tables missing conflicts/excluded arrays`);
 	}
 	check(snap.tables.conflicts.length === 1, `fuzz hits the conflict path (${snap.tables.conflicts.length} conflict(s))`);
-	check(snap.tables.excluded.length === 4, `fuzz hits evidence paths (${snap.tables.excluded.length} excluded)`);
+	check(snap.tables.excluded.length === 5, `fuzz hits evidence paths (${snap.tables.excluded.length} excluded)`);
 	const fuzzBase = fingerprint(probeDir);
 	console.log(`fuzz projection: ${fuzzBase}`);
 	const rand = rng32(FUZZ_SEED);

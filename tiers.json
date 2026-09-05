@@ -1,0 +1,26 @@
+{
+  "_comment": "BITS tier manifest (bi#81). Maps every npm-test script to a tier. T0 = offline, seconds, no sockets. T1 = offline integration, minutes, loopback binds allowed. T2 = live-key / external, never in default gates (loud skips offline). Budgets are wall-clock seconds; over-budget = fail, enforced by scripts/tiers.mjs.",
+  "tiers": {
+    "t0": { "budget_s": 300, "desc": "offline unit, seconds, no sockets" },
+    "t1": { "budget_s": 900, "desc": "offline integration, minutes, loopback binds allowed" },
+    "t2": { "budget_s": 600, "desc": "live-key / external, never in default gates" }
+  },
+  "baml_t0_note": "BAML unit (`baml test --project bais`) is a T0 member run outside npm; scripts/tiers.mjs runs only the cmd members below.",
+  "scripts": [
+    { "name": "lease-race", "cmd": ["node", "scripts/lease-race.mjs"], "tier": "t1", "budget_s": 300 },
+    { "name": "sync-test", "cmd": ["node", "scripts/sync-test.mjs"], "tier": "t1", "budget_s": 600 },
+    { "name": "mcp-test", "cmd": ["node", "scripts/mcp-test.mjs"], "tier": "t0", "budget_s": 120 },
+    { "name": "reducer-determinism", "cmd": ["node", "scripts/reducer-determinism.mjs"], "tier": "t0", "budget_s": 120 },
+    { "name": "cross-check", "cmd": ["node", "scripts/cross-check.mjs", "../bi/.bais/issues"], "tier": "t0", "budget_s": 120 },
+    { "name": "ingest-durability", "cmd": ["node", "scripts/ingest-durability.mjs"], "tier": "t1", "budget_s": 300 },
+    { "name": "move-unblocked", "cmd": ["node", "scripts/move-unblocked.mjs"], "tier": "t0", "budget_s": 120 },
+    { "name": "ready-wait", "cmd": ["node", "scripts/ready-wait.mjs"], "tier": "t0", "budget_s": 180 },
+    { "name": "content-ids", "cmd": ["node", "scripts/content-ids.mjs"], "tier": "t1", "budget_s": 180 },
+    { "name": "contract-test", "cmd": ["node", "scripts/contract-test.mjs"], "tier": "t0", "budget_s": 120 },
+    { "name": "fault-drills", "cmd": ["node", "scripts/fault-drills.mjs"], "tier": "t1", "budget_s": 600 }
+  ],
+  "t2_placeholders": [
+    { "name": "live-hub-smoke", "tier": "t2", "live": true, "in_default_gate": false, "needs": "BAIS_T2_LIVE=1 + BAIS_LIVE_KEY" },
+    { "name": "external-loopback-probe", "tier": "t2", "live": true, "in_default_gate": false, "needs": "BAIS_T2_LIVE=1 + BAIS_LIVE_KEY" }
+  ]
+}

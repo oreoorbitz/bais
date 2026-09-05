@@ -10,7 +10,10 @@
 	"scripts": {
 		"build": "tsc -p tsconfig.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
-		"test": "node scripts/lease-race.mjs && node scripts/sync-test.mjs && node scripts/mcp-test.mjs && node scripts/reducer-determinism.mjs && node scripts/cross-check.mjs ../bi/.bais/issues && node scripts/ingest-durability.mjs && node scripts/move-unblocked.mjs && node scripts/ready-wait.mjs && node scripts/content-ids.mjs && node scripts/fault-drills.mjs"
+		"test": "node scripts/tiers.mjs t0 t1",
+		"test:t0": "node scripts/tiers.mjs t0",
+		"test:t1": "node scripts/tiers.mjs t1",
+		"test:t2": "node scripts/test-t2.mjs"
 	},
 	"dependencies": {
 		"@boundaryml/baml-bridge": "0.17.0"
