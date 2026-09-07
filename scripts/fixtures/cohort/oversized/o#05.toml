@@ -1,0 +1,11 @@
+id = "o#05"
+title = "oversized slice 05"
+status = "Open"
+kind = "Feat"
+area = "demo/cohort"
+body = """
+Slice 05 of the oversized surface; every slice shares mesh.ts so the whole
+set is one affinity group that cannot fit the footprint cap.
+Acceptance: slice 05 closes on its own acceptance; slice 05 red-checks its own hunk.
+Files: mesh.ts part05a.ts part05b.ts
+"""

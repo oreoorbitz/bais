@@ -1,0 +1,11 @@
+# Post-interview component plan agreed BEFORE any squad forms.
+dir: goals/inventory-mvp
+lieutenant: lieut-145
+plan-proposed: ingest,query
+plan-agreed: by=operator
+squad-formed: squad-ingest component=ingest
+squad-formed: squad-query component=query
+depends: query on ingest
+integrated: ingest by=lieut-145 ref=handoff-001
+integrated: query by=lieut-145 ref=handoff-002
+system-test: owner=lieut-145 covers=ingest,query result=pass

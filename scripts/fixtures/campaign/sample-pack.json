@@ -1,0 +1,16 @@
+{
+  "pack": "t-sample",
+  "suite": "pass",
+  "slots": [
+    {
+      "id": "t#01",
+      "item": "pass",
+      "diff": "diff --git a/titan.ts b/titan.ts\n--- a/titan.ts\n+++ b/titan.ts\n@@ -1 +1 @@\n-old\n+new"
+    },
+    {
+      "id": "t#02",
+      "item": "pass",
+      "diff": "diff --git a/leaf-two.ts b/leaf-two.ts\n--- a/leaf-two.ts\n+++ b/leaf-two.ts\n@@ -1 +1 @@\n-old\n+new"
+    }
+  ]
+}

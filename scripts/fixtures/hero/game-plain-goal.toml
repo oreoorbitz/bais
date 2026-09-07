@@ -1,0 +1,17 @@
+# Fixture (bi#135): game statement WITHOUT the game style — keyword fallback.
+statement = "Prototype the physics resolve pass for entity collisions"
+
+users = "solo dev (adrian)"
+scale = "single prototype"
+platform = "local CLI"
+constraints = ["offline-friendly"]
+style = "plain"
+hero = ""
+
+done_criteria = [
+  "collisions resolve without per-entity allocation",
+]
+
+non_goals = [
+  "presentation layer",
+]

@@ -437,10 +437,63 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 		setMeta(db, "completeness", failures.length ? "partial" : "complete");
 		setMeta(db, "reducer_version", reduction.version);
 		setMeta(db, "project", project);
+		// hub#178: ingest instant. check compares the newest issue mtime
+		// seen here against the live newest mtime and warns when the
+		// store predates edits. Volatile operational keys — deliberately
+		// OUT of FP_META (the fingerprint covers content truth, not clocks).
+		setMeta(db, "ingest_wall_ts", new Date().toISOString());
+		setMeta(db, "ingest_max_mtime_ms", String(newestIssueMtimeMs(issuesDir)));
 	} finally {
 		db.close();
 	}
 	return { events: fullLog.length, failures: failures.length };
+}
+
+// hub#178: newest issues/*.toml mtime (floor ms). 0 when unreadable.
+export function newestIssueMtimeMs(issuesDir: string): number {
+	let max = 0;
+	try {
+		for (const f of readdirSync(issuesDir)) {
+			if (!f.endsWith(".toml")) continue;
+			try {
+				const t = statSync(join(issuesDir, f)).mtimeMs;
+				if (t > max) max = t;
+			} catch {}
+		}
+	} catch {}
+	return Math.floor(max);
+}
+
+export type StoreFreshness =
+	| { state: "no-store" }
+	| { state: "legacy-unknown"; detail: string }
+	| { state: "fresh" }
+	| { state: "stale"; behindMs: number; storedMaxMs: number; currentMaxMs: number };
+
+// hub#178: is the store older than the newest issue file? Advisory-only
+// input for `check` — never throws, never fatal. A store that predates
+// an edit serves the pre-edit projection while looking clean.
+export function storeFreshness(issuesDir: string): StoreFreshness {
+	const p = dbPathFor(issuesDir);
+	if (!existsSync(p)) return { state: "no-store" };
+	let stored: string | null = null;
+	try {
+		const db = new DatabaseSync(p);
+		try {
+			ensureSchema(db);
+			const row = db.prepare("SELECT v FROM meta WHERE k = 'ingest_max_mtime_ms'").get() as { v: string } | undefined;
+			stored = row?.v ?? null;
+		} finally {
+			db.close();
+		}
+	} catch {
+		return { state: "legacy-unknown", detail: `${p} unreadable for age check` };
+	}
+	if (stored === null) return { state: "legacy-unknown", detail: `${p} predates ingest-instant records — run \`bais ingest\`` };
+	const current = newestIssueMtimeMs(issuesDir);
+	const behind = current - parseInt(stored, 10);
+	if (behind > 0) return { state: "stale", behindMs: behind, storedMaxMs: parseInt(stored, 10), currentMaxMs: current };
+	return { state: "fresh" };
 }
 
 export function hasStore(issuesDir: string): boolean {
@@ -705,11 +758,21 @@ export function storeOversight(issuesDir: string): Oversight {
 		// (rejected_evidence) with the in-log evidence rows. UNION
 		// dedupes a verdict recorded in both homes; lc-ordered since
 		// rowid is meaningless across the union.
+		// bi#55: third leg — reducer staging exclusions (admitted=1 rows
+		// the reducer ruled evidence, not state: lease-held, not-current,
+		// stale-fence, needs-approval, ...). Joined to events for the
+		// feed columns; pruned-away rows drop (INNER JOIN) while live
+		// rows always resolve. `not-admitted:*` rows are filtered: every
+		// admitted=0 event already reports its underlying drop_reason via
+		// the first leg, and the reducer's `not-admitted: <reason>` echo
+		// would duplicate it under a derived name.
 		const rejected_events = db.prepare(
 			`SELECT id, author, type, reason, lc FROM (
 				SELECT id, author, type, drop_reason AS reason, lc FROM events WHERE admitted = 0 AND drop_reason IS NOT NULL
 				UNION
 				SELECT event_id AS id, author, type, reason, lc FROM rejected_evidence
+				UNION
+				SELECT e.id, e.author, e.type, x.reason, e.lc FROM excluded x JOIN events e ON e.id = x.event_id WHERE x.reason NOT LIKE 'not-admitted:%'
 			) ORDER BY lc DESC, id`,
 		).all() as Oversight["rejected_events"];
 		return { conflicts, budget_overruns, unverified_submits, stalled_leases, caps_over_budget, rejected_events, as_of, completeness };

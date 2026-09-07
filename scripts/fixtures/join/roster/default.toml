@@ -1,0 +1,14 @@
+# bi#147 roster entry — the default generalist.
+#
+# Same Agent shape as the specialists but with no specialty tags, so it
+# never wins a tag match and only serves as the LOUD fallback (see
+# match() in bais/scripts/roster.mjs). No corpus: the default agent gets
+# no evidence context attached.
+
+[agent]
+name = "default"
+model = "generalist-v1"
+specialty_tags = []
+style = "clean-concise"
+corpus = ""
+description = "Default generalist. Assignment falls back here LOUD with a named reason when no specialist matches."

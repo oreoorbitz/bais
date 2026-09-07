@@ -1,0 +1,18 @@
+# Fixture (bi#135): game campaign goal — real .bais/goal.toml shape (flat keys).
+statement = "Build the data-oriented game engine core: entity simulation, physics resolve, and frame presentation with a measured budget"
+
+users = "solo dev (adrian)"
+scale = "single game core (simulate, resolve, present)"
+platform = "local CLI"
+constraints = ["offline-friendly", "zero hot-loop allocation"]
+style = "data-oriented-game"
+hero = ""
+
+done_criteria = [
+  "entity simulation runs on SoA layouts",
+  "frame budget is explicit and measured",
+]
+
+non_goals = [
+  "hosted service or SaaS surface",
+]

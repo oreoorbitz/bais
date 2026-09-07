@@ -1,0 +1,8 @@
+id = "u#01"
+title = "first unknown surface"
+status = "Open"
+kind = "Feat"
+body = """
+First swipe candidate with no declared footprint.
+Acceptance: first unknown holds its slot alone.
+"""

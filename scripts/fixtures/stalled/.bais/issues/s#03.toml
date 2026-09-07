@@ -1,0 +1,7 @@
+id = "s#03"
+title = "live work"
+status = "Doing"
+kind = "Feat"
+body = "b"
+holder = "alive-1"
+lease = "2099-01-01T00:00:00Z"

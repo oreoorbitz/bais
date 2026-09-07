@@ -1,0 +1,13 @@
+# bi#134 fixture: ONE goal sketched under TWO styles.
+# Same statement, same done criteria — the style alone changes the graph.
+
+[goal]
+statement = "Ship scoped player-auth for the arena prototype"
+style = "data-oriented-game"
+hero = "swarm-lieutenant + named specialists"
+non_goals = ["hosted accounts or SaaS billing"]
+done_criteria = [
+  "guest can enter the arena in under a second",
+  "session survives a client reconnect",
+  "no per-frame allocation in the auth hot path",
+]

@@ -1,0 +1,37 @@
+# hub#166 fixture: parser goal WITH a token spec — the spec must flow into
+# the sketch oracle in BITS case shape (case/facet/spec), verbatim.
+[goal]
+statement = "Ship a TOML subset parser"
+style = "plain"
+hero = "plain"
+non_goals = ["full TOML v1.0.0"]
+done_criteria = [{ text = "token spec cases pass", done = false }]
+testing_surface = [{ surface = "parser accepts sample docs", exercise = "run: bais parse sample.toml" }]
+surface_spec = [{ facet = "parser tokens", spec = "KEY, STRING, INTEGER per toml.abnf sections 3-5" }, { facet = "api shape", spec = "parse(text) => { ok, value, errors }" }]
+[interview.users]
+status = "filled"
+value = "solo dev"
+[interview.scale]
+status = "filled"
+value = "single directory"
+[interview.platform]
+status = "filled"
+value = "local CLI"
+[interview.constraints]
+status = "waived"
+value = ""
+[interview.style]
+status = "filled"
+value = "plain"
+[interview.acceptance]
+status = "filled"
+value = "token spec cases pass"
+[interview.non-goals]
+status = "filled"
+value = "full TOML v1.0.0"
+[interview."testing-surface"]
+status = "filled"
+value = "parser accepts sample docs => run: bais parse sample.toml"
+[interview."surface-spec"]
+status = "filled"
+value = "parser tokens => KEY, STRING, INTEGER per toml.abnf sections 3-5; api shape => parse(text) => { ok, value, errors }"

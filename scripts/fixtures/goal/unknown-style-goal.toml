@@ -1,0 +1,6 @@
+# hub#158 fixture: unknown style warns (not fails) until the styles pack lands (bi#134).
+statement = "Ship per-directory goal tracking for BAIS"
+style = "no-such-style"
+hero = "plain"
+done_criteria = ["sketch refused while open", "commit gated on approval"]
+non_goals = []

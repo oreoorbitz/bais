@@ -1,0 +1,10 @@
+id = "b#01"
+title = "blocked-set alpha"
+status = "Open"
+kind = "Feat"
+area = "demo/cohort"
+body = """
+Alpha slice; cohorts with beta.
+Acceptance: alpha closes on its own acceptance; alpha red-checks its own hunk.
+Files: face.ts layout.ts
+"""

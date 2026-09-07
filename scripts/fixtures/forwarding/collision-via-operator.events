@@ -1,0 +1,8 @@
+# Colliding hop (src/shared.ts) routes via the operator with a reason.
+chain: inv-forward-2
+branch: ingest owner=titan-1 files=src/shared.ts,src/ingest.ts
+branch: query owner=titan-2 files=src/shared.ts,src/query.ts
+branch: export owner=titan-3 files=src/export.ts
+forward: ingest to=query via=operator reason=collision on src/shared.ts handoff=handoff-011
+forward: query to=export via=direct handoff=handoff-012
+broadcast: to=merger chain=inv-forward-2 result=done ref=handoff-013

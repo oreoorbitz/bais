@@ -1,0 +1,10 @@
+id = "c#03"
+title = "cohort trio gamma"
+status = "Open"
+kind = "Feat"
+area = "demo/cohort"
+body = """
+Gamma slice of the shared surface.
+Acceptance: gamma closes on its own acceptance; gamma red-checks its own hunk.
+Files: store.ts cli.ts
+"""

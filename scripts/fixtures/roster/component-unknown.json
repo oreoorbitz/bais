@@ -1,0 +1,5 @@
+{
+	"id": "goal-component-rust",
+	"title": "Port the hot-loop scheduler to embedded Rust",
+	"tags": ["rust", "embedded"]
+}

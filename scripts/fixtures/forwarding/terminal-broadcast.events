@@ -1,0 +1,6 @@
+# Minimal chain: one direct hop, terminal broadcast closes it.
+chain: inv-forward-4
+branch: ingest owner=titan-1 files=src/ingest.ts
+branch: query owner=titan-2 files=src/query.ts
+forward: ingest to=query via=direct handoff=handoff-031
+broadcast: to=merger chain=inv-forward-4 result=done ref=handoff-032

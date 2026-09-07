@@ -24,11 +24,15 @@ const mkfix = (withStore) => {
 	if (withStore) execFileSync("node", [CLI, "ingest"], { cwd: d, timeout: 60000 });
 	return d;
 };
+// bi#55: keep the streams separate — stdout stays the pinned contract,
+// stderr carries diagnostics (e.g. the storeless-scan fallback notice).
+// `out` remains the combined stream for the text-shape pins that assert
+// on it with includes().
 const waitForExit = (child) => new Promise((res) => {
-	let out = "";
-	child.stdout.on("data", (c) => { out += c; });
-	child.stderr.on("data", (c) => { out += c; });
-	child.on("close", (code) => res({ code, out }));
+	let out = "", stdout = "", stderr = "";
+	child.stdout.on("data", (c) => { out += c; stdout += c; });
+	child.stderr.on("data", (c) => { out += c; stderr += c; });
+	child.on("close", (code) => res({ code, out, stdout, stderr }));
 });
 const alive = (child) => child.exitCode === null && child.signalCode === null;
 const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], { cwd: d, timeout: 60000, encoding: "utf8" });
@@ -49,7 +53,7 @@ const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], {
 	// bi#58: the bound binds — a waiter that sleeps through the change wakes
 	// only at the 20s timeout (dt ≈ 20000); 5000 separates wake from timeout.
 	check("45.store.wakes-fast", dt < 5000, `${dt}ms`);
-	check("45.store.fresh-set", res.out === "t#02\tdownstream work\n", JSON.stringify(res.out));
+	check("45.store.fresh-set", res.out === "t#02\tdownstream work\tbr=0\n", JSON.stringify(res.out));
 }
 // --- scan path: waiter sleeps, wakes on file touch ---
 {
@@ -61,7 +65,10 @@ const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], {
 	freeBlocker(d);
 	const res = await done;
 	check("45.scan.wakes-exit0", res.code === 0, JSON.stringify(res));
-	check("45.scan.fresh-set", res.out === "t#02\tdownstream work\n", JSON.stringify(res.out));
+	// bi#55: the storeless scan names its fallback on stderr, which this
+	// combined-stream capture interleaves with stdout — pin contents,
+	// not byte order across the two pipes.
+	check("45.scan.fresh-set", res.out.includes("t#02\tdownstream work\tbr=0\n") && res.out.includes("no store.db — directory scan"), JSON.stringify(res.out));
 }
 // --- timeout exits 0 empty (text + json) ---
 {
@@ -71,7 +78,8 @@ const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], {
 	const res = await waitForExit(child);
 	const dt = Date.now() - t0;
 	check("45.timeout.exit0", res.code === 0, JSON.stringify(res));
-	check("45.timeout.empty-text", res.out === "(no ready issues)\n", JSON.stringify(res.out));
+	// bi#55: stdout is the pinned contract (streams split in waitForExit).
+	check("45.timeout.empty-text", res.stdout === "(no ready issues)\n", JSON.stringify(res));
 	// bi#58: both sides bind — dt >= 900 proves it actually waited the
 	// --timeout 1 (no instant empty), dt < 8000 proves it did not hang.
 	check("45.timeout.timing", dt >= 900 && dt < 8000, `${dt}ms`);
@@ -80,8 +88,9 @@ const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], {
 	const d = mkfix(false);
 	const child = spawn("node", [CLI, "ready", "--wait", "--timeout", "1", "--json"], { cwd: d, stdio: ["ignore", "pipe", "pipe"] });
 	const res = await waitForExit(child);
-	const j = JSON.parse(res.out);
-	check("45.timeout.json", res.code === 0 && Array.isArray(j.ready) && j.ready.length === 0, res.out);
+	// bi#55: parse stdout only — stderr carries diagnostics, never JSON.
+	const j = JSON.parse(res.stdout);
+	check("45.timeout.json", res.code === 0 && Array.isArray(j.ready) && j.ready.length === 0, res.stdout);
 }
 // --- non-empty ready returns immediately (no wait) ---
 {
@@ -91,7 +100,8 @@ const freeBlocker = (d) => execFileSync("node", [CLI, "move", "t#01", "Done"], {
 	const child = spawn("node", [CLI, "ready", "--wait", "--timeout", "20"], { cwd: d, stdio: ["ignore", "pipe", "pipe"] });
 	const res = await waitForExit(child);
 	const dt = Date.now() - t0;
-	check("45.immediate.fresh", res.code === 0 && res.out === "t#02\tdownstream work\n", JSON.stringify(res.out));
+	// bi#55: stdout is the pinned contract; the fallback notice rides stderr.
+	check("45.immediate.fresh", res.code === 0 && res.stdout === "t#02\tdownstream work\tbr=0\n" && res.stderr.includes("no store.db — directory scan"), JSON.stringify(res));
 	// bi#58: binds — a waiter that always sleeps takes >= 1500ms+timeout ramp; 3000 separates immediate from waiting.
 	check("45.immediate.no-sleep", dt < 3000, `${dt}ms`);
 }

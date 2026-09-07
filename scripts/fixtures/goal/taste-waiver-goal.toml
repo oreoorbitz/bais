@@ -1,0 +1,38 @@
+# hub#166 fixture: UI goal with NO design but an EXPLICIT taste-waiver with
+# reason — recorded in the box value, sketch proceeds, oracle carries the
+# waiver record (status filled, facet waiver).
+[goal]
+statement = "Ship a dashboard UI for BAIS issues"
+style = "plain"
+hero = "plain"
+non_goals = ["backlog-wide campaigns"]
+done_criteria = [{ text = "dashboard renders open issues", done = false }]
+testing_surface = [{ surface = "dashboard shows open issues", exercise = "run: bais dashboard" }]
+surface_spec = [{ facet = "waiver", spec = "no design exists yet, owner accepts taste risk, review-gated draft" }]
+[interview.users]
+status = "filled"
+value = "solo dev"
+[interview.scale]
+status = "filled"
+value = "single directory"
+[interview.platform]
+status = "filled"
+value = "local browser"
+[interview.constraints]
+status = "waived"
+value = ""
+[interview.style]
+status = "filled"
+value = "plain"
+[interview.acceptance]
+status = "filled"
+value = "dashboard renders open issues"
+[interview.non-goals]
+status = "filled"
+value = "backlog-wide campaigns"
+[interview."testing-surface"]
+status = "filled"
+value = "dashboard shows open issues => run: bais dashboard"
+[interview."surface-spec"]
+status = "filled"
+value = "waiver => no design exists yet, owner accepts taste risk, review-gated draft"

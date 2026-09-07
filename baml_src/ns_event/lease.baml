@@ -9,8 +9,11 @@
 //
 // Body contracts (WireEvent.body — readers MUST-ignore-unknown-fields):
 //   LeaseClaim   { ttl: int (lc ticks), epoch: int = 0, idem: string,
-//                  read_set: string[] = [] }
-//   LeaseRenew   { lease_ref: string (claim event id) }
+//                  read_set: string[] = [],
+//                  ttl_wall_ms?: int (wall TTL, optional),
+//                  expires_wall?: string (RFC3339 UTC Z, hub-stamped) }
+//   LeaseRenew   { lease_ref: string (claim event id),
+//                  expires_wall?: string (hub restamp, wall leases only) }
 //   LeaseRelease { lease_ref: string }
 //   TaskTransition / WorkSubmit may carry { fencing: int } — required iff
 //   the task has an active unexpired lease (see lease_fence_ok).
@@ -26,6 +29,23 @@
 //   current active lease. Release frees; anyone else is excluded.
 // - `expire` is DERIVED, never written: finalize marks active leases with
 //   expires_lc <= max admitted lc as expired.
+// - Wall-clock companion (bi#42): a claim may ALSO carry a wall bound
+//   (ttl_wall_ms + hub-stamped expires_wall). Liveness is the min() of the
+//   two clocks — a lease is live iff BOTH bounds still cover the observation
+//   point, expired when EITHER lapses. Lc advances only on admission, so on
+//   a quiet log the wall bound is what frees a dead holder's task; the next
+//   admitted event (e.g. the reclaim claim itself) observes the lapse via
+//   its own (lc, ts) and the sweep confirms it at finalize.
+//   Split: the HOST owns clocks (stamps expires_wall = claim ts +
+//   ttl_wall_ms, restamps on renew from the lease's own ttl_wall_ms — never
+//   from client input, so holders cannot inflate); BAML owns this min()
+//   comparison. WireEvent.ts is advisory and author-controlled on the sync
+//   path, so wall bounds resolve to ~ the 1h skew-gate precision across
+//   hostile peers — the coordinator path (hub-stamped ts) is exact.
+//   Shape constraint: expires_wall MUST be fixed-shape RFC3339 UTC Z
+//   (hub `Date.toISOString()`), where lexicographic order == chronological
+//   order. Missing expires_wall (or missing observation wall) degrades to
+//   pure lc semantics — legacy claims keep reducing identically.
 // - Fencing token = the winning claim's lc (monotonic, causal). A
 //   transition/submit on a leased task must echo it exactly, else
 //   `stale-fence`. No active lease -> no fencing required (existing logs
@@ -39,6 +59,10 @@ class Lease {
     fencing: int @description("winning claim's lc — echo on transition/submit"),
     ttl: int @description("lc ticks granted per claim/renew"),
     expires_lc: int,
+    ttl_wall_ms: int? @description("wall-clock TTL in ms (optional; absent = lc-only lease)"),
+    expires_wall: string? @description(
+        "RFC3339 UTC Z wall expiry, hub-stamped (host owns clocks); null = lc-only",
+    ),
     read_set: string[],
     idem: string @description("client idempotency key: same holder + same idem is a retry"),
     status: string @description("active | released | expired | superseded"),
@@ -71,12 +95,42 @@ function find_lease(acc: Acc, lease_id: string) -> Lease? {
     })
 }
 
-// Latest active, unexpired record for the entity in fold order. History
+// Wall bound lapses at or after the stamped expiry (fixed-shape RFC3339
+// UTC Z compares lexicographically == chronologically). A null lease bound
+// or a null observation wall means "no wall evidence" -> wall-inert.
+function wall_lapsed(expires_wall: string?, now_wall: string?) -> bool {
+    if let w: string = expires_wall {
+        if let n: string = now_wall {
+            n >= w
+        } else {
+            false
+        }
+    } else {
+        false
+    }
+}
+
+// Min() liveness (bi#42, BAML owns this): live iff status is active AND the
+// lc bound covers AND the wall bound covers. now_wall null (or a lease
+// without expires_wall) degrades to pure lc semantics.
+function lease_live(l: Lease, now_lc: int, now_wall: string? = null) -> bool {
+    if (l.status != "active" || l.expires_lc <= now_lc) {
+        false
+    } else if (wall_lapsed(l.expires_wall, now_wall)) {
+        false
+    } else {
+        true
+    }
+}
+
+// Latest live record for the entity in fold order. History
 // (released/superseded/expired-marked) stays in acc.leases as evidence.
-function current_lease(acc: Acc, entity: string, now_lc: int) -> Lease? {
+// During the fold callers pass the observing event's own (lc, ts), so a
+// quiet-log lapse is seen by the next admitted event itself.
+function current_lease(acc: Acc, entity: string, now_lc: int, now_wall: string? = null) -> Lease? {
     let out: Lease? = null;
     for (let l in acc.leases) {
-        if (l.entity == entity && l.status == "active" && l.expires_lc > now_lc) {
+        if (l.entity == entity && lease_live(l, now_lc, now_wall = now_wall)) {
             out = l;
         }
     }
@@ -84,9 +138,15 @@ function current_lease(acc: Acc, entity: string, now_lc: int) -> Lease? {
 }
 
 // Fencing gate shared by TaskTransition (reduce.baml) and WorkSubmit
-// (verify.baml): no active lease -> open; active lease -> exact token echo.
-function lease_fence_ok(acc: Acc, entity: string, now_lc: int, fencing: int?) -> bool {
-    match (current_lease(acc, entity, now_lc)) {
+// (verify.baml): no live lease -> open; live lease -> exact token echo.
+function lease_fence_ok(
+    acc: Acc,
+    entity: string,
+    now_lc: int,
+    fencing: int?,
+    now_wall: string? = null,
+) -> bool {
+    match (current_lease(acc, entity, now_lc, now_wall = now_wall)) {
         null => true,
         let l: Lease => match (fencing) {
             null => false,
@@ -99,7 +159,7 @@ function apply_claim(acc: Acc, e: WireEvent) -> void {
     if let ttl: int = body_int(e.body, "ttl") {
         if let idem: string = body_string(e.body, "idem") {
             let epoch = body_int(e.body, "epoch") ?? 0;
-            if let cur: Lease = current_lease(acc, e.entity, e.lc) {
+            if let cur: Lease = current_lease(acc, e.entity, e.lc, now_wall = e.ts) {
                 if (cur.holder == e.author && cur.idem == idem) {
                     acc.excluded.push(Excluded { event_id: e.id, reason: "idem-duplicate" });
                 } else if (cur.holder == e.author && epoch <= cur.epoch) {
@@ -115,6 +175,8 @@ function apply_claim(acc: Acc, e: WireEvent) -> void {
                             fencing: e.lc,
                             ttl: ttl,
                             expires_lc: e.lc + ttl,
+                            ttl_wall_ms: body_int(e.body, "ttl_wall_ms"),
+                            expires_wall: body_string(e.body, "expires_wall"),
                             read_set: body_string_list(e.body, "read_set") ?? [],
                             idem: idem,
                             status: "active",
@@ -135,6 +197,8 @@ function apply_claim(acc: Acc, e: WireEvent) -> void {
                         fencing: e.lc,
                         ttl: ttl,
                         expires_lc: e.lc + ttl,
+                        ttl_wall_ms: body_int(e.body, "ttl_wall_ms"),
+                        expires_wall: body_string(e.body, "expires_wall"),
                         read_set: body_string_list(e.body, "read_set") ?? [],
                         idem: idem,
                         status: "active",
@@ -154,10 +218,16 @@ function apply_renew(acc: Acc, e: WireEvent) -> void {
         if let l: Lease = find_lease(acc, ref) {
             if (l.holder != e.author) {
                 acc.excluded.push(Excluded { event_id: e.id, reason: "not-holder" });
-            } else if (l.status != "active" || l.expires_lc <= e.lc) {
+            } else if (l.status != "active" || l.expires_lc <= e.lc || wall_lapsed(l.expires_wall, e.ts)) {
                 acc.excluded.push(Excluded { event_id: e.id, reason: "not-current" });
             } else {
                 l.expires_lc = e.lc + l.ttl;
+                // Wall restamp rides the renew body (hub recomputes it from
+                // the lease's own ttl_wall_ms — never from client input).
+                // Absent on lc-only leases: the wall bound stays absent.
+                if let w: string = body_string(e.body, "expires_wall") {
+                    l.expires_wall = w;
+                }
             }
         } else {
             acc.excluded.push(Excluded { event_id: e.id, reason: "unknown-lease" });
@@ -186,12 +256,15 @@ function apply_release(acc: Acc, e: WireEvent) -> void {
 }
 
 // Derived expiry (never written): rebuild with expired marks. Runs once at
-// finalize over the max admitted lc — during the fold, current_lease sees
-// expiry live off each event's own lc.
-function sweep_expiry(acc: Acc, max_lc: int) -> void {
+// finalize over the max admitted lc AND the max admitted wall ts — during
+// the fold, current_lease sees expiry live off each event's own (lc, ts).
+function sweep_expiry(acc: Acc, max_lc: int, max_wall: string? = null) -> void {
     acc.leases
         = acc.leases.map((l) -> {
-            if (l.status == "active" && l.expires_lc <= max_lc) {
+            if (
+                l.status == "active"
+                    && (l.expires_lc <= max_lc || wall_lapsed(l.expires_wall, max_wall))
+            ) {
                 Lease { ...l, status: "expired" }
             } else {
                 l
@@ -502,4 +575,275 @@ test "claim without ttl or idem is excluded, not defaulted" {
     let r2 = reduce([wire("LeaseClaim", "task:A", 1, "e1", no_idem)]);
     assert.equal(r2.leases.length(), 0);
     assert.equal(r2.excluded[0].reason, "missing-idem")
+}
+
+// bi#42 wall-clock arms: fixed-shape RFC3339 UTC Z throughout (millis
+// shape, as the hub stamps). The lc ttl is deliberately huge in every arm
+// so only the wall bound can fire — lc must never free these leases.
+function wall_claim_body(
+    ttl: int,
+    idem: string,
+    ttl_wall_ms: int,
+    expires_wall: string,
+) -> map<string, unknown> {
+    let b = claim_body(ttl, 0, idem);
+    let _ = b.set("ttl_wall_ms", ttl_wall_ms);
+    let _ = b.set("expires_wall", expires_wall);
+    b
+}
+
+test "wall expiry frees the task while the lc bound still covers" {
+    let t0 = "2026-09-03T00:00:00.000Z";
+    let bound = "2026-09-03T00:01:00.000Z";
+    let r = reduce(
+        [
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                wall_claim_body(1000000, "a1", 60000, bound),
+                author = "did:key:z6Mk-alice",
+                ts = t0,
+            ),
+            // lc 2 is deep inside the million-tick grant — only the wall
+            // lapse (ts past the stamped bound) frees the task.
+            wire(
+                "LeaseClaim",
+                "task:A",
+                2,
+                "e2",
+                wall_claim_body(1000000, "b1", 60000, "2026-09-03T00:02:01.000Z"),
+                author = "did:key:z6Mk-bob",
+                ts = "2026-09-03T00:01:01.000Z",
+            ),
+        ],
+    );
+    assert.equal(r.excluded.length(), 0);
+    assert.equal(r.leases.length(), 2);
+    assert.equal(r.leases[0].status, "expired");
+    assert.equal(r.leases[1].holder, "did:key:z6Mk-bob");
+    assert.equal(r.leases[1].status, "active")
+}
+
+test "claim inside the wall bound is still held" {
+    let t0 = "2026-09-03T00:00:00.000Z";
+    let bound = "2026-09-03T00:01:00.000Z";
+    let r = reduce(
+        [
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                wall_claim_body(1000000, "a1", 60000, bound),
+                author = "did:key:z6Mk-alice",
+                ts = t0,
+            ),
+            wire(
+                "LeaseClaim",
+                "task:A",
+                2,
+                "e2",
+                wall_claim_body(1000000, "b1", 60000, bound),
+                author = "did:key:z6Mk-bob",
+                ts = "2026-09-03T00:00:59.000Z",
+            ),
+        ],
+    );
+    assert.equal(r.leases.length(), 1);
+    assert.equal(r.leases[0].holder, "did:key:z6Mk-alice");
+    assert.equal(r.leases[0].status, "active");
+    assert.equal(r.excluded.length(), 1);
+    assert.equal(r.excluded[0].reason, "lease-held: did:key:z6Mk-alice")
+}
+
+test "wall lapse is exact at the stamped instant" {
+    let bound = "2026-09-03T00:01:00.000Z";
+    let r = reduce(
+        [
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                wall_claim_body(1000000, "a1", 60000, bound),
+                author = "did:key:z6Mk-alice",
+                ts = "2026-09-03T00:00:00.000Z",
+            ),
+            wire(
+                "LeaseClaim",
+                "task:A",
+                2,
+                "e2",
+                wall_claim_body(1000000, "b1", 60000, bound),
+                author = "did:key:z6Mk-bob",
+                ts = bound,
+            ),
+        ],
+    );
+    assert.equal(r.excluded.length(), 0);
+    assert.equal(r.leases[0].status, "expired");
+    assert.equal(r.leases[1].holder, "did:key:z6Mk-bob")
+}
+
+test "live renew extends both bounds and keeps competitors out" {
+    let bound = "2026-09-03T00:01:00.000Z";
+    let bound2 = "2026-09-03T00:01:30.000Z";
+    let renew_b: map<string, unknown> = {};
+    let _ = renew_b.set("lease_ref", "e1");
+    let _ = renew_b.set("expires_wall", bound2);
+    let r = reduce(
+        [
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                wall_claim_body(1000000, "a1", 60000, bound),
+                author = "did:key:z6Mk-alice",
+                ts = "2026-09-03T00:00:00.000Z",
+            ),
+            wire(
+                "LeaseRenew",
+                "task:A",
+                5,
+                "e2",
+                renew_b,
+                author = "did:key:z6Mk-alice",
+                ts = "2026-09-03T00:00:30.000Z",
+            ),
+            // Past the ORIGINAL bound but inside the restamp: still held.
+            wire(
+                "LeaseClaim",
+                "task:A",
+                6,
+                "e3",
+                wall_claim_body(1000000, "b1", 60000, bound2),
+                author = "did:key:z6Mk-bob",
+                ts = "2026-09-03T00:01:01.000Z",
+            ),
+        ],
+    );
+    assert.equal(r.excluded.length(), 1);
+    assert.equal(r.excluded[0].reason, "lease-held: did:key:z6Mk-alice");
+    assert.equal(r.leases.length(), 1);
+    assert.equal(r.leases[0].status, "active");
+    assert.equal(r.leases[0].expires_lc, 1000005);
+    assert.equal(r.leases[0].expires_wall, bound2)
+}
+
+test "renew past wall expiry is refused even though lc covers" {
+    let bound = "2026-09-03T00:01:00.000Z";
+    let renew_b: map<string, unknown> = {};
+    let _ = renew_b.set("lease_ref", "e1");
+    let r = reduce(
+        [
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                wall_claim_body(1000000, "a1", 60000, bound),
+                author = "did:key:z6Mk-alice",
+                ts = "2026-09-03T00:00:00.000Z",
+            ),
+            wire(
+                "LeaseRenew",
+                "task:A",
+                5,
+                "e2",
+                renew_b,
+                author = "did:key:z6Mk-alice",
+                ts = "2026-09-03T00:01:01.000Z",
+            ),
+        ],
+    );
+    assert.equal(r.excluded.length(), 1);
+    assert.equal(r.excluded[0].reason, "not-current");
+    assert.equal(r.leases[0].status, "expired")
+}
+
+test "lc-only leases ignore wall readings" {
+    let r = reduce(
+        [
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                claim_body(1000000, 0, "a1"),
+                author = "did:key:z6Mk-alice",
+                ts = "2026-09-03T00:00:00.000Z",
+            ),
+            // A far-future observer changes nothing without a wall bound.
+            wire(
+                "LeaseClaim",
+                "task:A",
+                2,
+                "e2",
+                claim_body(1000000, 0, "b1"),
+                author = "did:key:z6Mk-bob",
+                ts = "2030-01-01T00:00:00.000Z",
+            ),
+        ],
+    );
+    assert.equal(r.leases.length(), 1);
+    assert.equal(r.leases[0].holder, "did:key:z6Mk-alice");
+    assert.equal(r.leases[0].status, "active");
+    assert.equal(r.leases[0].expires_wall, null);
+    assert.equal(r.excluded.length(), 1);
+    assert.equal(r.excluded[0].reason, "lease-held: did:key:z6Mk-alice");
+    // Renew without a restamp keeps the lease lc-only.
+    let renew_b: map<string, unknown> = {};
+    let _ = renew_b.set("lease_ref", "e1");
+    let r2 = reduce(
+        [
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                claim_body(1000000, 0, "a1"),
+                author = "did:key:z6Mk-alice",
+                ts = "2026-09-03T00:00:00.000Z",
+            ),
+            wire(
+                "LeaseRenew",
+                "task:A",
+                5,
+                "e2",
+                renew_b,
+                author = "did:key:z6Mk-alice",
+                ts = "2026-09-03T00:00:30.000Z",
+            ),
+        ],
+    );
+    assert.equal(r2.excluded.length(), 0);
+    assert.equal(only_lease(r2).expires_wall, null)
+}
+
+test "fencing opens once the wall lapses" {
+    let bound = "2026-09-03T00:01:00.000Z";
+    let plain: map<string, unknown> = {};
+    let _ = plain.set("to", "Doing");
+    let r = reduce(
+        [
+            wire("TaskCreate", "task:A", 0, "e0", {}),
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                wall_claim_body(1000000, "a1", 60000, bound),
+                author = "did:key:z6Mk-alice",
+                ts = "2026-09-03T00:00:00.000Z",
+            ),
+            // No fencing echo, but the lease is wall-dead: gate is open.
+            wire("TaskTransition", "task:A", 2, "e2", plain, ts = "2026-09-03T00:01:01.000Z"),
+        ],
+    );
+    assert.equal(r.excluded.length(), 0);
+    assert.equal(only_issue(r).status, "Doing");
+    assert.equal(r.leases[0].status, "expired")
 }

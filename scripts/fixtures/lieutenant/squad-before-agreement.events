@@ -1,0 +1,6 @@
+# Squad formation BEFORE plan-agreed: must be REFUSED at line 5.
+dir: goals/inventory-mvp
+lieutenant: lieut-145
+plan-proposed: ingest,query
+squad-formed: squad-ingest component=ingest
+plan-agreed: by=operator

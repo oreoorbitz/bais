@@ -159,6 +159,19 @@ An edge end naming an id outside the loaded set is classified, never rejected:
 Scope = text before `#` (`bi#04` → `bi`); an id with no `#` is local scope.
 `check` fails on `Missing`, never on `External`.
 
+### 3.4 Blast radius (load-bearing)
+
+Per issue, the **transitive** dependents through the two ordering kinds
+(`DependsOn`/`Blocks`, same relation as §3.2), split into `open_downstream`
+(work actually held — the number dispatchers sort on) and `total_downstream`
+(every declared dependent, including `Done`/`Dropped` ones already freed).
+A dependent naming an unloaded id counts in total but never in open; the hub
+never counts itself, so cycles terminate without self-credit. Status-blind
+about the hub: a `Done` anchor with a live `Open` fan-out still reports it
+(the edge may be stale — a follow-up's problem, not a reason to hide the
+shape). No declared override field: derivation from edges is the mechanism.
+Reference: BAML `blast_radii` (`baml test`), mirrored by both hosts.
+
 ## 4. CLI contract
 
 `bais list | ready | check [--json]` plus `bais ingest` and `bais graph`,
@@ -177,19 +190,26 @@ distinguishable from `not-synced`; `check` keeps the §4.3 shape exactly.
 ### 4.1 `bais list --json`
 
 ```json
-{ "issues": [ { "issue": {<§2.1 + nulls>}, "edges": [{ "from": "…", "to": "…", "kind": "Blocks" }] } ],
+{ "issues": [ { "issue": {<§2.1 + nulls>}, "edges": [{ "from": "…", "to": "…", "kind": "Blocks" }],
+                "blast_radius": { "id": "…", "open_downstream": 3, "total_downstream": 4 } } ],
   "unparseable": [ { "file": "bad.toml", "error": "<message>" } ] }
 ```
 
 `unparseable` files are excluded from `issues` — treat non-empty as a gap in
 the list, never as zero issues. (`error` strings contain VM traces; match on
-`file`, not message text.)
+`file`, not message text.) Text rows carry a trailing `br=N` column (open
+blast radius, §3.4), uniform even when 0.
 
 ### 4.2 `bais ready --json`
 
 ```json
-{ "ready": [ <same BaisFile shape as list> ], "unparseable": [ … ] }
+{ "ready": [ <same BaisFile shape as list, with blast_radius> ], "unparseable": [ … ] }
 ```
+
+`bais ready --order blast-radius` sorts ready by `open_downstream`,
+descending (ties break on id, so the order is deterministic); any other
+`--order` value is a usage error. The `br=N` marker rides on text rows with
+or without `--order`.
 
 Store-backed reads append `"as_of": {"heads": […], "lc": 10, "wall_ts": "…"}`
 and `"completeness": "complete"|"partial"`. `bais graph --from <id> --json`
@@ -317,6 +337,21 @@ subcommands are reserved, not yet implemented.)
   the snapshot's `anchor_state` + `cursors`. `trust: "recomputed"` is the
   full-verify path. Pruned peers running pre-anchor-state hubs are
   refused — upgrade the peer, not the trust.
+
+### 4.7 Dispatch (dry-run swarm pack)
+
+`bais dispatch --agents N [--json]` answers "what should N agents work on"
+without mutating anything. Candidates are ready (§3.1) and unclaimed (live
+file-envelope claims excluded; the host owns the clock); greedy by open
+blast radius (§3.4, ties break on id); declared `Files:` footprints
+(`BAIS.md`) never shared between slots, undeclared issues pack flagged
+`files: unknown`. Text rows read
+`slot0<TAB><id><TAB>br=N<TAB>files: a.ts,b.ts|unknown<TAB><title>`; `--json`
+returns `{slots: [{slot, issue: {id, title}, open_downstream, files,
+files_state}], leased, budget}`. Any other `--agents` value is a usage
+error. Dispatch reads the directory scan (never the store): it needs live
+envelopes and fresh bodies, which the projection predates. Reference: BAML
+`dispatch_pack` (`baml test`), mirrored by both hosts.
 
 ### 4.1 Prune (truncation-with-anchor)
 
@@ -517,3 +552,42 @@ into SPEC.md but no such section existed — this checklist is its first home.)
   excluded count) and sync persists them as evidence rows; a reject would
   add no new catch and would destroy the audit trail the evidence feeds
   depend on.
+
+### 8.1 Audit record — bi#55 (2026-09-06)
+
+First full audit of every reject/exclude/park path in hub + store +
+reducer. Proof: `scripts/reject-audit.mjs` (18 drills, one deliberately
+triggered rejection per path showing its reason in `oversight --json` or
+the named CLI surface). Findings closed reason-first, behavior unchanged:
+
+- Staging exclusions were invisible (bi#37 Mode-A seed): admitted rows
+  the reducer ruled evidence (`lease-held:*`, `not-current`,
+  `stale-fence`, `needs-approval`, …) lived in `excluded` only.
+  `rejected_events` now unions `excluded` joined to `events`, minus the
+  `not-admitted:*` echo rows (every `admitted=0` event already reports
+  its underlying `drop_reason` via the first leg).
+- Live hub refusals were response-only: every `402`/`403`/`404`/`409`
+  write refusal (`budget-exhausted`, `frozen`, `cap-denied`,
+  `retry-budget-exhausted`, `unknown-lease`, `lease-active-at-anchor`,
+  plus every reducer decide-refusal and the `413` bounds verdicts) now
+  parks the refused candidate in `rejected_evidence` (advisory
+  forensics — outside the log, the reducer, and the content
+  fingerprint; never replicated), so it surfaces in `rejected_events`.
+- The storeless scan fallback was silent: `list`/`ready`/`graph` now
+  name it on stderr (`no store.db — directory scan`); stdout and exit
+  codes are untouched.
+
+Out of scope by shape, still named: malformed sync shapes cannot be
+represented as events (reason in the `rejected[]` response entry);
+`400` usage errors are caller bugs, not fail-closed; `503
+backfill-pending` and prune/checkpoint throws name their reason in the
+response/error (transient operator state, no event identity to park);
+`ready` parks are `ready --why-not` reasons (bi#48, the reference
+implementation: `BlockedBy`/`DanglingRef`/`InCycle`/`Leased`).
+
+Reason-code inventory: reducer exclusions in
+`baml_src/ns_event/*.baml` (`Excluded { … reason: … }`), sync chain /
+sig / clock / bounds / cap / budget gates in `src/hub.ts`
+(`appendForeignEvents`), live-write gates in `src/hub.ts`
+(`createHub` handlers + `anchorLeaseConflict`), tombstone/stall feeds
+in `src/store.ts` (`storeOversight`).

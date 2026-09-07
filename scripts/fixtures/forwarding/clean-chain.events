@@ -1,0 +1,8 @@
+# Clean chain: three direct hops, disjoint footprints, no operator hops.
+chain: inv-forward-1
+branch: ingest owner=titan-1 files=src/ingest.ts
+branch: query owner=titan-2 files=src/query.ts
+branch: export owner=titan-3 files=src/export.ts
+forward: ingest to=query via=direct handoff=handoff-001
+forward: query to=export via=direct handoff=handoff-002
+broadcast: to=merger chain=inv-forward-1 result=done ref=handoff-003

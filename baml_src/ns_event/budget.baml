@@ -117,7 +117,10 @@ function apply_reserve(acc: Acc, e: WireEvent) -> void {
                 if (usd < 0.0 || tokens < 0) {
                     acc.excluded.push(Excluded { event_id: e.id, reason: "negative-cost" });
                 } else if let b: Budget = find_budget(acc, e.entity) {
-                    if (b.reserved_usd + b.incurred_usd + usd > b.cap_usd || b.reserved_tokens + b.incurred_tokens + tokens > b.cap_tokens) {
+                    if (
+                        b.reserved_usd + b.incurred_usd + usd > b.cap_usd
+                            || b.reserved_tokens + b.incurred_tokens + tokens > b.cap_tokens
+                    ) {
                         acc.excluded.push(Excluded { event_id: e.id, reason: "over-cap" });
                     } else {
                         b.reserved_usd = b.reserved_usd + usd;
@@ -158,7 +161,9 @@ function apply_incurred(acc: Acc, e: WireEvent) -> void {
                 if let tokens: int = body_int(e.body, "tokens") {
                     if let r: CostEntry = find_cost(acc, ref) {
                         if (r.kind != "reserve" || r.principal != e.entity) {
-                            acc.excluded.push(Excluded { event_id: e.id, reason: "unknown-reserve" });
+                            acc.excluded.push(
+                                Excluded { event_id: e.id, reason: "unknown-reserve" },
+                            );
                         } else if (r.task != task) {
                             acc.excluded.push(Excluded { event_id: e.id, reason: "task-mismatch" });
                         } else if (r.consumed_usd + usd > r.usd || r.consumed_tokens + tokens > r.tokens) {
@@ -237,7 +242,12 @@ function reserve_body(task: string, usd: float, tokens: int) -> map<string, unkn
     b
 }
 
-function incurred_body(reserve_ref: string, task: string, usd: float, tokens: int) -> map<string, unknown> {
+function incurred_body(
+    reserve_ref: string,
+    task: string,
+    usd: float,
+    tokens: int,
+) -> map<string, unknown> {
     let b: map<string, unknown> = {};
     let _ = b.set("reserve_ref", reserve_ref);
     let _ = b.set("task", task);
@@ -290,13 +300,9 @@ test "reserve fits the cap in both dimensions or is excluded" {
     assert.equal(only_budget(r).reserved_usd, 6.0);
     assert.equal(r.costs.length(), 1);
     assert.equal(r.costs[0].kind, "reserve");
-    let over_usd = reduce(
-        [auth, wire("CostReserve", principal, 2, "e2", reserve_body("task:A", 60.0, 10))],
-    );
+    let over_usd = reduce([auth, wire("CostReserve", principal, 2, "e2", reserve_body("task:A", 60.0, 10))]);
     assert.equal(over_usd.excluded[0].reason, "over-cap");
-    let over_tokens = reduce(
-        [auth, wire("CostReserve", principal, 2, "e2", reserve_body("task:A", 1.0, 6000))],
-    );
+    let over_tokens = reduce([auth, wire("CostReserve", principal, 2, "e2", reserve_body("task:A", 1.0, 6000))]);
     assert.equal(over_tokens.excluded[0].reason, "over-cap");
     let nobody = reduce([wire("CostReserve", "did:key:z6Mk-ghost", 2, "e2", reserve_body("task:A", 1.0, 10))]);
     assert.equal(nobody.excluded[0].reason, "no-budget")
@@ -329,17 +335,11 @@ test "incurred draws down its reserve or is excluded" {
     assert.equal(r.costs[1].kind, "incurred");
     // Lease context carries from reserve to incurred (null here: none given).
     assert.is_true(r.costs[1].lease_ref is null);
-    let over = reduce(
-        [auth, res, wire("CostIncurred", principal, 3, "e3", incurred_body("e2", "task:A", 9.0, 10))],
-    );
+    let over = reduce([auth, res, wire("CostIncurred", principal, 3, "e3", incurred_body("e2", "task:A", 9.0, 10))]);
     assert.equal(over.excluded[0].reason, "over-reserve");
-    let mismatch = reduce(
-        [auth, res, wire("CostIncurred", principal, 3, "e3", incurred_body("e2", "task:B", 1.0, 10))],
-    );
+    let mismatch = reduce([auth, res, wire("CostIncurred", principal, 3, "e3", incurred_body("e2", "task:B", 1.0, 10))]);
     assert.equal(mismatch.excluded[0].reason, "task-mismatch");
-    let ghost = reduce(
-        [auth, wire("CostIncurred", principal, 3, "e3", incurred_body("nope", "task:A", 1.0, 10))],
-    );
+    let ghost = reduce([auth, wire("CostIncurred", principal, 3, "e3", incurred_body("nope", "task:A", 1.0, 10))]);
     assert.equal(ghost.excluded[0].reason, "unknown-reserve")
 }
 
@@ -363,9 +363,7 @@ test "receipts attach to incurred entries only" {
         ],
     );
     assert.equal(on_reserve.excluded[0].reason, "not-incurred");
-    let ghost = reduce(
-        [wire("ReceiptAttach", principal, 1, "e1", receipt_body("nope", "cid:x"))],
-    );
+    let ghost = reduce([wire("ReceiptAttach", principal, 1, "e1", receipt_body("nope", "cid:x"))]);
     assert.equal(ghost.excluded[0].reason, "unknown-cost")
 }
 
@@ -374,4 +372,53 @@ function receipt_body(cost_ref: string, receipt: string) -> map<string, unknown>
     let _ = b.set("cost_ref", cost_ref);
     let _ = b.set("receipt", receipt);
     b
+}
+
+// ── Per-task cost attribution (bi#52) ─────────────────────────────────────
+// The urgency join needs spend per TASK, but budgets live per PRINCIPAL
+// (entity is the account holder). CostEntry already carries the task +
+// lease_ref on every reserve/incurred row, so attribution is a pure fold
+// over the projection — no new event type, no reducer change. Only
+// ADMITTED incurred rows count: reserves, excluded attempts, and unknown
+// spend never inflate the join (a holder cannot self-report spend into
+// urgency; the host meters it by emitting CostIncurred through the
+// reserve/drawdown checks above, and unmetered tasks read as 0).
+// Host mirror: taskIncurredTokens/taskIncurredUsd (bais/src/graph.ts).
+function task_incurred_tokens(costs: CostEntry[], task: string) -> int {
+    let total = 0;
+    for (let c in costs) {
+        if (c.kind == "incurred" && c.task == task) {
+            total = total + c.tokens;
+        }
+    }
+    total
+}
+
+function task_incurred_usd(costs: CostEntry[], task: string) -> float {
+    let total = 0.0;
+    for (let c in costs) {
+        if (c.kind == "incurred" && c.task == task) {
+            total = total + c.usd;
+        }
+    }
+    total
+}
+
+test "task incurred accumulates admitted spend per task, reserves excluded" {
+    let principal = "did:key:z6Mk-alice";
+    let r = reduce(
+        [
+            wire("BudgetAuthorize", principal, 1, "e1", auth_body(10.0, 10000)),
+            wire("CostReserve", principal, 2, "e2", reserve_body("task:A", 6.0, 6000)),
+            wire("CostIncurred", principal, 3, "e3", incurred_body("e2", "task:A", 4.0, 4000)),
+            wire("CostIncurred", principal, 4, "e4", incurred_body("e2", "task:A", 1.0, 1000)),
+        ],
+    );
+    assert.equal(r.excluded.length(), 0);
+    // Reserves are allowance, not spend: only the two incurred rows count.
+    assert.equal(task_incurred_tokens(r.costs, "task:A"), 5000);
+    assert.equal(task_incurred_usd(r.costs, "task:A"), 5.0);
+    // Unknown tasks read as 0 — unmetered spend never inflates urgency.
+    assert.equal(task_incurred_tokens(r.costs, "task:B"), 0);
+    assert.equal(task_incurred_usd(r.costs, "task:B"), 0.0)
 }

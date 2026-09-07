@@ -1,0 +1,38 @@
+# hub#166 fixture: pure-no-IO goal — the exemption is established EXPLICITLY
+# in the box value (never assumed): sketch proceeds and the oracle records
+# the pure-no-io facet with its reason.
+[goal]
+statement = "Ship a pure checksum helper"
+style = "plain"
+hero = "plain"
+non_goals = ["streaming inputs"]
+done_criteria = [{ text = "checksum matches known vectors", done = false }]
+testing_surface = [{ surface = "checksum of fixture file", exercise = "run: bais checksum fixture.bin" }]
+surface_spec = [{ facet = "pure-no-io", spec = "reads argv only and writes stdout only, no UI, API, or format surface" }]
+[interview.users]
+status = "filled"
+value = "solo dev"
+[interview.scale]
+status = "filled"
+value = "single directory"
+[interview.platform]
+status = "filled"
+value = "local CLI"
+[interview.constraints]
+status = "waived"
+value = ""
+[interview.style]
+status = "filled"
+value = "plain"
+[interview.acceptance]
+status = "filled"
+value = "checksum matches known vectors"
+[interview.non-goals]
+status = "filled"
+value = "streaming inputs"
+[interview."testing-surface"]
+status = "filled"
+value = "checksum of fixture file => run: bais checksum fixture.bin"
+[interview."surface-spec"]
+status = "filled"
+value = "pure-no-io => reads argv only and writes stdout only, no UI, API, or format surface"

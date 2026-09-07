@@ -1,0 +1,12 @@
+id = "t#a5"
+title = "t#a5 threshold-boundary anchor"
+status = "Open"
+kind = "Feat"
+body = """
+Exactly one live dependent (t#a6): open_downstream = 1, load-bearing
+by the >= threshold boundary, non-load-bearing under a strict > read.
+This file is the bi#57 red-check tripwire for the threshold hunk.
+
+Requirement: the boundary open_downstream == threshold still audits
+Acceptance: a strict-> comparison is caught by the suite
+"""

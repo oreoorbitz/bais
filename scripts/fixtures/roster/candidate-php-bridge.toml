@@ -1,0 +1,17 @@
+# Candidate skill — filed by a specialist, judged on read by the hero.
+# This PHP-Hack bridge novelty was MISFILED in the default library
+# (specialists file freely; misfiled-but-present beats lost). Read-side
+# routing must still land it in PhpJoe's library (domain-scoped: matches
+# PhpJoe's specialty tags).
+
+[skill]
+id = "php-hack-bridge-001"
+title = "Novel PHP-Hack bridge for legacy billing types"
+tags = ["php", "hack"]
+filed_in = "default"
+body = """
+The legacy billing endpoint exposes Hack vec shapes over a PHP
+entrypoint: coerce with Vec\map + invariant() at the boundary instead of
+rewriting the caller. Applies whenever a PHP component touches
+Hack-typed billing code.
+"""

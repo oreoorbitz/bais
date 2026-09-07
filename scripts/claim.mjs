@@ -110,10 +110,10 @@ check("claim.deterministic", cycle() === once);
 	check("claim.renew-nondoing", rn.code === 1 && rn.out.includes("not Doing (nothing to renew)"), JSON.stringify(rn));
 	// list --claims appends; plain list shape unchanged.
 	const l1 = run(d2, ["list"]);
-	check("claim.list-shape", l1.out.trim() === "t#02\tDone\tFeat\tw", JSON.stringify(l1.out));
+	check("claim.list-shape", l1.out.trim() === "t#02\tDone\tFeat\tw\tbr=0", JSON.stringify(l1.out));
 	run(d2, ["move", "t#02", "Doing", "--as", "a1", "--for", "1h", "--now", T0]);
 	const l2 = run(d2, ["list", "--claims"]);
-	check("claim.list-claims", l2.out.trim() === `t#02\tDoing\tFeat\tw\ta1\t${L1H}`, JSON.stringify(l2.out));
+	check("claim.list-claims", l2.out.trim() === `t#02\tDoing\tFeat\tw\ta1\t${L1H}\tbr=0`, JSON.stringify(l2.out));
 	// Bad durations and owners fail closed with names.
 	const bd = run(d2, ["move", "t#02", "Doing", "--as", "a1", "--for", "soon"]);
 	check("claim.bad-duration", bd.code === 1 && bd.out.includes('needs <n>s|m|h|d'), JSON.stringify(bd));

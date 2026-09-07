@@ -1,0 +1,7 @@
+id = "t#a4"
+title = "t#a4 unreferenced leaf"
+status = "Open"
+kind = "Feat"
+body = """
+No dependents at all: open_downstream = 0, never load-bearing.
+"""

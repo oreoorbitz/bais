@@ -35,6 +35,7 @@ import { DatabaseSync } from "node:sqlite";
 import { resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { event } from "../baml_sdk/index.js";
+import { serveDelta, parseHeadsParam } from "./sync_delta.js";
 import { projectName } from "./graph.js";
 import { eventId, verifyEventId } from "./ids.js";
 import { refreshProjectionTables, ensureSchema, exportSnapshot, mergeAnchorReduction, storeOversight, sealProjection, verifyProjection } from "./store.js";
@@ -718,8 +719,17 @@ function anchorLeaseConflict(db: DatabaseSync, reduction: any, entity: string, l
 		const merged = mergeAnchorReduction(JSON.parse(raw), reduction, lc);
 		// The candidate's own newly-admitted lease lives in both views —
 		// exclude it, or every post-prune claim false-positives.
+		// bi#42 wall companion (host owns clocks): the live wall reading is
+		// taken once per call; a wall-lapsed anchor lease no longer blocks.
+		// Fixed-shape RFC3339 UTC Z compares lexicographically ==
+		// chronologically; a non-string (or absent) bound degrades to pure
+		// lc semantics — the min() policy itself lives in lease.baml.
+		const nowWall = new Date().toISOString();
 		const live = (ls: any[]): any | null =>
-			ls.find((l) => l.lease_id !== excludeId && l.entity === entity && l.status === "active" && l.expires_lc > lc) ?? null;
+			ls.find((l) =>
+				l.lease_id !== excludeId && l.entity === entity && l.status === "active" && l.expires_lc > lc &&
+				(typeof l.expires_wall !== "string" || l.expires_wall > nowWall)
+			) ?? null;
 		const hit = live(merged.leases ?? []);
 		if (!hit) return null;
 		if (live(reduction.leases ?? [])) return null; // truncated view saw it — BAML already ruled
@@ -801,7 +811,7 @@ export async function pruneBelowCheckpoint(
 
 export async function createHub(
 	issuesDir: string,
-	opts: { port?: number; project?: string; limits?: HubLimits } = {},
+	opts: { port?: number; project?: string; limits?: HubLimits; publicBase?: string } = {},
 ): Promise<{ hub: Hub; server: Server }> {
 	const baisDir = resolve(issuesDir, "..");
 	// Same store.db as store.ts dbPathFor: .bais/store.db.
@@ -881,13 +891,78 @@ export async function createHub(
 	};
 	rebuildRenews();
 
-	// Ephemeral channel (report §2, Nostr model): memory ring + live SSE
-	// fan-out only. Nothing here touches the log, the reducer, or SQLite.
+	// Ephemeral channel, bi#46 (report §2, Nostr model): SQLite-retained
+	// ring + live SSE fan-out. The memory-only ring lost everything on hub
+	// restart (and reset pubSeq to 0, so a reconnecting subscriber's
+	// ?since= cursor matched nothing — a silent gap), and rotated past 1000
+	// with no signal. Retention now lives in host storage — the pub_keep
+	// table below — which is deliberately OUTSIDE the log, the reducer, the
+	// projection tables, and the content fingerprint: ephemeral stays
+	// ephemeral, replays from storage, and never trips store integrity.
 	type PubMsg = { seq: number; type: string; entity: string | null; body: unknown; author: string | null; ts: string };
+	db.exec(
+		"CREATE TABLE IF NOT EXISTS pub_keep(seq INTEGER PRIMARY KEY, type TEXT NOT NULL, entity TEXT, body TEXT NOT NULL, author TEXT, ts TEXT NOT NULL)",
+	);
+	// Last-N per entity (a task's recent pulses survive) + a global bound
+	// (one chatty entity cannot evict everyone else's window).
+	const pubKeepPerEntity = 50;
+	const pubKeepGlobal = 5000;
+	// The cursor survives restarts with the data: a subscriber holding a
+	// pre-restart seq reconnects into the same numbering.
 	let pubSeq = 0;
-	const pubRing: PubMsg[] = [];
-	const pubCap = 1000;
+	try {
+		const top = (db.prepare("SELECT MAX(seq) AS m FROM pub_keep").get() as any)?.m;
+		if (typeof top === "number") pubSeq = top + 1;
+	} catch {
+		pubSeq = 0;
+	}
+	const pubStore = (m: PubMsg): void => {
+		db.prepare("INSERT INTO pub_keep(seq, type, entity, body, author, ts) VALUES (?, ?, ?, ?, ?, ?)").run(
+			m.seq, m.type, m.entity, JSON.stringify(m.body ?? {}), m.author, m.ts,
+		);
+		// Per-entity floor: drop this entity's rows older than its last-N.
+		// OFFSET keeps exactly N: the row at OFFSET N is the (N+1)-th
+		// newest, so everything at or below it goes.
+		db.prepare(
+			"DELETE FROM pub_keep WHERE COALESCE(entity, '') = COALESCE(?, '') AND seq <= (SELECT seq FROM pub_keep WHERE COALESCE(entity, '') = COALESCE(?, '') ORDER BY seq DESC LIMIT 1 OFFSET ?)",
+		).run(m.entity, m.entity, pubKeepPerEntity);
+		// Global ceiling: drop rows older than the last-N overall.
+		db.prepare(
+			"DELETE FROM pub_keep WHERE seq <= (SELECT seq FROM pub_keep ORDER BY seq DESC LIMIT 1 OFFSET ?)",
+		).run(pubKeepGlobal);
+	};
+	const pubLoad = (since: number, type: string | null): { events: PubMsg[]; oldest: number | null; floor: number | null } => {
+		const rows = (db.prepare(
+			"SELECT seq, type, entity, body, author, ts FROM pub_keep WHERE seq > ? AND (? IS NULL OR type = ?) ORDER BY seq ASC",
+		).all(since, type, type) as any[]);
+		const events: PubMsg[] = rows.map((r) => ({
+			seq: r.seq, type: r.type, entity: r.entity ?? null,
+			body: JSON.parse(r.body), author: r.author ?? null, ts: r.ts,
+		}));
+		let oldest: number | null = null;
+		let floor: number | null = null;
+		try {
+			const o = (db.prepare("SELECT MIN(seq) AS m FROM pub_keep").get() as any)?.m;
+			if (typeof o === "number") oldest = o;
+			// Gap floor: the YOUNGEST per-entity window-start. A cursor
+			// below it missed messages in at least one entity's window
+			// that have since aged out. Loud by design: a subscriber
+			// watching only intact entities gets a false-positive nudge
+			// toward re-bootstrap; a subscriber watching an evicted entity
+			// never gets silence.
+			const f = (db.prepare("SELECT MAX(o) AS f FROM (SELECT MIN(seq) AS o FROM pub_keep GROUP BY COALESCE(entity, ''))").get() as any)?.f;
+			if (typeof f === "number") floor = f;
+		} catch {
+			oldest = null;
+			floor = null;
+		}
+		return { events, oldest, floor };
+	};
 	const sseClients = new Set<ServerResponse>();
+	// Advertised base for the gap signal's one-command re-bootstrap. The
+	// hub cannot know its public hostname, so an explicit publicBase wins;
+	// otherwise the bound loopback + port (honest for local hubs).
+	let hubBase: string | null = typeof opts.publicBase === "string" ? opts.publicBase : null;
 
 	// Pruned history: reads serve the merged view (anchor state + surviving
 	// rows), so projections never lose pre-prune state the tables kept.
@@ -979,6 +1054,27 @@ export async function createHub(
 		refreshProjectionTables(db, reduction, log.map((x) => x.id), maxLc);
 	};
 
+	// bi#55: no fail-closed without a named reason. A live-write refusal
+	// (402/403/404/409 with a reason) parks the refused candidate in
+	// rejected_evidence — advisory forensics, never projection state
+	// (outside the log, the reducer, and the content fingerprint; never
+	// replicated; survives ingest rebuilds) — so every refusal surfaces
+	// in oversight rejected_events, not just in the ephemeral HTTP
+	// response. Best-effort by design: a park failure never fails the
+	// write path, the response stays the primary surface. Same-id +
+	// same-reason retries dedupe (first copy stands).
+	const parkRefusal = (wire: WireEvent, reason: string): void => {
+		try {
+			db.prepare(
+				"INSERT INTO rejected_evidence(event_id, author, seq, prev, project, entity, refs, lc, ts, type, body, sig, reason, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(event_id, reason) DO NOTHING",
+			).run(
+				wire.id, wire.author, wire.seq, wire.prev, wire.project, wire.entity,
+				JSON.stringify(wire.refs), wire.lc, wire.ts, wire.type,
+				JSON.stringify(wire.body), wire.sig, reason, new Date().toISOString(),
+			);
+		} catch {}
+	};
+
 	const decide = async (candidate: WireEvent): Promise<{ ok: true; reduction: any } | { ok: false; reason: string }> => {
 		const reduction = await (event as any).reduce([...log, candidate]);
 		const hit = (reduction.excluded as any[]).find((x) => x.event_id === candidate.id);
@@ -1019,39 +1115,63 @@ export async function createHub(
 				send(res, 503, { reason: "backfill-pending" });
 				return;
 			}
-			const { task, holder, ttl, epoch, idem, read_set } = b ?? {};
+			const { task, holder, ttl, epoch, idem, read_set, ttl_wall_ms } = b ?? {};
 			if (typeof task !== "string" || typeof holder !== "string" || typeof ttl !== "number" || typeof epoch !== "number" || typeof idem !== "string") {
 				send(res, 400, { error: "claim needs {task, holder, ttl, epoch, idem}" });
 				return;
 			}
-			const body = { ttl, epoch, idem, read_set: Array.isArray(read_set) ? read_set : [] };
+			// bi#42 wall companion (host owns clocks): optional wall TTL in
+			// ms. The hub stamps expires_wall = claim ts + ttl_wall_ms; BAML
+			// owns the min() expiry policy. Absent = lc-only lease (legacy).
+			if (ttl_wall_ms !== undefined && (!Number.isInteger(ttl_wall_ms) || ttl_wall_ms < 0)) {
+				send(res, 400, { error: "claim ttl_wall_ms must be a non-negative integer ms" });
+				return;
+			}
+			const claimNowMs = Date.now();
+			const claimTs = new Date(claimNowMs).toISOString();
+			const body: Record<string, unknown> = { ttl, epoch, idem, read_set: Array.isArray(read_set) ? read_set : [] };
+			let claimExpiresWall: string | undefined;
+			if (ttl_wall_ms !== undefined) {
+				claimExpiresWall = new Date(claimNowMs + ttl_wall_ms).toISOString();
+				body.ttl_wall_ms = ttl_wall_ms;
+				body.expires_wall = claimExpiresWall;
+			}
+			// bi#55: the candidate is built BEFORE the gates (nextLc/nextSeq/
+			// nextPrev/eventId are pure reads — no side effects) so every
+			// refusal below can park it in rejected_evidence. Gate order
+			// and response bytes are unchanged.
+			const lc = nextLc();
+			const fields = {
+				author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
+				project, entity: task, refs: [], lc, ts: claimTs,
+				type: "LeaseClaim", body: encodeBodyArrays(body), sig: null,
+			};
+			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
 			const bounded = checkBounds(body, []);
 			if (bounded) {
+				parkRefusal(candidate, bounded);
 				send(res, 413, { reason: bounded });
 				return;
 			}
 			if (authorExhausted(holder)) {
+				parkRefusal(candidate, "budget-exhausted");
 				send(res, 402, { reason: "budget-exhausted" });
 				return;
 			}
 			const frozen = isFrozen(task);
 			if (frozen) {
+				parkRefusal(candidate, "frozen");
 				send(res, 409, { reason: "frozen", until: new Date(frozen).toISOString() });
 				return;
 			}
 			if (needsCap(holder, "lease.claim", task)) {
+				parkRefusal(candidate, "cap-denied");
 				send(res, 403, { reason: "cap-denied", action: "lease.claim", scope: task });
 				return;
 			}
-			const lc = nextLc();
-			const fields = {
-				author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
-				project, entity: task, refs: [], lc, ts: new Date().toISOString(),
-				type: "LeaseClaim", body: encodeBodyArrays(body), sig: null,
-			};
-			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
 			const d = await decide(candidate);
 			if (!d.ok) {
+				parkRefusal(candidate, d.reason);
 				send(res, 409, { reason: d.reason });
 				return;
 			}
@@ -1061,13 +1181,19 @@ export async function createHub(
 			// Holders re-claim after anchor leases expire; prune idle hubs.
 			const anchorBlock = anchorLeaseConflict(db, d.reduction, task, lc, candidate.id);
 			if (anchorBlock) {
+				// bi#55: park the refusal — the 409 stays the primary surface.
+				parkRefusal(candidate, "lease-active-at-anchor");
 				send(res, 409, { reason: "lease-active-at-anchor", lease_id: anchorBlock.lease_id });
 				return;
 			}
 			admit(candidate, d.reduction);
 			recordChange(task);
 			const lease = (d.reduction.leases as any[]).find((l) => l.lease_id === candidate.id);
-			send(res, 200, { lease_id: candidate.id, task, holder, fencing: lease.fencing, expires_lc: lease.expires_lc });
+			send(res, 200, {
+				lease_id: candidate.id, task, holder, fencing: lease.fencing, expires_lc: lease.expires_lc,
+				// bi#42: the documented wall bound (absent on lc-only leases).
+				...(claimExpiresWall !== undefined ? { ttl_wall_ms, expires_wall: claimExpiresWall } : {}),
+			});
 		},
 		"POST /renew": async (b, res) => {
 			if (backfillPending()) {
@@ -1081,29 +1207,56 @@ export async function createHub(
 			}
 			const known = (lastReduction.leases as any[]).some((l) => l.lease_id === lease_ref);
 			if (!known) {
+				// bi#55: no stored entity to commit a candidate to — park a
+				// synthetic refused shape (honest content hash over the
+				// lookup as given) so the 404 names its reason in
+				// oversight too. Response bytes unchanged.
+				const lc0 = nextLc();
+				const ufields = {
+					author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
+					project, entity: "", refs: [], lc: lc0, ts: new Date().toISOString(),
+					type: "LeaseRenew", body: { lease_ref }, sig: null,
+				};
+				parkRefusal({ ...ufields, id: eventId(ufields), admitted: true, drop_reason: null }, "unknown-lease");
 				send(res, 404, { reason: "unknown-lease" });
 				return;
 			}
-			if ((renewsByLease.get(lease_ref) ?? 0) >= limits.maxRenewsPerLease) {
-				send(res, 409, { reason: "retry-budget-exhausted", lease_ref });
-				return;
-			}
-			const lc = nextLc();
 			// Entity is resolved BEFORE id assignment: the content hash must
 			// commit to the stored bytes (bi#41 caught a post-id mutation here).
 			const rec = (lastReduction.leases as any[]).find((l) => l.lease_id === lease_ref);
+			// bi#55: candidate before the retry gate (pure reads, no side
+			// effects) so the refusal parks. Gate order and response bytes
+			// are unchanged.
+			const lc = nextLc();
+			// bi#42 wall companion (host owns clocks): the restamp extends
+			// from the lease's OWN ttl_wall_ms — never from client input, so
+			// a holder cannot inflate its bound by renewing. Lc-only leases
+			// (no stored wall TTL) renew without a wall bound, as before.
+			const renewBody: Record<string, unknown> = { lease_ref };
+			let renewExpiresWall: string | undefined;
+			if (typeof rec.ttl_wall_ms === "number") {
+				renewExpiresWall = new Date(Date.now() + rec.ttl_wall_ms).toISOString();
+				renewBody.expires_wall = renewExpiresWall;
+			}
 			const fields = {
 				author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
 				project, entity: rec.entity, refs: [], lc, ts: new Date().toISOString(),
-				type: "LeaseRenew", body: { lease_ref }, sig: null,
+				type: "LeaseRenew", body: renewBody, sig: null,
 			};
 			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
+			if ((renewsByLease.get(lease_ref) ?? 0) >= limits.maxRenewsPerLease) {
+				parkRefusal(candidate, "retry-budget-exhausted");
+				send(res, 409, { reason: "retry-budget-exhausted", lease_ref });
+				return;
+			}
 			if (needsCap(holder, "lease.renew", rec.entity)) {
+				parkRefusal(candidate, "cap-denied");
 				send(res, 403, { reason: "cap-denied", action: "lease.renew", scope: rec.entity });
 				return;
 			}
 			const d = await decide(candidate);
 			if (!d.ok) {
+				parkRefusal(candidate, d.reason);
 				send(res, 409, { reason: d.reason });
 				return;
 			}
@@ -1111,7 +1264,11 @@ export async function createHub(
 			renewsByLease.set(lease_ref, (renewsByLease.get(lease_ref) ?? 0) + 1);
 			recordChange(rec.entity);
 			const lease = (d.reduction.leases as any[]).find((l) => l.lease_id === lease_ref);
-			send(res, 200, { lease_id: lease_ref, expires_lc: lease.expires_lc });
+			send(res, 200, {
+				lease_id: lease_ref, expires_lc: lease.expires_lc,
+				// bi#42: the restamped wall bound (absent on lc-only leases).
+				...(renewExpiresWall !== undefined ? { expires_wall: renewExpiresWall } : {}),
+			});
 		},
 		"POST /release": async (b, res) => {
 			if (backfillPending()) {
@@ -1125,11 +1282,16 @@ export async function createHub(
 			}
 			const rec = (lastReduction.leases as any[]).find((l) => l.lease_id === lease_ref);
 			if (!rec) {
+				// bi#55: synthetic refused shape, same contract as renew —
+				// the 404 names its reason in oversight too.
+				const lc0 = nextLc();
+				const ufields = {
+					author: holder, seq: nextSeq(holder), prev: nextPrev(holder),
+					project, entity: "", refs: [], lc: lc0, ts: new Date().toISOString(),
+					type: "LeaseRelease", body: { lease_ref }, sig: null,
+				};
+				parkRefusal({ ...ufields, id: eventId(ufields), admitted: true, drop_reason: null }, "unknown-lease");
 				send(res, 404, { reason: "unknown-lease" });
-				return;
-			}
-			if (needsCap(holder, "lease.release", rec.entity)) {
-				send(res, 403, { reason: "cap-denied", action: "lease.release", scope: rec.entity });
 				return;
 			}
 			const lc = nextLc();
@@ -1139,8 +1301,15 @@ export async function createHub(
 				type: "LeaseRelease", body: { lease_ref }, sig: null,
 			};
 			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
+			// bi#55: park refusals — responses stay the primary surface.
+			if (needsCap(holder, "lease.release", rec.entity)) {
+				parkRefusal(candidate, "cap-denied");
+				send(res, 403, { reason: "cap-denied", action: "lease.release", scope: rec.entity });
+				return;
+			}
 			const d = await decide(candidate);
 			if (!d.ok) {
+				parkRefusal(candidate, d.reason);
 				send(res, 409, { reason: d.reason });
 				return;
 			}
@@ -1161,6 +1330,21 @@ export async function createHub(
 		// requester's ids (git/IPLD-style want/have); cursors report every
 		// actor's head so the peer knows what to ask for next.
 		"GET /sync": async (_b, res, url) => {
+			// bi#47: heads mode serves the BAML diff policy (from→to delta
+			// or an explicit re-bootstrap, never a partial diff presented
+			// as complete). Without `heads` the legacy filters below apply.
+			if (url.searchParams.has("heads")) {
+				const anchor = readPruneAnchor(db);
+				const d = await serveDelta({
+					log,
+					heads: parseHeadsParam(url.searchParams.get("heads")),
+					anchor: anchor ? { lc: anchor.lc, state_root: anchor.state_root } : null,
+					clientVersion: url.searchParams.get("reducer_version"),
+					hubBase,
+				});
+				send(res, 200, { ...d, anchor });
+				return;
+			}
 			const author = url.searchParams.get("author");
 			const sinceSeq = url.searchParams.get("since_seq");
 			const sinceLc = url.searchParams.get("since_lc");
@@ -1210,7 +1394,16 @@ export async function createHub(
 			if (author !== null) out = out.filter((e) => e.author === author);
 			if (sinceSeqN !== null) out = out.filter((e) => e.seq > sinceSeqN);
 			const ids = out.map((e) => e.id).sort();
-			send(res, 200, { count: ids.length, digest: sha256Hex(ids.join(",")), head_lc: maxLc });
+			// bi#47: version gate served on the digest — a peer pins
+			// reducer_version BEFORE pulling a delta, and anchor_lc tells
+			// it whether its heads may have been pruned away.
+			send(res, 200, {
+				count: ids.length,
+				digest: sha256Hex(ids.join(",")),
+				head_lc: maxLc,
+				reducer_version: await (event as any).reducer_version(),
+				anchor_lc: readPruneAnchor(db)?.lc ?? 0,
+			});
 		},
 		// Peer ingestion: cortical append through the shared validator.
 		// Rejected events land as evidence (admitted=0), never silently.
@@ -1315,10 +1508,8 @@ export async function createHub(
 				return;
 			}
 			const by = typeof issuer === "string" ? issuer : hubKey.did;
-			if (needsCap(by, "cap.admin", scope)) {
-				send(res, 403, { reason: "cap-denied", action: "cap.admin", scope });
-				return;
-			}
+			// bi#55: candidate before the cap gate (pure reads) so the
+			// refusal parks. Gate order and response bytes are unchanged.
 			const lc = nextLc();
 			const body: Record<string, unknown> = { audience, can: JSON.stringify(can), scope, expiry_lc };
 			if (typeof budget_cap_usd === "number") body.budget_cap_usd = budget_cap_usd;
@@ -1329,8 +1520,15 @@ export async function createHub(
 				type: "CapGrant", body: encodeBodyArrays(body), sig: null,
 			};
 			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
+			// bi#55: park refusals — responses stay the primary surface.
+			if (needsCap(by, "cap.admin", scope)) {
+				parkRefusal(candidate, "cap-denied");
+				send(res, 403, { reason: "cap-denied", action: "cap.admin", scope });
+				return;
+			}
 			const d = await decide(candidate);
 			if (!d.ok) {
+				parkRefusal(candidate, d.reason);
 				send(res, 409, { reason: d.reason });
 				return;
 			}
@@ -1359,6 +1557,8 @@ export async function createHub(
 			const candidate: WireEvent = { ...fields, id: eventId(fields), admitted: true, drop_reason: null };
 			const d = await decide(candidate);
 			if (!d.ok) {
+				// bi#55: park the refusal — the 409 stays the primary surface.
+				parkRefusal(candidate, d.reason);
 				send(res, 409, { reason: d.reason });
 				return;
 			}
@@ -1436,20 +1636,41 @@ export async function createHub(
 				author: typeof author === "string" ? author : null,
 				ts: new Date().toISOString(),
 			};
-			pubRing.push(msg);
-			if (pubRing.length > pubCap) pubRing.splice(0, pubRing.length - pubCap);
+			// bi#46: retained in host storage (survives hub restarts, replays
+			// to poll-confirm), still never in the log or reducer.
+			pubStore(msg);
 			const line = `data: ${JSON.stringify(msg)}\n\n`;
 			for (const c of sseClients) c.write(line);
 			send(res, 200, { seq: msg.seq });
 		},
+		// bi#46: replay comes from retention, and what retention cannot
+		// cover is LOUD. gap_unknown is true when the caller named a
+		// non-negative cursor below the gap floor (the youngest per-entity
+		// window-start) — messages it asked for have aged out of some
+		// entity's window and will never replay. The rebootstrap
+		// command re-derives standing from the durable log (the one source
+		// ephemeral can never come back from). No silent case: a stale
+		// cursor either replays or says so.
 		"GET /pub": async (_b, res, url) => {
-			const since = Number(url.searchParams.get("since") ?? "-1");
+			const sinceParam = url.searchParams.get("since");
+			const since = Number(sinceParam ?? "-1");
 			const type = url.searchParams.get("type");
+			const { events, oldest, floor } = pubLoad(Number.isFinite(since) ? since : -1, type);
+			// since < 0 is "from the start": no cursor, no gap to name.
+			// Any non-negative cursor below the floor missed aged-out
+			// messages in some entity's window.
+			const stale =
+				sinceParam !== null && Number.isInteger(since) && since >= 0 && floor !== null && since < floor;
 			send(res, 200, {
-				events: pubRing.filter((m) => m.seq > since && (type === null || m.type === type)),
+				events,
+				oldest_seq: oldest,
+				gap_unknown: stale,
+				rebootstrap: stale ? `bais sync --from ${hubBase ?? "http://HUB_HOST:HUB_PORT"}` : null,
 			});
 		},
 		// Live-only SSE fan-out: no replay, no history — connect and listen.
+		// Reconnects backfill first via GET /pub?since=<cursor> (which says
+		// gap_unknown when the cursor predates retention), then hold this.
 		"GET /pub/stream": async (_b, res) => {
 			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
 			sseClients.add(res);
@@ -1489,6 +1710,8 @@ export async function createHub(
 	await new Promise<void>((resolve) => server.listen(port, resolve));
 	const addr = server.address();
 	const bound = typeof addr === "object" && addr ? addr.port : port;
+	// bi#46: default advertised base for the gap signal's re-bootstrap.
+	if (hubBase === null) hubBase = `http://127.0.0.1:${bound}`;
 	return {
 		hub: {
 			port: bound,

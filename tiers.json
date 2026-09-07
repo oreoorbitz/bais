@@ -57,7 +57,7 @@
    "cmd": [
     "node",
     "scripts/cross-check.mjs",
-    "../bi/.bais/issues"
+    "../.bais/issues"
    ],
    "tier": "t0",
    "budget_s": 120
@@ -121,6 +121,42 @@
    "cmd": [
     "node",
     "scripts/claim.mjs"
+   ],
+   "tier": "t0",
+   "budget_s": 120
+  },
+  {
+   "name": "dispatch",
+   "cmd": [
+    "node",
+    "scripts/dispatch.mjs"
+   ],
+   "tier": "t0",
+   "budget_s": 120
+  },
+  {
+   "name": "mirror-parity",
+   "cmd": [
+    "node",
+    "scripts/mirror-parity.mjs"
+   ],
+   "tier": "t0",
+   "budget_s": 120
+  },
+  {
+   "name": "shape-parity",
+   "cmd": [
+    "node",
+    "scripts/shape-parity.mjs"
+   ],
+   "tier": "t0",
+   "budget_s": 120
+  },
+  {
+   "name": "baml-suites",
+   "cmd": [
+    "node",
+    "scripts/baml-suites.mjs"
    ],
    "tier": "t0",
    "budget_s": 120

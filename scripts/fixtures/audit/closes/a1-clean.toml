@@ -1,0 +1,11 @@
+id = "t#a1"
+title = "t#a1 load-bearing anchor"
+status = "Done"
+kind = "Feat"
+body = """
+Audited close: audit t#a1#1 passed with the trail in
+trails/t#a1-1.json, and the ref rides on the issue itself (bi#83:
+verdicts as types, machine-checkable on the close).
+
+Evidence: audit(t#a1#1)
+"""

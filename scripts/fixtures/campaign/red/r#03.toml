@@ -1,0 +1,10 @@
+id = "r#03"
+title = "red refill"
+status = "Open"
+kind = "Feat"
+area = "bais/multi-agent"
+body = """
+Clean issue the refill seats after the red requeue.
+Files: red-refill.ts
+Acceptance: leaf lands with its diff under review; whole-pack suite passes.
+"""

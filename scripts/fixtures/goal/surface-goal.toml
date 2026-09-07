@@ -1,0 +1,36 @@
+# hub#165 fixture: goal with a declared testing surface — every surface
+# item must appear in the sketch e2e output in BITS case shape.
+[goal]
+statement = "Ship per-directory goal tracking for BAIS"
+style = "plain"
+hero = "plain"
+non_goals = ["backlog-wide campaigns"]
+done_criteria = [{ text = "sketch refused while open", done = false }, { text = "commit gated on approval", done = false }]
+testing_surface = [{ surface = "bais list shows open issues", exercise = "run: bais list --json" }, { surface = "bais ready orders by severity", exercise = "run: bais ready" }]
+[interview.users]
+status = "filled"
+value = "solo dev"
+[interview.scale]
+status = "filled"
+value = "single directory"
+[interview.platform]
+status = "filled"
+value = "local CLI"
+[interview.constraints]
+status = "waived"
+value = ""
+[interview.style]
+status = "filled"
+value = "plain"
+[interview.acceptance]
+status = "filled"
+value = "sketch refused while open; commit gated on approval"
+[interview.non-goals]
+status = "filled"
+value = "backlog-wide campaigns"
+[interview."testing-surface"]
+status = "filled"
+value = "bais list shows open issues => run: bais list --json; bais ready orders by severity => run: bais ready"
+[interview."surface-spec"]
+status = "filled"
+value = "cli output shape => bais list --json matches the testing_surface contract"

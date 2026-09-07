@@ -1,0 +1,10 @@
+id = "b#03"
+title = "budget three"
+status = "Open"
+kind = "Feat"
+area = "bais/multi-agent"
+body = """
+Third lone issue.
+Files: budget-three.ts
+Acceptance: issue lands with its diff under review; whole-pack suite passes.
+"""

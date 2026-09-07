@@ -1,0 +1,8 @@
+id = "u#02"
+title = "second unknown surface"
+status = "Open"
+kind = "Feat"
+body = """
+Second swipe candidate with no declared footprint.
+Acceptance: second unknown never shares a pack with the first.
+"""

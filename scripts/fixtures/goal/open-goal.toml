@@ -1,0 +1,27 @@
+[goal]
+statement = "Ship per-directory goal tracking for BAIS"
+style = ""
+hero = ""
+non_goals = []
+done_criteria = []
+[interview.users]
+status = "filled"
+value = "solo dev"
+[interview.scale]
+status = "open"
+value = ""
+[interview.platform]
+status = "open"
+value = ""
+[interview.constraints]
+status = "open"
+value = ""
+[interview.style]
+status = "open"
+value = ""
+[interview.acceptance]
+status = "open"
+value = ""
+[interview.non-goals]
+status = "open"
+value = ""

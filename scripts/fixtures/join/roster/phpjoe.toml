@@ -1,0 +1,14 @@
+# bi#147 roster entry — PhpJoe, the PHP specialist.
+#
+# Agent {name, model, specialty tags, style, corpus binding} stored as one
+# file per agent in .bais/roster/. Style names the bi#134 pack
+# (.bais/styles/<name>.toml); corpus is an opaque BAGL corpus ref for now
+# (resolved by a later issue — see bais/scripts/roster.mjs).
+
+[agent]
+name = "PhpJoe"
+model = "php-specialist-v1"
+specialty_tags = ["php", "hack", "backend"]
+style = "corporate-oop"
+corpus = "bagl:corpora/php-v1"
+description = "PHP/Hack backend specialist. Takes PHP components with php-corpus evidence attached."

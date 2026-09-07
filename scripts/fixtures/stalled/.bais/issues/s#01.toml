@@ -1,0 +1,7 @@
+id = "s#01"
+title = "dead hub"
+status = "Doing"
+kind = "Feat"
+body = "b"
+holder = "ghost-1"
+lease = "2000-01-01T00:00:00Z"

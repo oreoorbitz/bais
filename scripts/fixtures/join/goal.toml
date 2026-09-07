@@ -1,0 +1,20 @@
+# Fixture (hub#161): goal whose components split PHP vs orchestration.
+# Unknown style + no hero keywords -> the general (default) hero, so the
+# join selftest exercises the default path while the roster decides.
+statement = "Rewrite the legacy billing endpoint in PHP and coordinate the rollout across squads"
+
+users = "solo dev (adrian)"
+scale = "single service (billing endpoint + rollout)"
+platform = "local CLI"
+constraints = ["offline-friendly"]
+style = "plain"
+hero = ""
+
+done_criteria = [
+  "billing endpoint ported with php-corpus evidence attached",
+  "rollout assignment names its agent and reason out loud",
+]
+
+non_goals = [
+  "new features",
+]

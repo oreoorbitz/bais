@@ -1,0 +1,10 @@
+id = "b#02"
+title = "budget two"
+status = "Open"
+kind = "Feat"
+area = "bais/multi-agent"
+body = """
+Second lone issue.
+Files: budget-two.ts
+Acceptance: issue lands with its diff under review; whole-pack suite passes.
+"""

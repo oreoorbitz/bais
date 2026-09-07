@@ -1,0 +1,10 @@
+id = "c#02"
+title = "cohort trio beta"
+status = "Open"
+kind = "Feat"
+area = "demo/cohort"
+body = """
+Beta slice of the shared surface.
+Acceptance: beta closes on its own acceptance; beta red-checks its own hunk.
+Files: surface.ts cli.ts
+"""

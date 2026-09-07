@@ -60,7 +60,7 @@ function find_verification(acc: Acc, verify_id: string) -> Verification? {
 }
 
 function apply_submit(acc: Acc, e: WireEvent) -> void {
-    if (!lease_fence_ok(acc, e.entity, e.lc, body_int(e.body, "fencing"))) {
+    if (!lease_fence_ok(acc, e.entity, e.lc, body_int(e.body, "fencing"), now_wall = e.ts)) {
         acc.excluded.push(Excluded { event_id: e.id, reason: "stale-fence" });
     } else if let evidence: string[] = body_string_list(e.body, "evidence") {
         if (evidence.length() == 0) {
@@ -89,9 +89,12 @@ function apply_verify(acc: Acc, e: WireEvent) -> void {
             } else if let s: Submission = find_submission(acc, ref) {
                 if (s.producer == e.author) {
                     acc.excluded.push(Excluded { event_id: e.id, reason: "self-verify" });
-                } else if (acc.verifications.find((v) -> {
-                    v.submit_id == ref && v.verifier == e.author
-                }) != null) {
+                } else if (
+                    acc.verifications.find((v) -> {
+                        v.submit_id == ref && v.verifier == e.author
+                    })
+                        != null
+                ) {
                     acc.excluded.push(Excluded { event_id: e.id, reason: "dupe-verify" });
                 } else {
                     acc.verifications.push(
@@ -161,9 +164,12 @@ function apply_reject(acc: Acc, e: WireEvent) -> void {
         if let s: Submission = find_submission(acc, ref) {
             if (e.author == s.producer) {
                 s.status = "rejected";
-            } else if (acc.verifications.find((v) -> {
-                v.submit_id == ref && v.verifier == e.author && v.verdict == "reject"
-            }) != null) {
+            } else if (
+                acc.verifications.find((v) -> {
+                    v.submit_id == ref && v.verifier == e.author && v.verdict == "reject"
+                })
+                    != null
+            ) {
                 s.status = "rejected";
             } else {
                 acc.excluded.push(Excluded { event_id: e.id, reason: "reject-denied" });
@@ -196,7 +202,18 @@ function only_submission(r: Reduction) -> Submission {
 }
 
 test "submit with evidence is submitted, without is excluded" {
-    let r = reduce([wire("WorkSubmit", "task:A", 1, "e1", submit_body(["cid:abc", "ci:123"]), author = "did:key:z6Mk-alice")]);
+    let r = reduce(
+        [
+            wire(
+                "WorkSubmit",
+                "task:A",
+                1,
+                "e1",
+                submit_body(["cid:abc", "ci:123"]),
+                author = "did:key:z6Mk-alice",
+            ),
+        ],
+    );
     assert.equal(r.excluded.length(), 0);
     let s = only_submission(r);
     assert.equal(s.producer, "did:key:z6Mk-alice");
@@ -218,7 +235,14 @@ test "hosts send evidence and refs JSON-encoded" {
     let ok = reduce(
         [
             wire("WorkSubmit", "task:A", 1, "e1", sb, author = "did:key:z6Mk-alice"),
-            wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "accept"), author = "did:key:z6Mk-bob"),
+            wire(
+                "VerifyRecord",
+                "task:A",
+                2,
+                "e2",
+                verify_body("e1", "accept"),
+                author = "did:key:z6Mk-bob",
+            ),
             wire("WorkAccept", "task:A", 3, "e3", ab),
         ],
     );
@@ -233,7 +257,12 @@ test "submit on a leased task needs the fencing echo" {
     let ok = reduce([claim, wire("WorkSubmit", "task:A", 2, "e2", fenced, author = "did:key:z6Mk-alice")]);
     assert.equal(ok.excluded.length(), 0);
     assert.equal(only_submission(ok).status, "submitted");
-    let bare = reduce([claim, wire("WorkSubmit", "task:A", 2, "e2", submit_body(["cid:x"]), author = "did:key:z6Mk-alice")]);
+    let bare = reduce(
+        [
+            claim,
+            wire("WorkSubmit", "task:A", 2, "e2", submit_body(["cid:x"]), author = "did:key:z6Mk-alice"),
+        ],
+    );
     assert.equal(bare.submissions.length(), 0);
     assert.equal(bare.excluded[0].reason, "stale-fence")
 }
@@ -241,7 +270,14 @@ test "submit on a leased task needs the fencing echo" {
 test "verify records a foreign verdict, self-verify is excluded" {
     let events = [
         wire("WorkSubmit", "task:A", 1, "e1", submit_body(["cid:x"]), author = "did:key:z6Mk-alice"),
-        wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "accept"), author = "did:key:z6Mk-bob"),
+        wire(
+            "VerifyRecord",
+            "task:A",
+            2,
+            "e2",
+            verify_body("e1", "accept"),
+            author = "did:key:z6Mk-bob",
+        ),
     ];
     let r = reduce(events);
     assert.equal(r.excluded.length(), 0);
@@ -251,7 +287,14 @@ test "verify records a foreign verdict, self-verify is excluded" {
     let self = reduce(
         [
             wire("WorkSubmit", "task:A", 1, "e1", submit_body(["cid:x"]), author = "did:key:z6Mk-alice"),
-            wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "accept"), author = "did:key:z6Mk-alice"),
+            wire(
+                "VerifyRecord",
+                "task:A",
+                2,
+                "e2",
+                verify_body("e1", "accept"),
+                author = "did:key:z6Mk-alice",
+            ),
         ],
     );
     assert.equal(self.verifications.length(), 0);
@@ -261,16 +304,51 @@ test "verify records a foreign verdict, self-verify is excluded" {
 test "verify rejects unknown verdicts, submits, and dupes" {
     let submit = wire("WorkSubmit", "task:A", 1, "e1", submit_body(["cid:x"]), author = "did:key:z6Mk-alice");
     let bad_verdict = reduce(
-        [submit, wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "maybe"), author = "did:key:z6Mk-bob")],
+        [
+            submit,
+            wire(
+                "VerifyRecord",
+                "task:A",
+                2,
+                "e2",
+                verify_body("e1", "maybe"),
+                author = "did:key:z6Mk-bob",
+            ),
+        ],
     );
     assert.equal(bad_verdict.excluded[0].reason, "unknown-verdict");
-    let ghost = reduce([wire("VerifyRecord", "task:A", 2, "e2", verify_body("nope", "accept"), author = "did:key:z6Mk-bob")]);
+    let ghost = reduce(
+        [
+            wire(
+                "VerifyRecord",
+                "task:A",
+                2,
+                "e2",
+                verify_body("nope", "accept"),
+                author = "did:key:z6Mk-bob",
+            ),
+        ],
+    );
     assert.equal(ghost.excluded[0].reason, "unknown-submit");
     let dupe = reduce(
         [
             submit,
-            wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "accept"), author = "did:key:z6Mk-bob"),
-            wire("VerifyRecord", "task:A", 3, "e3", verify_body("e1", "reject"), author = "did:key:z6Mk-bob"),
+            wire(
+                "VerifyRecord",
+                "task:A",
+                2,
+                "e2",
+                verify_body("e1", "accept"),
+                author = "did:key:z6Mk-bob",
+            ),
+            wire(
+                "VerifyRecord",
+                "task:A",
+                3,
+                "e3",
+                verify_body("e1", "reject"),
+                author = "did:key:z6Mk-bob",
+            ),
         ],
     );
     assert.equal(dupe.verifications.length(), 1);
@@ -280,7 +358,14 @@ test "verify rejects unknown verdicts, submits, and dupes" {
 test "accept links verdicts and marks submitted accepted, idempotently" {
     let flow = [
         wire("WorkSubmit", "task:A", 1, "e1", submit_body(["cid:x"]), author = "did:key:z6Mk-alice"),
-        wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "accept"), author = "did:key:z6Mk-bob"),
+        wire(
+            "VerifyRecord",
+            "task:A",
+            2,
+            "e2",
+            verify_body("e1", "accept"),
+            author = "did:key:z6Mk-bob",
+        ),
         wire("WorkAccept", "task:A", 3, "e3", accept_body(["e2"])),
     ];
     let r = reduce(flow);
@@ -290,7 +375,14 @@ test "accept links verdicts and marks submitted accepted, idempotently" {
     let again = reduce(
         [
             wire("WorkSubmit", "task:A", 1, "e1", submit_body(["cid:x"]), author = "did:key:z6Mk-alice"),
-            wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "accept"), author = "did:key:z6Mk-bob"),
+            wire(
+                "VerifyRecord",
+                "task:A",
+                2,
+                "e2",
+                verify_body("e1", "accept"),
+                author = "did:key:z6Mk-bob",
+            ),
             wire("WorkAccept", "task:A", 3, "e3", accept_body(["e2"])),
             wire("WorkAccept", "task:A", 4, "e4", accept_body(["e2"])),
         ],
@@ -304,7 +396,14 @@ test "accept refuses reject refs, foreign refs, and empty sets" {
     let rejected = reduce(
         [
             submitted,
-            wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "reject"), author = "did:key:z6Mk-bob"),
+            wire(
+                "VerifyRecord",
+                "task:A",
+                2,
+                "e2",
+                verify_body("e1", "reject"),
+                author = "did:key:z6Mk-bob",
+            ),
             wire("WorkAccept", "task:A", 3, "e3", accept_body(["e2"])),
         ],
     );
@@ -314,7 +413,14 @@ test "accept refuses reject refs, foreign refs, and empty sets" {
         [
             submitted,
             wire("WorkSubmit", "task:B", 2, "e9", submit_body(["cid:y"]), author = "did:key:z6Mk-alice"),
-            wire("VerifyRecord", "task:B", 3, "e8", verify_body("e9", "accept"), author = "did:key:z6Mk-bob"),
+            wire(
+                "VerifyRecord",
+                "task:B",
+                3,
+                "e8",
+                verify_body("e9", "accept"),
+                author = "did:key:z6Mk-bob",
+            ),
             wire("WorkAccept", "task:A", 4, "e3", accept_body(["e8"])),
         ],
     );
@@ -328,21 +434,55 @@ test "accept refuses reject refs, foreign refs, and empty sets" {
 test "reject lands via producer withdraw or recorded reject verdict" {
     let submitted = wire("WorkSubmit", "task:A", 1, "e1", submit_body(["cid:x"]), author = "did:key:z6Mk-alice");
     let withdrawn = reduce(
-        [submitted, wire("WorkReject", "task:A", 2, "e2", str_body("submit_ref", "e1"), author = "did:key:z6Mk-alice")],
+        [
+            submitted,
+            wire(
+                "WorkReject",
+                "task:A",
+                2,
+                "e2",
+                str_body("submit_ref", "e1"),
+                author = "did:key:z6Mk-alice",
+            ),
+        ],
     );
     assert.equal(withdrawn.excluded.length(), 0);
     assert.equal(only_submission(withdrawn).status, "rejected");
     let verified = reduce(
         [
             submitted,
-            wire("VerifyRecord", "task:A", 2, "e2", verify_body("e1", "reject"), author = "did:key:z6Mk-bob"),
-            wire("WorkReject", "task:A", 3, "e3", str_body("submit_ref", "e1"), author = "did:key:z6Mk-bob"),
+            wire(
+                "VerifyRecord",
+                "task:A",
+                2,
+                "e2",
+                verify_body("e1", "reject"),
+                author = "did:key:z6Mk-bob",
+            ),
+            wire(
+                "WorkReject",
+                "task:A",
+                3,
+                "e3",
+                str_body("submit_ref", "e1"),
+                author = "did:key:z6Mk-bob",
+            ),
         ],
     );
     assert.equal(verified.excluded.length(), 0);
     assert.equal(only_submission(verified).status, "rejected");
     let denied = reduce(
-        [submitted, wire("WorkReject", "task:A", 2, "e2", str_body("submit_ref", "e1"), author = "did:key:z6Mk-bob")],
+        [
+            submitted,
+            wire(
+                "WorkReject",
+                "task:A",
+                2,
+                "e2",
+                str_body("submit_ref", "e1"),
+                author = "did:key:z6Mk-bob",
+            ),
+        ],
     );
     assert.equal(denied.excluded[0].reason, "reject-denied");
     assert.equal(only_submission(denied).status, "submitted")

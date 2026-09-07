@@ -41,7 +41,7 @@ const mkfix = () => {
 	check("49.scan.blocker.exact", r.out === "moved\tt#01\tOpen\tDone\nunblocked\tt#02\tdownstream work\n", JSON.stringify(r.out));
 	check("49.scan.blocker.file-updated", /^status = "Done"$/m.test(readFileSync(join(is, "t#01.toml"), "utf8"))); // bi#58: line-anchored, not substring
 	const r2 = run(d, ["ready"]);
-	check("49.scan.blocker.ready-consistent", r2.code === 0 && r2.out === "t#02\tdownstream work\nt#03\tlone\n", JSON.stringify(r2.out)); // bi#58: exact ready set+order, not two includes
+	check("49.scan.blocker.ready-consistent", r2.code === 0 && r2.out === "t#02\tdownstream work\tbr=0\nt#03\tlone\tbr=0\n", JSON.stringify(r2.out)); // bi#58: exact ready set+order, not two includes
 }
 // --- scan path: non-blocker move prints nothing extra ---
 {

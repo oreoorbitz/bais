@@ -1,0 +1,10 @@
+id = "s#01"
+title = "port session resume in boring corporate style"
+status = "Open"
+kind = "Feat"
+style = "corporate-oop"
+body = """
+Port session resume for the arena game in boring corporate style.
+Acceptance: resume works after reconnect; collaborators are injected behind interfaces.
+Files: session.ts
+"""

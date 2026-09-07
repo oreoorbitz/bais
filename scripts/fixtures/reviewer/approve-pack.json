@@ -1,0 +1,29 @@
+{
+  "pack": "r-approve",
+  "hero": "general",
+  "suite": "pass",
+  "redcheck": {
+    "hunk": "diff-emptiness guard in reviewMember",
+    "observed": "empty diff reds the pack naming the item"
+  },
+  "slots": [
+    {
+      "slot": 0,
+      "id": "r#01",
+      "title": "declared alpha",
+      "files": ["alpha.ts"],
+      "files_state": "declared",
+      "item": "pass",
+      "diff": "diff --git a/alpha.ts b/alpha.ts\n+export const alpha = 1;\n"
+    },
+    {
+      "slot": 1,
+      "id": "r#02",
+      "title": "declared beta",
+      "files": ["beta.ts"],
+      "files_state": "declared",
+      "item": "pass",
+      "diff": "diff --git a/beta.ts b/beta.ts\n+export const beta = 2;\n"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+id = "t#01"
+title = "declared alpha"
+status = "Open"
+kind = "Feat"
+body = """
+Alpha work with a declared footprint.
+Acceptance: alpha accepts x; alpha admits y on retry.
+Files: alpha.ts
+"""

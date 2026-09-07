@@ -159,6 +159,77 @@ check(z.status === 409 && zrenew.status === 409 && zold.status === 409,
 		`G-budget(b): funded author admits the identical shape (got ${rich.status})`);
 }
 
+// 10. W-wall live reconciliation (bi#42) — the coordinator path: the hub
+// stamps expires_wall from the claim's ttl_wall_ms (host owns clocks),
+// BAML owns the min() expiry. t1 is freed first (release b's reclaim), so
+// every wall probe below runs on a quiet log with a huge lc grant — only
+// the wall lapse may free these leases. No sleeps: ttl_wall_ms=0 lapses by
+// construction (lapse is >=), and the renew-extend poll retries on same-ms.
+{
+	const free = await post("/release", { lease_ref: reclaim.json.lease_id, holder: "did:key:b" });
+	check(free.status === 200, `W setup: t1 freed for wall probes (got ${free.status})`);
+	// Backward compat: pre-wall leases carry no bound anywhere.
+	check(win.json.expires_wall === undefined && renew.json.expires_wall === undefined,
+		"lc-only claim/renew responses carry no wall bound (legacy shape)");
+	// W1: zero wall TTL — the very next claim on the quiet log wins.
+	const w1 = await post("/claim", { task: "t1", holder: "did:key:w1", ttl: 1000, epoch: 0, idem: "w1", ttl_wall_ms: 0 });
+	check(w1.status === 200 && typeof w1.json.expires_wall === "string" && w1.json.ttl_wall_ms === 0,
+		`W1: zero-TTL claim admitted with the stamped bound echoed (got ${w1.status} ${JSON.stringify(w1.json)})`); // bi#58: === 0, not truthy — 0 is the whole point
+	const w2 = await post("/claim", { task: "t1", holder: "did:key:w2", ttl: 1000, epoch: 0, idem: "w2" });
+	check(w2.status === 200 && w2.json.holder === "did:key:w2",
+		`W1: immediate reclaim wins on the quiet log — the wall (not lc) freed it (got ${w2.status} ${w2.json.reason ?? w2.json.holder})`);
+	// W1c: the wall gate validates — negative, non-integer, non-number TTLs
+	// are 400s, never silent lc-only claims.
+	const badNeg = await post("/claim", { task: "t1", holder: "did:key:bad", ttl: 1000, epoch: 0, idem: "bn", ttl_wall_ms: -5 });
+	const badStr = await post("/claim", { task: "t1", holder: "did:key:bad", ttl: 1000, epoch: 0, idem: "bs", ttl_wall_ms: "x" });
+	const badFloat = await post("/claim", { task: "t1", holder: "did:key:bad", ttl: 1000, epoch: 0, idem: "bf", ttl_wall_ms: 1.5 });
+	check(badNeg.status === 400 && badStr.status === 400 && badFloat.status === 400,
+		`W1c: bad wall TTLs refused 400 (got ${badNeg.status}/${badStr.status}/${badFloat.status})`);
+	// W2: live holder with an hour bound — rival blocked, renew extends the
+	// wall, rival still blocked past nothing (the bound never lapses here).
+	const wrel = await post("/release", { lease_ref: w2.json.lease_id, holder: "did:key:w2" });
+	check(wrel.status === 200, `W2 setup: t1 freed again (got ${wrel.status})`);
+	const wl = await post("/claim", { task: "t1", holder: "did:key:wl", ttl: 1000, epoch: 0, idem: "wl", ttl_wall_ms: 3_600_000 });
+	check(wl.status === 200 && typeof wl.json.expires_wall === "string",
+		`W2 setup: live wall claim admitted with bound (got ${wl.status})`);
+	const wrival = await post("/claim", { task: "t1", holder: "did:key:wr", ttl: 1000, epoch: 0, idem: "wr" });
+	check(wrival.status === 409 && wrival.json.reason === "lease-held: did:key:wl",
+		`W2: rival blocked inside the bound (got ${wrival.status} ${wrival.json.reason})`);
+	let wrenew = await post("/renew", { lease_ref: wl.json.lease_id, holder: "did:key:wl" });
+	for (let i = 0; i < 5 && !(wrenew.status === 200 && wrenew.json.expires_wall > wl.json.expires_wall); i++) {
+		await new Promise((r) => setTimeout(r, 10));
+		wrenew = await post("/renew", { lease_ref: wl.json.lease_id, holder: "did:key:wl" });
+	}
+	check(wrenew.status === 200 && wrenew.json.expires_wall > wl.json.expires_wall,
+		`W2: live renew strictly extends the wall bound (got ${wrenew.status} ${wrenew.json.expires_wall} vs ${wl.json.expires_wall})`);
+	const wrival2 = await post("/claim", { task: "t1", holder: "did:key:wr", ttl: 1000, epoch: 0, idem: "wr2" });
+	check(wrival2.status === 409 && wrival2.json.reason === "lease-held: did:key:wl",
+		`W2: rival still blocked after live renew (got ${wrival2.status} ${wrival2.json.reason})`);
+
+// 11. W red-check (bi#57) — hunk: bais/src/hub.ts POST /claim wall
+// stamping (`body.ttl_wall_ms` + `body.expires_wall` from the claim clock
+// reading). Revert (stamp nothing, rebuild) breaks exactly the W1 reclaim:
+// the lease is lc-only, the quiet log never advances lc, and the immediate
+// reclaim dies `lease-held`.
+// Expected reason: `W1: immediate reclaim wins on the quiet log` (FAILS,
+// got 409 lease-held: did:key:w1).
+// Observed (live revert + rebuild, 2026-09-06): `FAIL: W1: zero-TTL claim
+// admitted with the stamped bound echoed (got 200 {...no expires_wall...})`
+// then `FAIL: W1: immediate reclaim wins on the quiet log (got 409
+// lease-held: did:key:w1)` + 8 failure(s) cascade (t1 stays parked on w1);
+// the W differential trips 1/2 on the reverted net.
+// Differential (runs every time): the valid reclaim response fails the
+// held predicate and the held rival fails the admit predicate — neither
+// W check passes on an always-200 / always-409 net.
+{
+	const frc = [];
+	const fcheck = (cond, msg) => { if (!cond) frc.push(msg); };
+	fcheck(w2.status === 409, "W1 immediate reclaim wins");
+	fcheck(wrival.status === 200, "W2 rival blocked inside the bound");
+	check(frc.length === 2, `W red-check: predicates discriminate freed from held (${frc.length}/2 cross-feed failures)`);
+}
+}
+
 await hub.close();
 if (failures) {
 	console.error(`${failures} failure(s)`);

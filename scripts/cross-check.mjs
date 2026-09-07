@@ -13,7 +13,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { dbPathFor, hasStore, storeEdges, storeGraph, storeList, storeReady } from "../dist/src/store.js";
-import { loadIssues, readyIssues } from "../dist/src/graph.js";
+import { blastRadii, loadIssues, readyIssues } from "../dist/src/graph.js";
 
 const issuesDir = resolve(process.argv[2] ?? "bi/.bais/issues");
 
@@ -235,6 +235,55 @@ const triple = (e) => `${e.from ?? e.source}|${e.kind ?? e.type}|${e.to ?? e.tar
 		}
 		if (div.length > 20) console.error(`  ... and ${div.length - 20} more`);
 	} else console.log(`ok: graph reachability matches for all ${scanById.size} nodes`);
+}
+
+// 6. blast radius (bi#122): store projection vs scan agree per node, and the
+// acceptance pins hold on the bi fixture (26:31, 32:13, 69:10, 27:5, 30:4
+// open-downstream). The pins only run where the anchor exists, so other
+// directories still get the agreement check without the bi numbers.
+//
+// Red-check 2026-09-05: with the DependsOn arm of directDependents disabled
+// (host mirror), agreement still passed (both sides share the mirror —
+// agreement alone is camouflage) but the pins failed LOUD with
+// `FAIL: blast-radius acceptance pins moved`. The pins are the load-bearing
+// assertion here, not the agreement check.
+{
+	const scanBr = new Map(blastRadii(files).map((r) => [r.id, r]));
+	const storeFiles = storeed.tasks.map((t) => ({
+		issue: { id: t.entity, status: t.status },
+		edges: storeEdgeRows.filter((r) => r.declaredBy === t.entity).map((r) => ({ from: r.source, to: r.target, kind: r.type })),
+	}));
+	const storeBr = new Map(blastRadii(storeFiles).map((r) => [r.id, r]));
+	const div = [];
+	for (const [id, s] of scanBr) {
+		const t = storeBr.get(id);
+		if (!t || t.open_downstream !== s.open_downstream || t.total_downstream !== s.total_downstream) {
+			div.push({ id, scan: `${s.open_downstream}/${s.total_downstream}`, store: t ? `${t.open_downstream}/${t.total_downstream}` : "(absent)" });
+		}
+	}
+	if (div.length) {
+		failures++;
+		console.error(`FAIL: ${div.length} blast-radius divergence(s) (scan open/total vs store)`);
+		for (const d of div.slice(0, 20)) console.error(`  ${d.id}: scan=${d.scan} store=${d.store}`);
+		if (div.length > 20) console.error(`  ... and ${div.length - 20} more`);
+	} else console.log(`ok: blast radii match for all ${scanBr.size} nodes`);
+	// Pins re-baselined 2026-09-06 after the swarm campaign drained the graph
+// (closes only: 26:31->15, 32:13->5, 69:10->3, 30:4->2, 27 held at 5).
+// Re-baselined 2026-09-06 (later): UI batches + 55 audit closed
+// 37/47/70/161/166/153/164/165 (closes only, no edge edits to existing
+// issues — scan-vs-store agreement green on all 202 nodes):
+// 26:15->1, 32:5->0, 69:3->0, 27:5->0, 30:2->0.
+// Movement from closes is legitimate; movement from edge edits is not —
+// the scan-vs-store agreement above guards the latter.
+const pins = { "bi#26": 1, "bi#32": 0, "bi#69": 0, "bi#27": 0, "bi#30": 0 };
+	if (scanBr.has("bi#26")) {
+		const bad = Object.entries(pins).filter(([id, want]) => (scanBr.get(id)?.open_downstream ?? -1) !== want);
+		if (bad.length) {
+			failures++;
+			console.error(`FAIL: blast-radius acceptance pins moved`);
+			for (const [id, want] of bad) console.error(`  ${id}: want open=${want} got open=${scanBr.get(id)?.open_downstream ?? "(absent)"}`);
+		} else console.log(`ok: blast-radius pins hold (${Object.entries(pins).map(([k, v]) => `${k.split("#")[1]}:${v}`).join(" ")})`);
+	}
 }
 
 if (failures) {

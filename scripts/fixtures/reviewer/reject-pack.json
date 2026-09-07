@@ -1,0 +1,29 @@
+{
+  "pack": "r-reject",
+  "hero": "general",
+  "suite": "pass",
+  "redcheck": {
+    "hunk": "item-fail guard in reviewMember",
+    "observed": "red item fails the whole pack naming r#12"
+  },
+  "slots": [
+    {
+      "slot": 0,
+      "id": "r#11",
+      "title": "declared alpha",
+      "files": ["alpha.ts"],
+      "files_state": "declared",
+      "item": "pass",
+      "diff": "diff --git a/alpha.ts b/alpha.ts\n+export const alpha = 1;\n"
+    },
+    {
+      "slot": 1,
+      "id": "r#12",
+      "title": "declared beta with wrong-direction edit",
+      "files": ["beta.ts"],
+      "files_state": "declared",
+      "item": "fail",
+      "diff": "diff --git a/beta.ts b/beta.ts\n-export const beta = 2;\n+export const beta = 3;\n"
+    }
+  ]
+}

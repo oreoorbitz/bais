@@ -4,3 +4,5 @@ dist/
 baml_sdk/
 .baml/
 .bais/
+# bi#127: the stalled-triage fixture is committed content, not live state.
+!scripts/fixtures/stalled/.bais/

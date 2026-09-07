@@ -1,0 +1,10 @@
+id = "c#01"
+title = "cohort trio alpha"
+status = "Open"
+kind = "Feat"
+area = "demo/cohort"
+body = """
+Alpha slice of the shared surface.
+Acceptance: alpha closes on its own acceptance; alpha red-checks its own hunk.
+Files: surface.ts store.ts
+"""

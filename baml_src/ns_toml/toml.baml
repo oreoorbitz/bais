@@ -311,12 +311,21 @@ function is_valid_lease_utc(s: string) -> bool {
     if (s.length() != 20) {
         false
     } else if (
-        s.slice(4, 5) != "-" || s.slice(7, 8) != "-" || s.slice(10, 11) != "T" ||
-        s.slice(13, 14) != ":" || s.slice(16, 17) != ":" || s.slice(19, 20) != "Z"
+        s.slice(4, 5) != "-"
+            || s.slice(7, 8) != "-"
+            || s.slice(10, 11) != "T"
+            || s.slice(13, 14) != ":"
+            || s.slice(16, 17) != ":"
+            || s.slice(19, 20) != "Z"
     ) {
         false
     } else {
-        let digits = s.slice(0, 4) + s.slice(5, 7) + s.slice(8, 10) + s.slice(11, 13) + s.slice(14, 16) + s.slice(17, 19);
+        let digits = s.slice(0, 4)
+            + s.slice(5, 7)
+            + s.slice(8, 10)
+            + s.slice(11, 13)
+            + s.slice(14, 16)
+            + s.slice(17, 19);
         digits.chars().every((c) -> {
             let cp = c.code_point_at(0) ?? -1;
             cp >= 48 && cp <= 57
@@ -786,7 +795,9 @@ test "claim fields parse, default null, and roundtrip" {
 
 test "bad lease shape rejects" {
     for (let bad in ["tomorrow", "2026-9-6T0:0:0Z", "2026-09-06 00:00:00", "2026-09-06T00:00:00+00:00"]) {
-        let toml = "id = \"bi#09\"\ntitle = \"t\"\nstatus = \"Doing\"\nkind = \"Bug\"\nlease = \"" + bad + "\"\nbody = \"b\"\n";
+        let toml = "id = \"bi#09\"\ntitle = \"t\"\nstatus = \"Doing\"\nkind = \"Bug\"\nlease = \""
+            + bad
+            + "\"\nbody = \"b\"\n";
         let threw = false;
         let _ = parse_bais_file(toml) catch (e) {
             baml.errors.ParseError => {

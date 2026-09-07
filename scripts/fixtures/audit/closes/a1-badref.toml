@@ -1,0 +1,11 @@
+id = "t#a1"
+title = "t#a1 load-bearing anchor"
+status = "Done"
+kind = "Feat"
+body = """
+Cites an audit that never passed: audit #9 was never opened for t#a1,
+so the ref dangles. Must fail loud as audit-ref-unresolvable (for the
+right reason — not the bare-close reason).
+
+Evidence: audit(t#a1#9)
+"""

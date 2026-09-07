@@ -1,0 +1,9 @@
+# Squad output for "query" never integrated: orphan, must FAIL.
+dir: goals/inventory-mvp
+lieutenant: lieut-145
+plan-proposed: ingest,query
+plan-agreed: by=operator
+squad-formed: squad-ingest component=ingest
+squad-formed: squad-query component=query
+integrated: ingest by=lieut-145 ref=handoff-001
+system-test: owner=lieut-145 covers=ingest,query result=pass

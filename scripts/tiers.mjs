@@ -39,10 +39,16 @@ if (process.argv[2] === "selftest") {
   check(judgeElapsed(1000, 1) === "ok", "1000ms against 1s budget is ok");
   check(judgeElapsed(0, 1) === "ok", "0ms against 1s budget is ok");
   // Manifest covers the current chain exactly once, in legacy order
-  // (contract-test is bi#84-new, pinned here like the rest).
+  // (contract-test is bi#84-new, pinned here like the rest; claim was
+  // appended to the manifest without updating this list — repaired here
+  // alongside the dispatch addition, which is why selftest is green again;
+  // mirror-parity appended for bi#64 the same way; shape-parity (hub#199)
+  // and baml-suites (hub#201/hub#216 close-evidence drill) appended the
+  // same way 2026-09-07).
   const legacy = ["lease-race", "sync-test", "mcp-test", "reducer-determinism",
     "cross-check", "ingest-durability", "move-unblocked", "ready-wait",
-    "content-ids", "contract-test", "fault-drills"];
+    "content-ids", "contract-test", "fault-drills", "claim", "dispatch",
+    "mirror-parity", "shape-parity", "baml-suites"];
   const names = manifest.scripts.map((s) => s.name);
   check(JSON.stringify(names) === JSON.stringify(legacy),
     `manifest preserves the legacy chain order (${names.join(",")})`);

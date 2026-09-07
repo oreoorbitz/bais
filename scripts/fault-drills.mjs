@@ -24,7 +24,7 @@ import { DatabaseSync } from "node:sqlite";
 import { createHub, appendForeignEvents, publishCheckpoint, pruneBelowCheckpoint, encodeBodyArrays } from "../dist/src/hub.js";
 import { eventId } from "../dist/src/ids.js";
 import {
-	ingestIssues, storeList, hasStore, dbPathFor, storeOversight,
+	ingestIssues, storeList, hasStore, dbPathFor, storeOversight, storeLeases,
 	exportSnapshot, importSnapshot, recordImportedAnchor,
 	readBootstrap, markBootstrapComplete,
 } from "../dist/src/store.js";
@@ -41,7 +41,7 @@ const { clock } = clockFromArgv(process.argv);
 console.log(`info: wall-clock ${clock.fixed ? `pinned at ${clock.nowISO()}` : "live"}`);
 
 let failures = 0;
-const drillFailures = { a: 0, b: 0, c: 0, d: 0, r: 0 };
+const drillFailures = { a: 0, b: 0, c: 0, d: 0, e: 0, r: 0 };
 let drill = "?";
 const check = (cond, msg) => {
 	if (!cond) {
@@ -449,6 +449,139 @@ drill = "d";
 	}
 }
 
+// ---------------------------------------------------------------- (e) lease wall-clock reconciliation (bi#42)
+// Leases expire in lc ticks, but lc advances only on admission — on a quiet
+// log a dead holder's claim stays "active" forever. The wall companion
+// (expires_wall alongside expires_lc, BAML owning the min() policy, the hub
+// owning clocks) bounds it: the task becomes claimable once the stamped
+// wall bound lapses, with no intervening events. Fully in-process via
+// appendForeignEvents (the POST /sync handler shares it); claim bodies
+// carry the hub-stamped bound exactly as the coordinator writes it
+// (ttl huge so lc can never free these leases — only the wall lapse may).
+// Boundaries pinned both sides (G-skew style): 59s held, 60s exact lapse,
+// 61s free against a 60s documented bound. Timestamps ride the injectable
+// clock (clock.mjs), so the drill is identical live and under --now.
+drill = "e";
+{
+	const t = mkTree("e-lease");
+	writeFileSync(join(t.issues, "t1.toml"), toml("t1", "alpha"));
+	await ingestIssues(t.issues);
+
+	const base = clock.nowMs();
+	const iso = (ms) => clock.isoAt(ms);
+	const BOUND_MS = 60_000;
+	const bound = iso(base + BOUND_MS);
+	const claimBody = (idem, boundIso) => ({
+		ttl: 1000000, epoch: 0, idem, read_set: [],
+		ttl_wall_ms: BOUND_MS, expires_wall: boundIso,
+	});
+	const leaseEv = (o) => mkForeign({ project: "g", ...o });
+	// Reducer verdicts for sync-admitted events land in the excluded table
+	// (admitted=1 rows the reducer rules evidence, not state) — read the
+	// named reason, or null when the event stands.
+	const exclReason = (issuesDir, id) => {
+		const db = new DatabaseSync(dbPathFor(issuesDir));
+		try {
+			return db.prepare("SELECT reason FROM excluded WHERE event_id = ?").get(id)?.reason ?? null;
+		} finally {
+			db.close();
+		}
+	};
+	const holderOf = (issuesDir, entity) =>
+		(storeLeases(issuesDir).find((l) => l.entity === entity) ?? {}).holder ?? null;
+
+	// 1. Dead holder claims; the log goes quiet (no events between).
+	const DEAD = "did:key:e-dead";
+	const c1 = leaseEv({
+		author: DEAD, seq: 0, prev: null, entity: "t-wall-dead",
+		lc: 9100, ts: iso(base), type: "LeaseClaim", body: claimBody("d1", bound),
+	});
+	const a1 = await appendForeignEvents(t.issues, [c1]);
+	check(a1.accepted.length === 1 && a1.accepted[0] === c1.id, "E setup: dead holder's wall claim admitted");
+	check(holderOf(t.issues, "t-wall-dead") === DEAD, "E setup: dead holder holds the task");
+
+	// 2. Pre-bound probe (59s): still held — the wall bound has not lapsed.
+	const PROBE = "did:key:e-probe";
+	const probe = leaseEv({
+		author: PROBE, seq: 0, prev: null, entity: "t-wall-dead",
+		lc: 9101, ts: iso(base + 59_000), type: "LeaseClaim", body: claimBody("p1", iso(base + 119_000)),
+	});
+	const ap = await appendForeignEvents(t.issues, [probe]);
+	check(ap.accepted.length === 1, "E pre-bound probe stages (sync admits, the reducer rules)");
+	const probeReason = exclReason(t.issues, probe.id);
+	check(probeReason === `lease-held: ${DEAD}`, `E pre-bound probe excluded lease-held (got ${probeReason})`); // bi#58: pin the holder suffix
+	check(holderOf(t.issues, "t-wall-dead") === DEAD, "E pre-bound probe wins nothing");
+
+	// 3. Post-bound reclaim (61s): the ONLY new event on the quiet log (lc
+	// 9102, deep inside the million-tick grant) — its own (lc, ts) is the
+	// observation that sees the wall lapse, and the sweep confirms it.
+	const NEXT = "did:key:e-next";
+	const c2 = leaseEv({
+		author: NEXT, seq: 0, prev: null, entity: "t-wall-dead",
+		lc: 9102, ts: iso(base + 61_000), type: "LeaseClaim", body: claimBody("n1", iso(base + 121_000)),
+	});
+	const a2 = await appendForeignEvents(t.issues, [c2]);
+	check(a2.accepted.length === 1 && a2.accepted[0] === c2.id, "E post-bound reclaim admitted on the quiet log");
+	check(exclReason(t.issues, c2.id) === null, "E post-bound reclaim not excluded (the wall freed it)");
+	check(holderOf(t.issues, "t-wall-dead") === NEXT, "E post-bound reclaim wins the task within the documented bound");
+
+	// 4. Exact boundary (separate task): lapse fires at the stamped instant.
+	const EDGE = "did:key:e-edge", EDGE2 = "did:key:e-edge2";
+	const e1 = leaseEv({
+		author: EDGE, seq: 0, prev: null, entity: "t-wall-edge",
+		lc: 9200, ts: iso(base), type: "LeaseClaim", body: claimBody("e1", bound),
+	});
+	await appendForeignEvents(t.issues, [e1]);
+	const exact = leaseEv({
+		author: EDGE2, seq: 0, prev: null, entity: "t-wall-edge",
+		lc: 9201, ts: bound, type: "LeaseClaim", body: claimBody("e2", iso(base + 120_000)),
+	});
+	await appendForeignEvents(t.issues, [exact]);
+	check(exclReason(t.issues, exact.id) === null, "E exact-bound probe admitted (lapse is >=, not >)");
+	check(holderOf(t.issues, "t-wall-edge") === EDGE2, "E exact-bound probe wins at the stamped instant");
+
+	// 5. Live holder renews inside the bound and keeps the task: the renew
+	// restamps the wall (hub recomputes from the lease's own ttl_wall_ms),
+	// so a rival past the ORIGINAL bound is still held.
+	const LIVE = "did:key:e-live", RIVAL = "did:key:e-rival";
+	const l1 = leaseEv({
+		author: LIVE, seq: 0, prev: null, entity: "t-wall-live",
+		lc: 9300, ts: iso(base), type: "LeaseClaim", body: claimBody("l1", bound),
+	});
+	await appendForeignEvents(t.issues, [l1]);
+	const rn = leaseEv({
+		author: LIVE, seq: 1, prev: l1.id, entity: "t-wall-live",
+		lc: 9301, ts: iso(base + 30_000), type: "LeaseRenew",
+		body: { lease_ref: l1.id, expires_wall: iso(base + 90_000) },
+	});
+	const ar = await appendForeignEvents(t.issues, [rn]);
+	check(ar.accepted.length === 1 && exclReason(t.issues, rn.id) === null, "E live renew admitted inside the bound");
+	const rival = leaseEv({
+		author: RIVAL, seq: 0, prev: null, entity: "t-wall-live",
+		lc: 9302, ts: iso(base + 61_000), type: "LeaseClaim", body: claimBody("r1", iso(base + 121_000)),
+	});
+	await appendForeignEvents(t.issues, [rival]);
+	const rivalReason = exclReason(t.issues, rival.id);
+	check(rivalReason === `lease-held: ${LIVE}`, `E rival past the original bound still held after live renew (got ${rivalReason})`);
+	check(holderOf(t.issues, "t-wall-live") === LIVE, "E live holder keeps the task");
+
+	// 6. Dead holder's late renew (past the bound) is refused: liveness is
+	// holder-driven no longer — the wall decides.
+	const ZED = "did:key:e-zed";
+	const z1 = leaseEv({
+		author: ZED, seq: 0, prev: null, entity: "t-wall-zed",
+		lc: 9400, ts: iso(base), type: "LeaseClaim", body: claimBody("z1", bound),
+	});
+	await appendForeignEvents(t.issues, [z1]);
+	const zr = leaseEv({
+		author: ZED, seq: 1, prev: z1.id, entity: "t-wall-zed",
+		lc: 9401, ts: iso(base + 61_000), type: "LeaseRenew", body: { lease_ref: z1.id },
+	});
+	await appendForeignEvents(t.issues, [zr]);
+	const zrReason = exclReason(t.issues, zr.id);
+	check(zrReason === "not-current", `E late renew past the bound refused not-current (got ${zrReason})`);
+}
+
 // ---------------------------------------------------------------- red-checks (bi#57)
 // Each net above carries a recorded revert-hunk verification (hunk,
 // expected failure reason, observed output from the 2026-09-04
@@ -556,6 +689,64 @@ const rcReset = () => rcFails.splice(0, rcFails.length);
 	rcReset();
 }
 
+// RED-CHECK R-e — hunk: bais/baml_src/ns_event/lease.baml wall-lapse fold
+// observation (`now_wall = e.ts` in apply_claim's current_lease call — the
+// min() policy seeing the quiet-log lapse through the next event's own ts).
+// Revert (drop the now_wall pass so the fold is lc-only, regenerate) must
+// break drill (e) exactly at the post-bound reclaim: the fold sees a live
+// lease (lc covers) and excludes the reclaim `lease-held`, so the dead
+// holder keeps the task past its documented bound.
+// Expected reason: `E post-bound reclaim not excluded (the wall freed it)`.
+// Observed (live revert + regenerate, 2026-09-06): `FAIL [e]: E post-bound
+// reclaim not excluded (the wall freed it)` + `... wins the task ...` +
+// both exact-bound checks, 6 failure(s). Telling detail: the sweep half of
+// the policy still fires (dead lease marked expired) while the blind fold
+// excludes the reclaim `lease-held` — the task parks on NOBODY (R-e holder
+// probe reads null, differential trips 1/2). Fold observation load-bearing.
+// Non-vacuity probes (run every time): each new predicate must ALSO fail
+// its mirror — an always-admit / always-held net trips one side.
+{
+	const t = mkTree("r-e");
+	writeFileSync(join(t.issues, "t1.toml"), toml("t1", "alpha"));
+	await ingestIssues(t.issues);
+	const base = clock.nowMs();
+	const iso = (ms) => clock.isoAt(ms);
+	const cb = (idem, boundIso) => ({
+		ttl: 1000000, epoch: 0, idem, read_set: [],
+		ttl_wall_ms: 60_000, expires_wall: boundIso,
+	});
+	const lev = (o) => mkForeign({ project: "g", ...o });
+	const excl = (issuesDir, id) => {
+		const db = new DatabaseSync(dbPathFor(issuesDir));
+		try {
+			return db.prepare("SELECT reason FROM excluded WHERE event_id = ?").get(id)?.reason ?? null;
+		} finally {
+			db.close();
+		}
+	};
+	const DEAD = "did:key:r-e-dead", NEXT = "did:key:r-e-next";
+	const wbound = iso(base + 60_000);
+	const w1 = lev({
+		author: DEAD, seq: 0, prev: null, entity: "t-wall",
+		lc: 9500, ts: iso(base), type: "LeaseClaim", body: cb("w1", wbound),
+	});
+	await appendForeignEvents(t.issues, [w1]);
+	const w2 = lev({
+		author: NEXT, seq: 0, prev: null, entity: "t-wall",
+		lc: 9501, ts: iso(base + 61_000), type: "LeaseClaim", body: cb("w2", iso(base + 121_000)),
+	});
+	await appendForeignEvents(t.issues, [w2]);
+	// The intact net frees the task: reclaim stands, dead holder is gone.
+	check(excl(t.issues, w2.id) === null, "R-e setup: post-bound reclaim stands on the intact net");
+	// Mirror probes: a wall-blind (reverted) net would exclude w2
+	// lease-held AND leave DEAD holding — the drill predicates discriminate
+	// both directions, so neither new check is vacuous.
+	rcheck(excl(t.issues, w2.id) === `lease-held: ${DEAD}`, "E post-bound reclaim not excluded (the wall freed it)");
+	rcheck((storeLeases(t.issues).find((l) => l.entity === "t-wall") ?? {}).holder === DEAD, "E post-bound reclaim wins the task");
+	check(rcFails.length === 2, `R-e red-check: wall-blind outcome fails both drill predicates (${rcFails.length}/2 cross-feed failures)`);
+	rcReset();
+}
+
 // RED-CHECK R-fallback — hunk: bais/src/cli.ts `const useStore =
 // hasStore(issuesDir)` + the scan-path else-branch (hasStore fallback).
 // Revert (E3: `const useStore = true` forced, rebuild) serves confident
@@ -594,6 +785,7 @@ console.log(`drill (a) corruption-fallback: ${verdict("a")}`);
 console.log(`drill (b) idempotence: ${verdict("b")}`);
 console.log(`drill (c) prune-resync convergence: ${verdict("c")}`);
 console.log(`drill (d) gate injection proofs: ${verdict("d")}`);
+console.log(`drill (e) lease wall-clock reconciliation: ${verdict("e")}`);
 console.log(`red-checks (r) revert-hunk probes: ${verdict("r")}`);
 console.log("loopback needed: NO — all drills fully in-process (node:sqlite + dist imports); no sockets opened, no child processes spawned.");
 if (failures) {

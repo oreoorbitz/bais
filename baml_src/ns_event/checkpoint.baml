@@ -43,7 +43,9 @@ function apply_checkpoint(acc: Acc, e: WireEvent) -> void {
             if let version: string = body_string(e.body, "reducer_version") {
                 if let at: int = body_int(e.body, "lc") {
                     if (root == "" || heads.length() == 0) {
-                        acc.excluded.push(Excluded { event_id: e.id, reason: "missing-checkpoint-field" });
+                        acc.excluded.push(
+                            Excluded { event_id: e.id, reason: "missing-checkpoint-field" },
+                        );
                     } else if (version != reducer_version()) {
                         acc.excluded.push(Excluded { event_id: e.id, reason: "version-skew" });
                     } else {
@@ -59,7 +61,9 @@ function apply_checkpoint(acc: Acc, e: WireEvent) -> void {
                         );
                     }
                 } else {
-                    acc.excluded.push(Excluded { event_id: e.id, reason: "missing-checkpoint-field" });
+                    acc.excluded.push(
+                        Excluded { event_id: e.id, reason: "missing-checkpoint-field" },
+                    );
                 }
             } else {
                 acc.excluded.push(Excluded { event_id: e.id, reason: "missing-checkpoint-field" });
@@ -72,7 +76,12 @@ function apply_checkpoint(acc: Acc, e: WireEvent) -> void {
     }
 }
 
-function checkpoint_body(root: string, heads: string[], version: string, lc: int) -> map<string, unknown> {
+function checkpoint_body(
+    root: string,
+    heads: string[],
+    version: string,
+    lc: int,
+) -> map<string, unknown> {
     let b: map<string, unknown> = {};
     let _ = b.set("state_root", root);
     let _ = b.set("heads", heads);
@@ -88,7 +97,15 @@ function only_checkpoint(r: Reduction) -> Checkpoint {
 
 test "valid checkpoint records with publisher and coverage" {
     let r = reduce(
-        [wire("CheckpointPublish", "task:A", 5, "e1", checkpoint_body("ab12", ["e0"], "bais.reduce@1", 4))],
+        [
+            wire(
+                "CheckpointPublish",
+                "task:A",
+                5,
+                "e1",
+                checkpoint_body("ab12", ["e0"], "bais.reduce@1", 4),
+            ),
+        ],
     );
     assert.equal(r.excluded.length(), 0);
     let c = only_checkpoint(r);
@@ -122,7 +139,15 @@ test "checkpoint with missing fields is excluded" {
 
 test "foreign reducer version is version-skew, not silent accept" {
     let r = reduce(
-        [wire("CheckpointPublish", "task:A", 5, "e1", checkpoint_body("ab12", ["e0"], "bais.reduce@99", 4))],
+        [
+            wire(
+                "CheckpointPublish",
+                "task:A",
+                5,
+                "e1",
+                checkpoint_body("ab12", ["e0"], "bais.reduce@99", 4),
+            ),
+        ],
     );
     assert.equal(r.checkpoints.length(), 0);
     assert.equal(r.excluded[0].reason, "version-skew")
@@ -131,8 +156,20 @@ test "foreign reducer version is version-skew, not silent accept" {
 test "checkpoints accumulate, latest wins by lc" {
     let r = reduce(
         [
-            wire("CheckpointPublish", "task:A", 5, "e1", checkpoint_body("aa", ["e0"], "bais.reduce@1", 4)),
-            wire("CheckpointPublish", "task:A", 9, "e2", checkpoint_body("bb", ["e0", "e1"], "bais.reduce@1", 8)),
+            wire(
+                "CheckpointPublish",
+                "task:A",
+                5,
+                "e1",
+                checkpoint_body("aa", ["e0"], "bais.reduce@1", 4),
+            ),
+            wire(
+                "CheckpointPublish",
+                "task:A",
+                9,
+                "e2",
+                checkpoint_body("bb", ["e0", "e1"], "bais.reduce@1", 8),
+            ),
         ],
     );
     assert.equal(r.checkpoints.length(), 2);

@@ -46,34 +46,93 @@ class DispatchVerdict {
 // not the issue reducer).
 function dispatch_event(t: EventType) -> DispatchVerdict {
     match (t) {
-        EventType.ProjectCreate => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-project-scope" },
-        EventType.ProjectPolicy => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-project-scope" },
-        EventType.SchemaRegister => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-schema-registry" },
-        EventType.TaskCreate => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" },
-        EventType.TaskSet => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" },
-        EventType.TaskTransition => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" },
-        EventType.LabelAdd => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" },
-        EventType.LabelRemove => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" },
-        EventType.RelAdd => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" },
-        EventType.RelRetract => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" },
-        EventType.CommentPost => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" },
-        EventType.LeaseClaim => DispatchVerdict { route: DispatchRoute.RouteCoordinator, reason: "ok-coordinator-claim" },
-        EventType.LeaseRenew => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-lease-log" },
-        EventType.LeaseRelease => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-lease-log" },
-        EventType.WorkSubmit => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-work-log" },
-        EventType.VerifyRecord => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-work-log" },
-        EventType.WorkAccept => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-work-log" },
-        EventType.WorkReject => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-work-log" },
-        EventType.BudgetAuthorize => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-budget-log" },
-        EventType.CostReserve => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-budget-log" },
-        EventType.CostIncurred => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-budget-log" },
-        EventType.ReceiptAttach => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-budget-log" },
-        EventType.CapGrant => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-cap-log" },
-        EventType.CapRevoke => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-cap-log" },
-        EventType.KeyRotate => DispatchVerdict { route: DispatchRoute.Reject, reason: "unrouted-key-model" },
-        EventType.CheckpointPublish => DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-checkpoint-log" },
-        EventType.Heartbeat => DispatchVerdict { route: DispatchRoute.RouteEphemeral, reason: "ok-ephemeral-pub" },
-        EventType.Progress => DispatchVerdict { route: DispatchRoute.RouteEphemeral, reason: "ok-ephemeral-pub" },
+        EventType.ProjectCreate => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-project-scope" }
+        },
+        EventType.ProjectPolicy => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-project-scope" }
+        },
+        EventType.SchemaRegister => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-schema-registry" }
+        },
+        EventType.TaskCreate => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" }
+        },
+        EventType.TaskSet => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" }
+        },
+        EventType.TaskTransition => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" }
+        },
+        EventType.LabelAdd => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" }
+        },
+        EventType.LabelRemove => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" }
+        },
+        EventType.RelAdd => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" }
+        },
+        EventType.RelRetract => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" }
+        },
+        EventType.CommentPost => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-issue-log" }
+        },
+        EventType.LeaseClaim => {
+            DispatchVerdict {
+                route: DispatchRoute.RouteCoordinator,
+                reason: "ok-coordinator-claim",
+            }
+        },
+        EventType.LeaseRenew => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-lease-log" }
+        },
+        EventType.LeaseRelease => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-lease-log" }
+        },
+        EventType.WorkSubmit => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-work-log" }
+        },
+        EventType.VerifyRecord => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-work-log" }
+        },
+        EventType.WorkAccept => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-work-log" }
+        },
+        EventType.WorkReject => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-work-log" }
+        },
+        EventType.BudgetAuthorize => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-budget-log" }
+        },
+        EventType.CostReserve => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-budget-log" }
+        },
+        EventType.CostIncurred => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-budget-log" }
+        },
+        EventType.ReceiptAttach => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-budget-log" }
+        },
+        EventType.CapGrant => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-cap-log" }
+        },
+        EventType.CapRevoke => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-cap-log" }
+        },
+        EventType.KeyRotate => {
+            DispatchVerdict { route: DispatchRoute.Reject, reason: "unrouted-key-model" }
+        },
+        EventType.CheckpointPublish => {
+            DispatchVerdict { route: DispatchRoute.AdmitDurable, reason: "ok-checkpoint-log" }
+        },
+        EventType.Heartbeat => {
+            DispatchVerdict { route: DispatchRoute.RouteEphemeral, reason: "ok-ephemeral-pub" }
+        },
+        EventType.Progress => {
+            DispatchVerdict { route: DispatchRoute.RouteEphemeral, reason: "ok-ephemeral-pub" }
+        },
     }
 }
 

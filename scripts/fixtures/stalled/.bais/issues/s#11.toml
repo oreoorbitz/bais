@@ -1,0 +1,10 @@
+id = "s#11"
+title = "dep two"
+status = "Open"
+kind = "Feat"
+body = "b"
+
+[[edge]]
+from = "s#11"
+to = "s#10"
+kind = "DependsOn"

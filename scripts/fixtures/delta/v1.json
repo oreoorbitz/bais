@@ -1,0 +1,217 @@
+{
+  "format": "bais.delta-fixture@1",
+  "reducer_version": "bais.reduce@1",
+  "seed": 47,
+  "events": [
+    {
+      "id": "fx-001",
+      "author": "did:key:z6Mk-test",
+      "seq": 1,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:A",
+      "refs": [],
+      "lc": 1,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "TaskCreate",
+      "body": {
+        "title": "flare",
+        "kind": "Feat",
+        "body": "fx"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-002",
+      "author": "did:key:z6Mk-test",
+      "seq": 2,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:A",
+      "refs": [],
+      "lc": 2,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "TaskTransition",
+      "body": {
+        "to": "Doing"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-003",
+      "author": "did:key:z6Mk-test",
+      "seq": 3,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:A",
+      "refs": [],
+      "lc": 3,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "LabelAdd",
+      "body": {
+        "label": "backend"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-004",
+      "author": "did:key:z6Mk-test",
+      "seq": 4,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:A",
+      "refs": [],
+      "lc": 4,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "TaskTransition",
+      "body": {
+        "to": "Done"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-005",
+      "author": "did:key:z6Mk-test",
+      "seq": 5,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:A",
+      "refs": [],
+      "lc": 5,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "CommentPost",
+      "body": {
+        "text": "note-alpha"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-006",
+      "author": "did:key:z6Mk-test",
+      "seq": 6,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:B",
+      "refs": [],
+      "lc": 6,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "TaskCreate",
+      "body": {
+        "title": "delta",
+        "kind": "Feat",
+        "body": "fx"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-007",
+      "author": "did:key:z6Mk-test",
+      "seq": 7,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:B",
+      "refs": [],
+      "lc": 7,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "TaskTransition",
+      "body": {
+        "to": "Doing"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-008",
+      "author": "did:key:z6Mk-test",
+      "seq": 8,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:B",
+      "refs": [],
+      "lc": 8,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "CommentPost",
+      "body": {
+        "text": "note-ember"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-009",
+      "author": "did:key:z6Mk-test",
+      "seq": 9,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:C",
+      "refs": [],
+      "lc": 9,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "TaskCreate",
+      "body": {
+        "title": "ember",
+        "kind": "Feat",
+        "body": "fx"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-010",
+      "author": "did:key:z6Mk-test",
+      "seq": 10,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:C",
+      "refs": [],
+      "lc": 10,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "TaskSet",
+      "body": {
+        "title": "retitled-flare"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-011",
+      "author": "did:key:z6Mk-test",
+      "seq": 11,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:C",
+      "refs": [],
+      "lc": 11,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "TaskTransition",
+      "body": {
+        "to": "Doing"
+      },
+      "admitted": true,
+      "drop_reason": null
+    },
+    {
+      "id": "fx-012",
+      "author": "did:key:z6Mk-test",
+      "seq": 12,
+      "prev": null,
+      "project": "bi",
+      "entity": "task:C",
+      "refs": [],
+      "lc": 12,
+      "ts": "2026-09-03T00:00:00Z",
+      "type": "TaskTransition",
+      "body": {
+        "to": "Done"
+      },
+      "admitted": true,
+      "drop_reason": null
+    }
+  ]
+}

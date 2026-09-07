@@ -1,0 +1,25 @@
+id = "t#01"
+title = "hub titan"
+status = "Open"
+kind = "Feat"
+area = "bais/multi-agent"
+body = """
+Load-bearing hub work.
+Files: titan.ts
+Acceptance: hub lands with its diff under review; whole-pack suite passes.
+"""
+
+[[edge]]
+from = "t#02"
+to = "t#01"
+kind = "DependsOn"
+
+[[edge]]
+from = "t#03"
+to = "t#01"
+kind = "DependsOn"
+
+[[edge]]
+from = "t#04"
+to = "t#01"
+kind = "DependsOn"

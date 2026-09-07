@@ -32,6 +32,29 @@ const { clock } = await import(`${BAIS}/scripts/clock.mjs`).then((m) => m.clockF
 // live clock, but they only verify hashes/roots — no wall-clock gates.
 console.log(`info: wall-clock ${clock.fixed ? `pinned at ${clock.nowISO()}` : "live"}`);
 
+// Grandchild-loopback preflight: the CLI bootstrap section below spawns
+// `bais sync --from` as a child that fetches the in-process test hub over
+// localhost. Sandboxed runners that block that IPC hang there until the
+// tier timeout (600s of nothing) — so probe first and SKIP loud instead.
+// Zero assertions on the skip path; exit zero like every loud skip.
+{
+	const { createServer } = await import("node:http");
+	const srv = createServer((req, res) => res.end("pong"));
+	await new Promise((res) => srv.listen(0, "127.0.0.1", res));
+	const port = srv.address().port;
+	let childOk = false;
+	try {
+		const { execFileSync: execSync } = await import("node:child_process");
+		const out = execSync("node", ["-e", `fetch("http://127.0.0.1:${port}/").then((r) => r.text()).then((t) => console.log(t))`], { encoding: "utf8", timeout: 15000 });
+		childOk = out.trim() === "pong";
+	} catch {}
+	await new Promise((res) => srv.close(res));
+	if (!childOk) {
+		console.log("SKIP [t1] sync-test: exec'd child cannot fetch loopback (sandboxed grandchild IPC) — run hub + CLI as sibling processes per the file header instead");
+		process.exit(0);
+	}
+}
+
 let failures = 0;
 const check = (cond, msg) => {
 	if (!cond) {

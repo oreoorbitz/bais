@@ -1,0 +1,10 @@
+id = "t#a4"
+title = "t#a4 unreferenced leaf"
+status = "Done"
+kind = "Feat"
+body = """
+Prose-only Done on a leaf (open_downstream = 0). The AUDIT gate is
+quiet here — non-load-bearing closes are unaffected. (The bi#83
+close-evidence gate may still have its own say; that is not this
+gate's verdict.)
+"""

@@ -1,0 +1,10 @@
+id = "b#04"
+title = "blocked-set hub dependency"
+status = "Open"
+kind = "Feat"
+area = "demo/other"
+body = """
+The dependency gamma waits on; disjoint surface so it cohorts with nothing.
+Acceptance: hub closes on its own acceptance.
+Files: hub.ts
+"""

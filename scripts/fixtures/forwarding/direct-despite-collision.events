@@ -1,0 +1,8 @@
+# Direct hop over a footprint collision (src/shared.ts): must be REFUSED at line 6.
+chain: inv-forward-5
+branch: ingest owner=titan-1 files=src/shared.ts,src/ingest.ts
+branch: query owner=titan-2 files=src/shared.ts,src/query.ts
+branch: export owner=titan-3 files=src/export.ts
+forward: ingest to=query via=direct handoff=handoff-041
+forward: query to=export via=direct handoff=handoff-042
+broadcast: to=merger chain=inv-forward-5 result=done ref=handoff-043

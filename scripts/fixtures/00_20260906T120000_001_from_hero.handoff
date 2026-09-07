@@ -1,0 +1,15 @@
+id: handoff-001
+from: hero
+to: titan-1
+priority: 00
+type: diff
+created_at: 2026-09-06T02:00:00Z
+
+base: 0123456789abcdef0123456789abcdef01234567
+diff --git a/a.ts b/a.ts
+--- a/a.ts
++++ b/a.ts
+@@ -1 +1 @@
+-old
++new
+Evidence: drill(handoff-validate)

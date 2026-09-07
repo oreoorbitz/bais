@@ -1,0 +1,16 @@
+id = "b#03"
+title = "blocked-set gamma waits on hub"
+status = "Open"
+kind = "Feat"
+area = "demo/cohort"
+body = """
+Gamma slice shares the surface but is ordered after b#04, so cohesion must
+not pull it ahead: it excludes with reason.
+Acceptance: gamma closes on its own acceptance; gamma red-checks its own hunk.
+Files: face.ts gamma.ts
+"""
+
+[[edge]]
+from = "b#03"
+to = "b#04"
+kind = "DependsOn"

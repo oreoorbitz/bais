@@ -1,0 +1,9 @@
+id = "t#a1"
+title = "t#a1 load-bearing anchor"
+status = "Done"
+kind = "Feat"
+body = """
+Closed on prose alone: no Evidence line at all. The audit gate must
+refuse this loudly with AUDIT_REQUIRED (first close attempt on a
+load-bearing node), even though no other gate has seen it yet.
+"""

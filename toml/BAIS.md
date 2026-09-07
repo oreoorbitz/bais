@@ -51,6 +51,30 @@ No new delimiters, no new value types, no alternative quoting.
 
 Agent rule: claim with a stable owner id before starting, renew (heartbeat) while working, release by moving on completion. If you die, your lease expires and anyone may reap.
 
+## File footprints + swarm dispatch (bi#123)
+
+Parallel agents share one checkout, so the dispatcher must know what files an
+issue will touch. Declare them in `body` markdown, one `Files:` line per
+group (same line convention as `Evidence:` in bi#83):
+
+```
+Files: bais/src/graph.ts bais/src/cli.ts
+Files: bais/baml_src/main.baml  # second group, unions with the first
+```
+
+Paths are relative to the project root, space-separated, `#` comments
+stripped. A `Files:` prefix means declared — even `Files:` empty (touches no
+files is a real claim). No prefix means `unknown`: the issue still packs, but
+the operator must confirm the footprint by hand.
+
+`bais dispatch --agents N [--json]` dry-runs the pack: ready + unclaimed
+issues, greedy by open blast radius, skipping live claims and file
+clashes with already-packed slots. Text rows read
+`slot0<TAB><id><TAB>br=N<TAB>files: a.ts,b.ts|<unknown><TAB><title>`.
+Dispatch never mutates — agents claim for themselves, so proxy claims cannot
+break the lease model. Reference: BAML `dispatch_pack` (`baml test`), mirrored
+by both hosts; `bais/scripts/dispatch.mjs` proves the CLI end to end.
+
 ## Evolving BAIS without deviating from training data
 
 When you need a new field or kind, extend BAML (`Kind.NewKind`, `Issue.new_field?: type`) and document it here as an *additive* convention:

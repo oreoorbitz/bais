@@ -1,0 +1,13 @@
+id = "t#a1"
+title = "t#a1 load-bearing anchor"
+status = "Open"
+kind = "Feat"
+body = """
+Anchor with two live dependents (t#a2, t#a3): open_downstream = 2,
+load-bearing at any threshold <= 2.
+
+Requirement: re-read the issue and its handoff before auditing
+Requirement: every requirement and acceptance clause traces to evidence
+Requirement: boundaries and failure cases are examined
+Acceptance: every finding is fixed and re-audited
+"""

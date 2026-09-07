@@ -1,0 +1,12 @@
+id = "t#a6"
+title = "t#a6 sole dependent"
+status = "Open"
+kind = "Feat"
+body = """
+Depends on t#a5: the single vote that makes the boundary exact.
+"""
+
+[[edge]]
+from = "t#a6"
+to = "t#a5"
+kind = "DependsOn"

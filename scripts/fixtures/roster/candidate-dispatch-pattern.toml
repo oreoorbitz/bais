@@ -1,0 +1,16 @@
+# Candidate skill — orchestration-level learning. The operator asked for
+# dispatch patterns to be filed as issues; on read the hero must NOT file
+# this in any specialist library — it escalates to the coordinator
+# library (domain-scoped accumulation: no specialist retains it).
+
+[skill]
+id = "dispatch-pattern-001"
+title = "Dispatch pattern: pack specialists before leasing generalists"
+tags = ["dispatch", "coordination"]
+filed_in = "phpjoe"
+body = """
+When a goal sketches more components than ready specialists, pack the
+matched specialists first and hold the remainder for the next round
+rather than leasing generalists early. The operator asked to file
+dispatch patterns as issues.
+"""

@@ -784,6 +784,17 @@ test "non-ordering edge kinds cannot form a cycle" {
 //   by this issue — derivable from edges alone, no status reads).
 // - Live: days parked with saturating decay (a week per point, capped at 2)
 //   so old trivia never outranks fresh breakage.
+// - Live/cost (bi#52): metered tokens per task as a capped, saturating
+//   component (half the task cap = 1, at/over the cap = 2, max 2). The
+//   host meters spend (CostIncurred events); BAML owns this policy. The
+//   join reads the `spent` table (task -> admitted incurred tokens);
+//   missing or negative entries count as 0: unknown spend never inflates.
+//   Burn-to-look-important defense: the component saturates at 2, so the
+//   max non-override total is 4 + 6 + 2 + 2 = 14, still below the
+//   severity-5 hatch (15) — infinite burn cannot reach override
+//   territory. The receipt names cost_part + incurred_tokens, so burn is
+//   visible; oversight outlier review (budget_overruns/caps_over_budget
+//   feeds) is the second eye. Human severity is never rewritten.
 //
 // Clocks (bi#42 split): the host owns clocks, BAML owns policy. Issue and
 // CostEntry carry no timestamps, so staleness cannot be derived from declared
@@ -794,13 +805,17 @@ test "non-ordering edge kinds cannot form a cycle" {
 // urgency.
 class Urgency {
     issue_id: string,
-    score: int @description("severity_part + blocks_part + stalled_part — always read with the parts"),
+    score: int @description(
+        "severity_part + blocks_part + stalled_part + cost_part — always read with the parts",
+    ),
     severity_part: int,
     fan_out: int @description("Blocks edges out of this issue (raw count, pre-cap)"),
     sole_unblocks: int @description("downstream solely blocked by this issue (raw count, pre-cap)"),
     blocks_part: int,
     stalled_days: int @description("parked days actually counted (clamped at 0, uncapped)"),
     stalled_part: int,
+    incurred_tokens: int @description("metered spend actually counted (clamped at 0, uncapped — the audit trail)"),
+    cost_part: int @description("capped spend component 0-2: burn can nudge, never override"),
 }
 
 function urgency_severity(issue: Issue) -> int {
@@ -886,22 +901,60 @@ function urgency_stalled(stalled_days: int) -> int {
     }
 }
 
-function urgency(issue: Issue, edges: Edge[], costs: map<string, int>, now: int) -> Urgency {
+// Per-task spend cap for the urgency join (bi#52): POLICY, not a budget —
+// the spend level at which the cost component saturates. Lives in a
+// function (not a literal) so the host mirror names the same constant
+// (URGENCY_COST_CAP_TOKENS in bais/src/graph.ts); the two must agree.
+function urgency_cost_cap() -> int {
+    1000
+}
+
+// Capped, saturating spend component: half the cap nudges (+1), at/over
+// the cap saturates (+2). Anything above the cap scores the same —
+// infinite burn buys nothing past this point.
+function urgency_cost(incurred_tokens: int) -> int {
+    if (incurred_tokens <= 0) {
+        0
+    } else if (incurred_tokens >= urgency_cost_cap()) {
+        2
+    } else if (incurred_tokens >= urgency_cost_cap() / 2) {
+        1
+    } else {
+        0
+    }
+}
+
+function urgency(
+    issue: Issue,
+    edges: Edge[],
+    costs: map<string, int>,
+    now: int,
+    spent: map<string, int>,
+) -> Urgency {
     let sev = urgency_severity(issue);
     let fan = blocks_fan_out(issue, edges);
     let sole = sole_unblocks(issue, edges);
     let blocks = urgency_blocks(issue, edges);
     let days = urgency_stalled_days(issue, costs, now);
     let stalled = urgency_stalled(days);
+    let raw_spent = spent.get(issue.id) ?? 0;
+    let incurred = if (raw_spent < 0) {
+        0
+    } else {
+        raw_spent
+    };
+    let cost = urgency_cost(incurred);
     Urgency {
         issue_id: issue.id,
-        score: sev + blocks + stalled,
+        score: sev + blocks + stalled + cost,
         severity_part: sev,
         fan_out: fan,
         sole_unblocks: sole,
         blocks_part: blocks,
         stalled_days: days,
         stalled_part: stalled,
+        incurred_tokens: incurred,
+        cost_part: cost,
     }
 }
 
@@ -934,12 +987,13 @@ test "urgency orders fan-out hub above leaf" {
     ];
     // No creation days stamped: unknown age counts as fresh (stalled 0).
     let costs: map<string, int> = {};
-    let hub_u = urgency(hub, edges, costs, 100);
+    let spent: map<string, int> = {};
+    let hub_u = urgency(hub, edges, costs, 100, spent);
     assert.equal(hub_u.fan_out, 4);
     assert.equal(hub_u.sole_unblocks, 4);
     assert.equal(hub_u.blocks_part, 6);
     assert.equal(hub_u.score, 8);
-    let leaf_u = urgency(leaves[0], edges, costs, 100);
+    let leaf_u = urgency(leaves[0], edges, costs, 100, spent);
     assert.equal(leaf_u.blocks_part, 0);
     assert.equal(leaf_u.score, 2);
     assert.equal(hub_u.score > leaf_u.score, true)
@@ -957,10 +1011,11 @@ test "severity-5 overrides a high structural score" {
     // Hub is maximally structural AND 60 days stale: 3 + 6 + 2 = 11.
     let costs: map<string, int> = {};
     let _ = costs.set("bi#21", 40);
-    let hub_u = urgency(hub, edges, costs, 100);
+    let spent: map<string, int> = {};
+    let hub_u = urgency(hub, edges, costs, 100, spent);
     assert.equal(hub_u.score, 11);
     // Fresh severity-5 leaf: the override hatch alone scores 15.
-    let hatch_u = urgency(hatch, edges, costs, 100);
+    let hatch_u = urgency(hatch, edges, costs, 100, spent);
     assert.equal(hatch_u.severity_part, 15);
     assert.equal(hatch_u.score, 15);
     assert.equal(hatch_u.score > hub_u.score, true)
@@ -972,11 +1027,12 @@ test "60-day trivia loses to fresh severity-4" {
     let edges: Edge[] = [];
     let costs: map<string, int> = {};
     let _ = costs.set("bi#30", 40);
-    let old_u = urgency(trivia, edges, costs, 100);
+    let spent: map<string, int> = {};
+    let old_u = urgency(trivia, edges, costs, 100, spent);
     assert.equal(old_u.stalled_days, 60);
     assert.equal(old_u.stalled_part, 2);
     assert.equal(old_u.score, 3);
-    let fresh_u = urgency(fresh, edges, costs, 100);
+    let fresh_u = urgency(fresh, edges, costs, 100, spent);
     assert.equal(fresh_u.stalled_part, 0);
     assert.equal(fresh_u.score, 4);
     assert.equal(old_u.score < fresh_u.score, true)
@@ -989,8 +1045,9 @@ test "staleness saturates: older alone never keeps winning" {
     let costs: map<string, int> = {};
     let _ = costs.set("bi#40", 70);
     let _ = costs.set("bi#41", 10);
-    let au = urgency(a, edges, costs, 100);
-    let bu = urgency(b, edges, costs, 100);
+    let spent: map<string, int> = {};
+    let au = urgency(a, edges, costs, 100, spent);
+    let bu = urgency(b, edges, costs, 100, spent);
     assert.equal(au.stalled_days, 30);
     assert.equal(bu.stalled_days, 90);
     assert.equal(au.stalled_part, 2);
@@ -1003,7 +1060,8 @@ test "urgency receipt adds up and names every component" {
     let edges = [Edge { from: "bi#50", to: "bi#51", kind: EdgeKind.Blocks }];
     let costs: map<string, int> = {};
     let _ = costs.set("bi#50", 94);
-    let u = urgency(issue, edges, costs, 100);
+    let spent: map<string, int> = {};
+    let u = urgency(issue, edges, costs, 100, spent);
     // urgency 5 = severity 3 + blocks 2 + stalled 6d (0 pts).
     assert.equal(u.issue_id, "bi#50");
     assert.equal(u.severity_part, 3);
@@ -1012,7 +1070,9 @@ test "urgency receipt adds up and names every component" {
     assert.equal(u.blocks_part, 2);
     assert.equal(u.stalled_days, 6);
     assert.equal(u.stalled_part, 0);
-    assert.equal(u.score, u.severity_part + u.blocks_part + u.stalled_part);
+    assert.equal(u.incurred_tokens, 0);
+    assert.equal(u.cost_part, 0);
+    assert.equal(u.score, u.severity_part + u.blocks_part + u.stalled_part + u.cost_part);
     assert.equal(u.score, 5)
 }
 
@@ -1022,10 +1082,11 @@ test "missing or future creation day counts as fresh" {
     let edges: Edge[] = [];
     let costs: map<string, int> = {};
     let _ = costs.set("bi#61", 105);
-    let mu = urgency(missing, edges, costs, 100);
+    let spent: map<string, int> = {};
+    let mu = urgency(missing, edges, costs, 100, spent);
     assert.equal(mu.stalled_days, 0);
     assert.equal(mu.stalled_part, 0);
-    let fu = urgency(future, edges, costs, 100);
+    let fu = urgency(future, edges, costs, 100, spent);
     assert.equal(fu.stalled_days, 0);
     assert.equal(fu.stalled_part, 0)
 }
@@ -1034,7 +1095,8 @@ test "null severity contributes nothing" {
     let issue = urgency_issue("bi#80", null);
     let edges: Edge[] = [];
     let costs: map<string, int> = {};
-    let u = urgency(issue, edges, costs, 100);
+    let spent: map<string, int> = {};
+    let u = urgency(issue, edges, costs, 100, spent);
     assert.equal(u.severity_part, 0);
     assert.equal(u.score, 0)
 }
@@ -1047,11 +1109,100 @@ test "shared blockers split the one-away bonus but keep fan-out" {
         Edge { from: "bi#99", to: "bi#72", kind: EdgeKind.Blocks },
     ];
     let costs: map<string, int> = {};
-    let u = urgency(hub, edges, costs, 100);
+    let spent: map<string, int> = {};
+    let u = urgency(hub, edges, costs, 100, spent);
     assert.equal(u.fan_out, 2);
     // bi#72 has a second blocker, so only bi#71 is one-completion-away.
     assert.equal(u.sole_unblocks, 1);
     assert.equal(u.blocks_part, 3)
+}
+
+test "cost component rises with spend and saturates below override territory" {
+    let issue = urgency_issue("bi#90", 2);
+    let edges: Edge[] = [];
+    let costs: map<string, int> = {};
+    // No metered spend: no component, unknown spend never inflates.
+    let none: map<string, int> = {};
+    let u0 = urgency(issue, edges, costs, 100, none);
+    assert.equal(u0.incurred_tokens, 0);
+    assert.equal(u0.cost_part, 0);
+    assert.equal(u0.score, 2);
+    // Below half the cap: still nothing.
+    let low: map<string, int> = {};
+    let _ = low.set("bi#90", 499);
+    let u1 = urgency(issue, edges, costs, 100, low);
+    assert.equal(u1.cost_part, 0);
+    // Half the cap nudges; at the cap it saturates.
+    let half: map<string, int> = {};
+    let _ = half.set("bi#90", 500);
+    let u2 = urgency(issue, edges, costs, 100, half);
+    assert.equal(u2.cost_part, 1);
+    assert.equal(u2.score, 3);
+    let cap: map<string, int> = {};
+    let _ = cap.set("bi#90", 1000);
+    let u3 = urgency(issue, edges, costs, 100, cap);
+    assert.equal(u3.incurred_tokens, 1000);
+    assert.equal(u3.cost_part, 2);
+    // Infinite burn buys nothing past the cap: 1M tokens scores the same.
+    let whale: map<string, int> = {};
+    let _ = whale.set("bi#90", 1000000);
+    let u4 = urgency(issue, edges, costs, 100, whale);
+    assert.equal(u4.incurred_tokens, 1000000);
+    assert.equal(u4.cost_part, 2);
+    assert.equal(u4.score, 4);
+    // Receipt still adds up with the cost component named.
+    assert.equal(u4.score, u4.severity_part + u4.blocks_part + u4.stalled_part + u4.cost_part);
+    // Negative spend clamps to 0 — it can never deflate or inflate.
+    let neg: map<string, int> = {};
+    let _ = neg.set("bi#90", 0 - 50);
+    let u5 = urgency(issue, edges, costs, 100, neg);
+    assert.equal(u5.incurred_tokens, 0);
+    assert.equal(u5.cost_part, 0)
+}
+
+test "severity stays 2 while cost crosses its cap: urgency rises, hatch untouched" {
+    // Acceptance fixture (bi#52): one task's incurred cost crosses its cap
+    // while its human severity stays 2. Computed urgency must rise WITH
+    // the cost component named, capped below severity-5-override
+    // territory, and the human severity must be untouched.
+    let cheap = urgency_issue("bi#91", 2);
+    let pricey = urgency_issue("bi#92", 2);
+    let edges: Edge[] = [];
+    let costs: map<string, int> = {};
+    let spent: map<string, int> = {};
+    let _ = spent.set("bi#92", 1200);
+    let cheap_u = urgency(cheap, edges, costs, 100, spent);
+    let pricey_u = urgency(pricey, edges, costs, 100, spent);
+    assert.equal(cheap_u.cost_part, 0);
+    assert.equal(cheap_u.score, 2);
+    assert.equal(pricey_u.incurred_tokens, 1200);
+    assert.equal(pricey_u.cost_part, 2);
+    assert.equal(pricey_u.score, 4);
+    assert.equal(pricey_u.score > cheap_u.score, true);
+    // Human severity is never rewritten: both inputs still declare 2, and
+    // the declared part still counts exactly 2.
+    assert.equal(cheap.severity, 2);
+    assert.equal(pricey.severity, 2);
+    assert.equal(pricey_u.severity_part, 2);
+    // Even maximally structural + stale + burnt, a non-override issue
+    // (4 + 6 + 2 + 2 = 14) stays below the severity-5 hatch (15).
+    let hub = urgency_issue("bi#93", 4);
+    let hub_edges = [
+        Edge { from: "bi#93", to: "bi#94", kind: EdgeKind.Blocks },
+        Edge { from: "bi#93", to: "bi#95", kind: EdgeKind.Blocks },
+        Edge { from: "bi#93", to: "bi#96", kind: EdgeKind.Blocks },
+        Edge { from: "bi#93", to: "bi#97", kind: EdgeKind.Blocks },
+    ];
+    let stale: map<string, int> = {};
+    let _ = stale.set("bi#93", 40);
+    let burnt: map<string, int> = {};
+    let _ = burnt.set("bi#93", 1000000);
+    let hub_u = urgency(hub, hub_edges, stale, 100, burnt);
+    assert.equal(hub_u.score, 14);
+    let hatch = urgency_issue("bi#98", 5);
+    let hatch_u = urgency(hatch, [], stale, 100, burnt);
+    assert.equal(hatch_u.score, 15);
+    assert.equal(hatch_u.score > hub_u.score, true)
 }
 
 // ── ready --why-not ─────────────────────────────────────────────────────────
@@ -1128,14 +1279,22 @@ function lease_for(entity: string, leases: IssueLease[]) -> IssueLease? {
     null
 }
 
-function why_not(issues: Issue[], edges: Edge[], project: string, leases: IssueLease[]) -> WhyNot[] {
+function why_not(
+    issues: Issue[],
+    edges: Edge[],
+    project: string,
+    leases: IssueLease[],
+) -> WhyNot[] {
     let out: WhyNot[] = [];
     let cyclic = cyclic_ids(issues, edges);
     for (let issue in issues) {
         // Omission gate: ready on every path is Open + unblocked (+ unleased
         // where the store knows leases — the scan path passes []). An issue
         // that survives it is listed as ready and carries no reason.
-        if (issue.status == Status.Open && (is_blocked(issue, edges, issues) || lease_for(issue.id, leases) != null)) {
+        if (
+            issue.status == Status.Open
+                && (is_blocked(issue, edges, issues) || lease_for(issue.id, leases) != null)
+        ) {
             // Each still-blocking Blocks edge contributes its own reason: a
             // resolved-but-unclosed blocker names the blocker + its status, an
             // unresolvable blocker names the dangling end + Missing/External.
@@ -1243,7 +1402,15 @@ test "why-not blocked-by names the blocker, its status, and the edge" {
     assert.equal(reasons[0].edge_to, "bi#02");
     assert.equal(reasons[0].edge_kind, "Blocks");
     // The blocker itself is ready, so it carries no reason.
-    assert.equal(contains_id(reasons.map((r) -> { r.id }), "bi#01"), false)
+    assert.equal(
+        contains_id(
+            reasons.map((r) -> {
+                r.id
+            }),
+            "bi#01",
+        ),
+        false,
+    )
 }
 
 test "why-not is empty for ready issues and resolved blockers free silently" {
@@ -1324,4 +1491,693 @@ test "why-not skips non-Open issues: status is self-describing" {
     // need an edge/lease/cycle to justify them.
     let issues = [mk_issue("bi#01", Status.Doing), mk_issue("bi#02", Status.Blocked)];
     assert.equal(why_not(issues, [], "bi", []).length(), 0)
+}
+
+// ── Blast radius (bi#122) ───────────────────────────────────────────────────
+// ready_issues answers "what can be worked now" as a SET, and urgency (bi#51)
+// scores one issue at a time with only DIRECT Blocks fan-out. Neither shows
+// that closing one node unblocks a whole transitive fan-out through DependsOn
+// chains (bi#32 holds 13 Open issues behind it, almost all via bi#69).
+// blast_radii closes that gap: per issue, the TRANSITIVE dependents through
+// the two ordering kinds (DependsOn/Blocks, same `precedes` relation the
+// cycle detector uses), split into open_downstream (work actually held —
+// the load-bearing number dispatchers sort on) and total_downstream (every
+// declared dependent, including Done ones already freed).
+//
+// Deliberately status-blind about the hub itself: a Done anchor with a live
+// Open fan-out still reports it (the edge may be stale — that is
+// dangling_edge_refs' or a follow-up's problem, not a reason to hide the
+// shape). A dependent naming an id that was never loaded counts in total
+// but never in open: we can see the declaration, we cannot prove it is work.
+// No declared override field: derivation from edges is the mechanism, and a
+// human label the issue body can already carry stays out of the pure function.
+class BlastRadius {
+    id: string,
+    open_downstream: int @description("transitive Open dependents — the load-bearing number"),
+    total_downstream: int @description("every transitive dependent, including Done/Dropped/unseen"),
+}
+
+function direct_dependents(id: string, edges: Edge[]) -> string[] {
+    let out: string[] = [];
+    for (let e in edges) {
+        if ((e.kind == EdgeKind.DependsOn || e.kind == EdgeKind.Blocks) && e.to == id) {
+            if (!contains_id(out, e.from)) {
+                out.push(e.from);
+            }
+        }
+    }
+    out
+}
+
+function is_open_status(id: string, issues: Issue[]) -> bool {
+    for (let i in issues) {
+        if (i.id == id) {
+            return i.status == Status.Open;
+        }
+    }
+    false
+}
+
+function blast_radii(issues: Issue[], edges: Edge[]) -> BlastRadius[] {
+    let out: BlastRadius[] = [];
+    for (let hub in issues) {
+        // Fixpoint over direct_dependents; the seen-guard makes cycles and
+        // diamonds terminate, and the root is excluded so a cycle never
+        // counts the hub as its own downstream.
+        let seen: string[] = [];
+        let frontier = direct_dependents(hub.id, edges);
+        while (frontier.length() > 0) {
+            let next: string[] = [];
+            for (let id in frontier) {
+                if (!contains_id(seen, id)) {
+                    seen.push(id);
+                    for (let d in direct_dependents(id, edges)) {
+                        if (!contains_id(seen, d)) {
+                            next.push(d);
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let open = 0;
+        let total = 0;
+        for (let id in seen) {
+            if (id != hub.id) {
+                total = total + 1;
+                if (is_open_status(id, issues)) {
+                    open = open + 1;
+                }
+            }
+        }
+        out.push(BlastRadius { id: hub.id, open_downstream: open, total_downstream: total });
+    }
+    out
+}
+
+function blast_of(id: string, rows: BlastRadius[]) -> BlastRadius {
+    for (let r in rows) {
+        if (r.id == id) {
+            return r;
+        }
+    }
+    BlastRadius { id: id, open_downstream: 0, total_downstream: 0 }
+}
+
+test "blast radius counts transitive open dependents through mixed kinds" {
+    let issues = [
+        mk_issue("bi#10", Status.Open),
+        mk_issue("bi#11", Status.Open),
+        mk_issue("bi#12", Status.Open),
+        mk_issue("bi#13", Status.Open),
+        mk_issue("bi#14", Status.Done),
+    ];
+    let edges = [
+        Edge { from: "bi#11", to: "bi#10", kind: EdgeKind.DependsOn },
+        Edge { from: "bi#12", to: "bi#10", kind: EdgeKind.Blocks },
+        Edge { from: "bi#13", to: "bi#11", kind: EdgeKind.DependsOn },
+        Edge { from: "bi#14", to: "bi#10", kind: EdgeKind.DependsOn },
+    ];
+    let rows = blast_radii(issues, edges);
+    // bi#10 holds three Open issues (11, 12, and 13 transitively) plus one
+    // Done dependent counted in total only.
+    let hub = blast_of("bi#10", rows);
+    assert.equal(hub.open_downstream, 3);
+    assert.equal(hub.total_downstream, 4);
+    // Mid-chain bi#11 holds only bi#13.
+    let mid = blast_of("bi#11", rows);
+    assert.equal(mid.open_downstream, 1);
+    assert.equal(mid.total_downstream, 1);
+    // Leaves and Done dependents hold nothing.
+    assert.equal(blast_of("bi#13", rows).open_downstream, 0);
+    assert.equal(blast_of("bi#14", rows).total_downstream, 0)
+}
+
+test "blast radius ignores Related and terminates on cycles" {
+    let issues = [mk_issue("bi#01", Status.Open), mk_issue("bi#02", Status.Open), mk_issue("bi#03", Status.Open)];
+    let edges = [
+        Edge { from: "bi#01", to: "bi#02", kind: EdgeKind.DependsOn },
+        Edge { from: "bi#02", to: "bi#01", kind: EdgeKind.DependsOn },
+        Edge { from: "bi#03", to: "bi#01", kind: EdgeKind.Related },
+    ];
+    let rows = blast_radii(issues, edges);
+    // The pair holds each other and nothing else; neither counts itself.
+    assert.equal(blast_of("bi#01", rows).open_downstream, 1);
+    assert.equal(blast_of("bi#01", rows).total_downstream, 1);
+    assert.equal(blast_of("bi#02", rows).open_downstream, 1);
+    // Related-only bi#03 holds nothing and is held by nothing.
+    assert.equal(blast_of("bi#03", rows).open_downstream, 0);
+    assert.equal(blast_of("bi#03", rows).total_downstream, 0)
+}
+
+test "blast radius counts a dangling dependent in total, never in open" {
+    let issues = [mk_issue("bi#02", Status.Open)];
+    // bi#99 was never loaded: the declaration is visible, the work is not.
+    let edges = [Edge { from: "bi#99", to: "bi#02", kind: EdgeKind.DependsOn }];
+    let rows = blast_radii(issues, edges);
+    assert.equal(blast_of("bi#02", rows).open_downstream, 0);
+    assert.equal(blast_of("bi#02", rows).total_downstream, 1)
+}
+
+// ── Swarm dispatch pack (bi#123) ────────────────────────────────────────────
+// Asking for "a batch of agents on the backlog" picks arbitrarily unless the
+// pack is workload-aware: load-bearing issues first, live claims never
+// double-assigned, file footprints never shared between slots. dispatch_pack
+// is that pack as a PURE function — the CLI dry-runs it, the operator spawns
+// agents from the printout, and each agent claims for itself (proxy claims
+// would break the lease model, so dispatch never mutates).
+//
+// Inputs follow the clocks/policy split (bi#42): the host owns clocks and
+// body parsing, BAML owns the packing rule. `leased` is the precomputed
+// live-claim set (host compares holder/lease against the wall clock);
+// `footprints` is the parsed `Files:` body convention (BAIS.md) as plain
+// data. An issue with no FileClaim packs freely but the CLI flags it
+// `files: unknown` — undeclared footprints are operator-confirmed, never
+// silently safe. Greedy by open blast radius (ties: id ascending), skipping
+// packed/leased/unready issues and file clashes with already-packed slots.
+class FileClaim {
+    issue_id: string,
+    files: string[],
+}
+
+class AgentSlot {
+    slot: int,
+    issue_id: string,
+}
+
+function parse_file_claims(body: string) -> string[] {
+    let out: string[] = [];
+    for (let line in body.lines()) {
+        let t = line.trim();
+        if (t.starts_with("Files:")) {
+            let rest = t.slice(6, t.length()).trim();
+            let hash = rest.index_of("#");
+            if (hash != null) {
+                rest = rest.slice(0, hash).trim();
+            }
+            for (let part in rest.split(" ")) {
+                let p = part.trim();
+                if (p != "" && !contains_id(out, p)) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    out
+}
+
+function files_for(id: string, footprints: FileClaim[]) -> string[] {
+    for (let fc in footprints) {
+        if (fc.issue_id == id) {
+            return fc.files;
+        }
+    }
+    []
+}
+
+function files_clash(a: string[], b: string[]) -> bool {
+    for (let x in a) {
+        if (contains_id(b, x)) {
+            return true;
+        }
+    }
+    false
+}
+
+function dispatch_pack(
+    issues: Issue[],
+    edges: Edge[],
+    leased: string[],
+    footprints: FileClaim[],
+    budget: int,
+) -> AgentSlot[] {
+    let slots: AgentSlot[] = [];
+    if (budget <= 0) {
+        return slots;
+    }
+    let radii = blast_radii(issues, edges);
+    let ready = ready_issues(issues, edges);
+    let packed: string[] = [];
+    let packed_files: string[] = [];
+    while (slots.length() < budget) {
+        let best_id = "";
+        let best_open = -1;
+        for (let c in ready) {
+            if (!contains_id(packed, c.id) && !contains_id(leased, c.id)) {
+                let r = blast_of(c.id, radii);
+                let clash = files_clash(files_for(c.id, footprints), packed_files);
+                if (
+                    !clash
+                        && (
+                            r.open_downstream > best_open
+                                || (
+                                    r.open_downstream == best_open
+                                        && (best_id == "" || c.id < best_id)
+                                )
+                        )
+                ) {
+                    best_id = c.id;
+                    best_open = r.open_downstream;
+                }
+            }
+        }
+        if (best_id == "") {
+            break;
+        }
+        packed.push(best_id);
+        for (let f in files_for(best_id, footprints)) {
+            if (!contains_id(packed_files, f)) {
+                packed_files.push(f);
+            }
+        }
+        slots.push(AgentSlot { slot: slots.length(), issue_id: best_id });
+    }
+    slots
+}
+
+function slot_issue(slots: AgentSlot[], slot: int) -> string {
+    for (let s in slots) {
+        if (s.slot == slot) {
+            return s.issue_id;
+        }
+    }
+    ""
+}
+
+test "dispatch packs the hub before leaves and caps by budget" {
+    let issues = [
+        mk_issue("t#01", Status.Open),
+        mk_issue("t#02", Status.Open),
+        mk_issue("t#03", Status.Open),
+        mk_issue("t#04", Status.Open),
+    ];
+    let edges = [
+        Edge { from: "t#02", to: "t#01", kind: EdgeKind.DependsOn },
+        Edge { from: "t#03", to: "t#01", kind: EdgeKind.DependsOn },
+    ];
+    let slots = dispatch_pack(issues, edges, [], [], 2);
+    assert.equal(slots.length(), 2);
+    assert.equal(slot_issue(slots, 0), "t#01");
+    // Leaves tie at 0 — id ascending.
+    assert.equal(slot_issue(slots, 1), "t#02")
+}
+
+test "dispatch skips leased and blocked issues" {
+    let issues = [
+        mk_issue("t#01", Status.Open),
+        mk_issue("t#02", Status.Open),
+        mk_issue("t#03", Status.Open),
+        mk_issue("t#04", Status.Open),
+    ];
+    let edges = [
+        Edge { from: "t#02", to: "t#01", kind: EdgeKind.DependsOn },
+        Edge { from: "t#03", to: "t#04", kind: EdgeKind.Blocks },
+    ];
+    // t#01 holds the most work but is live-claimed; t#04 is parked behind an
+    // open blocker. Neither is packed.
+    let slots = dispatch_pack(issues, edges, ["t#01"], [], 4);
+    assert.equal(slots.length(), 2);
+    assert.equal(slot_issue(slots, 0), "t#02");
+    assert.equal(slot_issue(slots, 1), "t#03")
+}
+
+test "dispatch packs around file conflicts" {
+    let issues = [mk_issue("t#01", Status.Open), mk_issue("t#02", Status.Open), mk_issue("t#03", Status.Open)];
+    let edges = [Edge { from: "t#02", to: "t#01", kind: EdgeKind.DependsOn }];
+    let footprints = [
+        FileClaim { issue_id: "t#01", files: ["a.ts"] },
+        FileClaim { issue_id: "t#02", files: ["a.ts"] },
+        FileClaim { issue_id: "t#03", files: [] },
+    ];
+    // t#01 first (radius 1); t#02 shares a.ts so the slot goes to t#03.
+    let slots = dispatch_pack(issues, edges, [], footprints, 3);
+    assert.equal(slots.length(), 2);
+    assert.equal(slot_issue(slots, 0), "t#01");
+    assert.equal(slot_issue(slots, 1), "t#03")
+}
+
+test "dispatch tie-breaks on id ascending" {
+    let issues = [mk_issue("t#09", Status.Open), mk_issue("t#02", Status.Open)];
+    let slots = dispatch_pack(issues, [], [], [], 1);
+    assert.equal(slots.length(), 1);
+    assert.equal(slot_issue(slots, 0), "t#02")
+}
+
+test "dispatch is empty on zero budget or fully leased backlog" {
+    let issues = [mk_issue("t#01", Status.Open)];
+    assert.equal(dispatch_pack(issues, [], [], [], 0).length(), 0);
+    assert.equal(dispatch_pack(issues, [], ["t#01"], [], 4).length(), 0);
+    assert.equal(dispatch_pack([], [], [], [], 4).length(), 0)
+}
+
+test "parse_file_claims reads Files lines, strips comments, unions" {
+    assert.equal(parse_file_claims("no refs here"), []);
+    assert.equal(parse_file_claims("Files: a.ts b/c.ts"), ["a.ts", "b/c.ts"]);
+    assert.equal(parse_file_claims("  Files: a.ts  a.ts # dup + comment"), ["a.ts"]);
+    assert.equal(parse_file_claims("Files: a.ts\nprose\nFiles: b.ts"), ["a.ts", "b.ts"]);
+    assert.equal(parse_file_claims("Files:"), []);
+    assert.equal(parse_file_claims("NotFiles: a.ts"), [])
+}
+
+// ── Goal-conditioned relevance (bi#133) ─────────────────────────────────────
+// Blast radius is goal-blind: the biggest hub outranks everything no matter
+// what the goal is. relevance(node, goal) fixes that with the same
+// declare/derive split as urgency (bi#51): the LLM (or operator) DECLARES
+// relevance + receipts as plain data — a Goal listing its clause ids and one
+// RelevanceClaim per node naming which goal clauses it serves — and BAML
+// DERIVES priority = f(relevance, blast_radius, severity) as a pure function
+// that returns the score WITH its parts (never a bare number).
+//
+// Parsing the goal statement into clause ids is declare-side work (host/LLM);
+// BAML only derives membership: a cited clause counts when it is a member of
+// the CURRENT goal's clause list. Re-alignment is therefore continuous, not
+// one-shot: every dispatch recomputes against the current goal and flags
+// drift — a claim whose cited clauses are ALL retired from the current goal
+// scores relevance 0 and carries drifted=true with the stale clause ids as
+// the reason (structured string[] — `+` is numeric-only, so no composed
+// message). A partially stale claim keeps alignment on its surviving
+// receipts; a node with no claim scores structural-only and is never drifted
+// (nothing to drift from).
+//
+// Weights (all bounded so every input can actually move the order):
+// - Relevance: declared level clamped 0..3, scaled x2 (max 6, above the
+//   blast cap, so goal alignment beats goal-blind leverage).
+// - Blast: open_downstream capped at 4 (the load-bearing structural signal).
+// - Severity: 1..4 linear, capped at 4 — deliberately WITHOUT urgency's
+//   severity-5 override hatch, which would reintroduce goal-blind dominance.
+// - Tie-breaks are structural all the way down (score, open_downstream,
+//   severity_part, id ascending) so equal declarations cannot promote pet
+//   work: an inflated declared level only wins ties it already tied.
+//
+// Out of scope (remainder): the scripts-lane recompute (relevance refresh per
+// dispatch) and merger verification of landed nodes against cited clauses —
+// this section is the pure derivation those lanes will call.
+class Goal {
+    statement: string @description(
+        "current goal text, e.g. ship the CLI — declare-side, BAML only reads the clause list",
+    ),
+    clauses: string[] @description("clause ids receipts may cite, e.g. [ship-cli, fix-flakes]"),
+}
+
+class RelevanceClaim {
+    issue_id: string,
+    level: int @description(
+        "declared 0-3: how directly the node serves the goal — clamped, never trusted raw",
+    ),
+    clauses: string[] @description("receipts: which goal clause ids this node serves"),
+}
+
+class GoalPriority {
+    issue_id: string,
+    score: int @description("relevance_part + blast_part + severity_part — always read with the parts"),
+    declared: int @description("raw declared level, pre-clamp — audit trail"),
+    relevance_part: int,
+    blast_part: int,
+    severity_part: int,
+    receipts: string[] @description("cited clauses surviving in the current goal"),
+    stale: string[] @description("cited clauses retired from the current goal — the drift reason"),
+    drifted: bool @description("claim exists and NO cited clause survives"),
+    open_downstream: int @description("structural tie-break signal, echoed for the sort receipt"),
+}
+
+function clamp_relevance(level: int) -> int {
+    if (level < 0) {
+        0
+    } else if (level > 3) {
+        3
+    } else {
+        level
+    }
+}
+
+function claim_for(issue_id: string, claims: RelevanceClaim[]) -> RelevanceClaim? {
+    for (let c in claims) {
+        if (c.issue_id == issue_id) {
+            return c;
+        }
+    }
+    null
+}
+
+function surviving_receipts(claim: RelevanceClaim, goal: Goal) -> string[] {
+    let out: string[] = [];
+    for (let c in claim.clauses) {
+        if (contains_id(goal.clauses, c) && !contains_id(out, c)) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+function stale_receipts(claim: RelevanceClaim, goal: Goal) -> string[] {
+    let out: string[] = [];
+    for (let c in claim.clauses) {
+        if (!contains_id(goal.clauses, c) && !contains_id(out, c)) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+function priority_severity(issue: Issue) -> int {
+    if let s: int = issue.severity {
+        if (s <= 0) {
+            0
+        } else if (s >= 4) {
+            4
+        } else {
+            s
+        }
+    } else {
+        0
+    }
+}
+
+function priority_blast(open_downstream: int) -> int {
+    if (open_downstream > 4) {
+        4
+    } else if (open_downstream < 0) {
+        0
+    } else {
+        open_downstream
+    }
+}
+
+function goal_priority(
+    issue: Issue,
+    goal: Goal,
+    claims: RelevanceClaim[],
+    radii: BlastRadius[],
+) -> GoalPriority {
+    let blast_open = blast_of(issue.id, radii).open_downstream;
+    let sev = priority_severity(issue);
+    let blast = priority_blast(blast_open);
+    if let c: RelevanceClaim = claim_for(issue.id, claims) {
+        let keep = surviving_receipts(c, goal);
+        let stale = stale_receipts(c, goal);
+        // Drifted = receipts no longer match the goal AT ALL: the declared
+        // level is untrusted once its backing clauses are gone.
+        let rel = if (keep.length() == 0) {
+            0
+        } else {
+            clamp_relevance(c.level) * 2
+        };
+        GoalPriority {
+            issue_id: issue.id,
+            score: rel + blast + sev,
+            declared: c.level,
+            relevance_part: rel,
+            blast_part: blast,
+            severity_part: sev,
+            receipts: keep,
+            stale: stale,
+            drifted: keep.length() == 0 && c.clauses.length() > 0,
+            open_downstream: blast_open,
+        }
+    } else {
+        GoalPriority {
+            issue_id: issue.id,
+            score: blast + sev,
+            declared: 0,
+            relevance_part: 0,
+            blast_part: blast,
+            severity_part: sev,
+            receipts: [],
+            stale: [],
+            drifted: false,
+            open_downstream: blast_open,
+        }
+    }
+}
+
+// Structural ordering over derived priorities: score, then open blast, then
+// severity, then id ascending. Declared data never breaks a tie by itself.
+function priority_ranks_above(a: GoalPriority, b: GoalPriority) -> bool {
+    if (a.score == b.score) {
+        if (a.open_downstream == b.open_downstream) {
+            if (a.severity_part == b.severity_part) {
+                a.issue_id < b.issue_id
+            } else {
+                a.severity_part > b.severity_part
+            }
+        } else {
+            a.open_downstream > b.open_downstream
+        }
+    } else {
+        a.score > b.score
+    }
+}
+
+test "goal switch reorders the pack" {
+    let cli = mk_issue("bi#60", Status.Open);
+    let flake = mk_issue("bi#61", Status.Open);
+    let edges: Edge[] = [];
+    let radii = blast_radii([cli, flake], edges);
+    let claims = [
+        RelevanceClaim { issue_id: "bi#60", level: 3, clauses: ["ship-cli"] },
+        RelevanceClaim { issue_id: "bi#61", level: 3, clauses: ["fix-flakes"] },
+    ];
+    let ship = Goal { statement: "ship the CLI", clauses: ["ship-cli"] };
+    let stab = Goal { statement: "stabilize flakes", clauses: ["fix-flakes"] };
+    let cli_ship = goal_priority(cli, ship, claims, radii);
+    let flake_ship = goal_priority(flake, ship, claims, radii);
+    assert.equal(cli_ship.relevance_part, 6);
+    assert.equal(flake_ship.relevance_part, 0);
+    assert.equal(flake_ship.drifted, true);
+    assert.equal(priority_ranks_above(cli_ship, flake_ship), true);
+    // Same declarations, new goal: the order flips.
+    let cli_stab = goal_priority(cli, stab, claims, radii);
+    let flake_stab = goal_priority(flake, stab, claims, radii);
+    assert.equal(flake_stab.relevance_part, 6);
+    assert.equal(cli_stab.drifted, true);
+    assert.equal(priority_ranks_above(flake_stab, cli_stab), true);
+    assert.equal(priority_ranks_above(cli_stab, flake_stab), false)
+}
+
+test "goal alignment outweighs goal-blind blast" {
+    // bi#26-style hub: four Open dependents (blast capped at 4), zero goal
+    // relevance. A fully relevant leaf (3 x 2 = 6) still outranks it.
+    let hub = mk_issue("bi#63", Status.Open);
+    let leaf = mk_issue("bi#64", Status.Open);
+    let issues = [
+        hub,
+        leaf,
+        mk_issue("bi#65", Status.Open),
+        mk_issue("bi#66", Status.Open),
+        mk_issue("bi#67", Status.Open),
+        mk_issue("bi#68", Status.Open),
+    ];
+    let edges = [
+        Edge { from: "bi#65", to: "bi#63", kind: EdgeKind.DependsOn },
+        Edge { from: "bi#66", to: "bi#63", kind: EdgeKind.DependsOn },
+        Edge { from: "bi#67", to: "bi#63", kind: EdgeKind.DependsOn },
+        Edge { from: "bi#68", to: "bi#63", kind: EdgeKind.DependsOn },
+    ];
+    let radii = blast_radii(issues, edges);
+    let goal = Goal { statement: "ship the CLI", clauses: ["ship-cli"] };
+    let claims = [RelevanceClaim { issue_id: "bi#64", level: 3, clauses: ["ship-cli"] }];
+    let hub_p = goal_priority(hub, goal, claims, radii);
+    let leaf_p = goal_priority(leaf, goal, claims, radii);
+    assert.equal(hub_p.blast_part, 4);
+    assert.equal(hub_p.relevance_part, 0);
+    assert.equal(leaf_p.score, 6);
+    assert.equal(priority_ranks_above(leaf_p, hub_p), true)
+}
+
+test "drifted node flagged with stale receipts as the reason" {
+    let node = mk_issue("bi#62", Status.Open);
+    let radii = blast_radii([node], []);
+    let claims = [RelevanceClaim { issue_id: "bi#62", level: 3, clauses: ["old-push"] }];
+    let goal = Goal { statement: "ship the CLI", clauses: ["ship-cli"] };
+    let p = goal_priority(node, goal, claims, radii);
+    assert.equal(p.drifted, true);
+    assert.equal(p.stale, ["old-push"]);
+    assert.equal(p.receipts, []);
+    assert.equal(p.relevance_part, 0);
+    assert.equal(p.score, p.blast_part + p.severity_part)
+}
+
+test "partial receipts keep alignment and list the stale rest" {
+    let node = mk_issue("bi#69", Status.Open);
+    let radii = blast_radii([node], []);
+    let claims = [RelevanceClaim { issue_id: "bi#69", level: 2, clauses: ["ship-cli", "old-push"] }];
+    let goal = Goal { statement: "ship the CLI", clauses: ["ship-cli"] };
+    let p = goal_priority(node, goal, claims, radii);
+    assert.equal(p.drifted, false);
+    assert.equal(p.receipts, ["ship-cli"]);
+    assert.equal(p.stale, ["old-push"]);
+    assert.equal(p.relevance_part, 4)
+}
+
+test "structural signals break ties so gaming cannot promote pet work" {
+    // Pet declares the max level 3 (6 pts) with no structural backing; the
+    // worker declares 2 (4 pts) but holds two Open dependents. Tied at 6 —
+    // the structural tie-break ranks the worker above despite the pet's
+    // higher declaration.
+    let pet = mk_issue("bi#70", Status.Open);
+    let worker = mk_issue("bi#71", Status.Open);
+    let issues = [pet, worker, mk_issue("bi#72", Status.Open), mk_issue("bi#73", Status.Open)];
+    let edges = [
+        Edge { from: "bi#72", to: "bi#71", kind: EdgeKind.DependsOn },
+        Edge { from: "bi#73", to: "bi#71", kind: EdgeKind.DependsOn },
+    ];
+    let radii = blast_radii(issues, edges);
+    let goal = Goal { statement: "ship the CLI", clauses: ["ship-cli"] };
+    let claims = [
+        RelevanceClaim { issue_id: "bi#70", level: 3, clauses: ["ship-cli"] },
+        RelevanceClaim { issue_id: "bi#71", level: 2, clauses: ["ship-cli"] },
+    ];
+    let pet_p = goal_priority(pet, goal, claims, radii);
+    let worker_p = goal_priority(worker, goal, claims, radii);
+    assert.equal(pet_p.score, worker_p.score);
+    assert.equal(priority_ranks_above(worker_p, pet_p), true);
+    assert.equal(priority_ranks_above(pet_p, worker_p), false)
+}
+
+test "identical priorities tie-break on id ascending" {
+    let a = mk_issue("bi#75", Status.Open);
+    let b = mk_issue("bi#74", Status.Open);
+    let radii = blast_radii([a, b], []);
+    let goal = Goal { statement: "ship the CLI", clauses: ["ship-cli"] };
+    let claims = [
+        RelevanceClaim { issue_id: "bi#75", level: 1, clauses: ["ship-cli"] },
+        RelevanceClaim { issue_id: "bi#74", level: 1, clauses: ["ship-cli"] },
+    ];
+    let pa = goal_priority(a, goal, claims, radii);
+    let pb = goal_priority(b, goal, claims, radii);
+    assert.equal(pa.score, pb.score);
+    assert.equal(priority_ranks_above(pb, pa), true)
+}
+
+test "undeclared node scores structural only and never drifts" {
+    let hub = mk_issue("bi#76", Status.Open);
+    let issues = [hub, mk_issue("bi#77", Status.Open)];
+    let edges = [Edge { from: "bi#77", to: "bi#76", kind: EdgeKind.DependsOn }];
+    let radii = blast_radii(issues, edges);
+    let goal = Goal { statement: "ship the CLI", clauses: ["ship-cli"] };
+    let p = goal_priority(hub, goal, [], radii);
+    assert.equal(p.relevance_part, 0);
+    assert.equal(p.blast_part, 1);
+    assert.equal(p.drifted, false);
+    assert.equal(p.receipts, []);
+    assert.equal(p.stale, []);
+    assert.equal(p.score, p.blast_part + p.severity_part)
+}
+
+test "declared level clamps to 0..3 before scaling" {
+    let hi = mk_issue("bi#78", Status.Open);
+    let lo = mk_issue("bi#79", Status.Open);
+    let radii = blast_radii([hi, lo], []);
+    let goal = Goal { statement: "ship the CLI", clauses: ["ship-cli"] };
+    let claims = [
+        RelevanceClaim { issue_id: "bi#78", level: 99, clauses: ["ship-cli"] },
+        RelevanceClaim { issue_id: "bi#79", level: -2, clauses: ["ship-cli"] },
+    ];
+    let hi_p = goal_priority(hi, goal, claims, radii);
+    let lo_p = goal_priority(lo, goal, claims, radii);
+    // Raw declaration kept for audit, scaled part clamped.
+    assert.equal(hi_p.declared, 99);
+    assert.equal(hi_p.relevance_part, 6);
+    assert.equal(lo_p.relevance_part, 0);
+    assert.equal(lo_p.drifted, false)
 }

@@ -1,0 +1,5 @@
+# Valid hops but no terminal broadcast: INCOMPLETE (chain never closed).
+chain: inv-forward-6
+branch: ingest owner=titan-1 files=src/ingest.ts
+branch: query owner=titan-2 files=src/query.ts
+forward: ingest to=query via=direct handoff=handoff-051

@@ -1,0 +1,15 @@
+id: handoff-sample
+from: titan-1
+to: merger
+priority: 00
+type: diff
+created_at: 2026-09-06T02:00:00Z
+
+base: 0123456789abcdef0123456789abcdef01234567
+diff --git a/titan.ts b/titan.ts
+--- a/titan.ts
++++ b/titan.ts
+@@ -1 +1 @@
+-old
++new
+Evidence: drill(campaign-refill)

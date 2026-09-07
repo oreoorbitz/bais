@@ -1,0 +1,17 @@
+# Fixture (bi#135): non-game goal under an unknown style — must fall to default.
+statement = "Tidy the release checklist tooling and documentation"
+
+users = "solo dev (adrian)"
+scale = "single directory"
+platform = "local CLI"
+constraints = ["offline-friendly"]
+style = "plain"
+hero = ""
+
+done_criteria = [
+  "checklist runs offline",
+]
+
+non_goals = [
+  "new features",
+]

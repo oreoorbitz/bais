@@ -1,0 +1,8 @@
+id = "u#01"
+title = "undeclared beta work"
+status = "Open"
+kind = "Feat"
+body = """
+Swipe candidate with no declared footprint yet.
+Acceptance: unknown names itself in the shared-pack warning.
+"""

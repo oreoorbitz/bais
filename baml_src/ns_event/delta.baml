@@ -323,3 +323,28 @@ test "delta plus snapshot composes to the full-replay fingerprint" {
         projection_fingerprint(reduce(full)),
     )
 }
+
+// Version gate (bi#47): the host serves a delta only when the caller's
+// reducer version matches this string; the deterministic fixture
+// (scripts/fixtures/delta/v1.json) pins it, and a bump must fail LOUD
+// here — regenerate the fixture — rather than silently replay an old log
+// under new merge rules (cf. version-skew in checkpoint.baml).
+test "delta fixture is version-gated on the reducer version" {
+    assert.equal(reducer_version(), "bais.reduce@1")
+}
+
+// The diff policy is a pure function: same heads over the same log,
+// twice, yields the same delta — the soak's regenerate-and-compare step
+// rests on this.
+test "diff_since is deterministic over repeated calls" {
+    let e1 = wire("TaskCreate", "task:A", 1, "e1", str_body("title", "a"));
+    let e2 = wire("TaskTransition", "task:A", 2, "e2", str_body("to", "Doing"));
+    let e3 = wire("CommentPost", "task:A", 3, "e3", str_body("text", "hi"));
+    let log = [e1, e2, e3];
+    let a = diff_since(["e1"], no_anchor(), log);
+    let b = diff_since(["e1"], no_anchor(), log);
+    assert.equal(delta_ids(a), delta_ids(b));
+    assert.equal(a.floor, b.floor);
+    assert.equal(a.complete, b.complete);
+    assert.equal(delta_ids(a), ["e2", "e3"])
+}

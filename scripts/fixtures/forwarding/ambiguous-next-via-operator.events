@@ -1,0 +1,8 @@
+# Ambiguous successor spells to=? and routes via the operator with a reason.
+chain: inv-forward-3
+branch: ingest owner=titan-1 files=src/ingest.ts
+branch: query owner=titan-2 files=src/query.ts
+branch: export owner=titan-3 files=src/export.ts
+forward: ingest to=? via=operator reason=ambiguous next branch (query vs export) handoff=handoff-021
+forward: query to=export via=direct handoff=handoff-022
+broadcast: to=merger chain=inv-forward-3 result=done ref=handoff-023

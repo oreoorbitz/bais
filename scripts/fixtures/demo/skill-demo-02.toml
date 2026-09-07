@@ -1,0 +1,17 @@
+[skill]
+id = "skill-demo-02"
+title = "One outstanding pack: warn LOUD on re-dispatch while slots are held"
+tags = ["dispatch", "coordination"]
+filed_in = "demo-156/squad-2"
+body = """
+Orchestration learning from bi#129 (2026-09-06): a dispatcher re-run
+while the previous pack still holds live claims must warn LOUD naming
+the held slots (kimi-veto shape), exit stays 0 — held slots are valid
+in-flight work, never silent. Scripts-lane form: warnReentry(leased) in
+briefs.mjs + dispatch.mjs §9 fixture (pack → claim → re-dispatch warns
+→ release → quiet); raw CLI wiring explicitly out of lane (cli.ts).
+Reuse hook: the §8 warnPartial precedent (stderr line + --json field)
+is the shape to copy before inventing a new warning convention.
+Red-check: neutering the guard to always-null must trip the fixture
+with `re-dispatch warns naming the held slot (null)`.
+"""

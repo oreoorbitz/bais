@@ -1,0 +1,10 @@
+id = "b#01"
+title = "budget one"
+status = "Open"
+kind = "Feat"
+area = "bais/multi-agent"
+body = """
+First lone issue.
+Files: budget-one.ts
+Acceptance: issue lands with its diff under review; whole-pack suite passes.
+"""

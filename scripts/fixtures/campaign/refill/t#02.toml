@@ -1,0 +1,10 @@
+id = "t#02"
+title = "leaf two"
+status = "Open"
+kind = "Feat"
+area = "bais/multi-agent"
+body = """
+First leaf after the hub.
+Files: leaf-two.ts
+Acceptance: leaf lands with its diff under review; whole-pack suite passes.
+"""

@@ -1,0 +1,10 @@
+id = "r#02"
+title = "red leaf"
+status = "Open"
+kind = "Feat"
+area = "bais/multi-agent"
+body = """
+Innocent pack member held by the red verdict.
+Files: red-leaf.ts
+Acceptance: leaf lands with its diff under review; whole-pack suite passes.
+"""

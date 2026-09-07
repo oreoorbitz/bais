@@ -1,0 +1,9 @@
+id = "t#03"
+title = "declared gamma"
+status = "Open"
+kind = "Feat"
+body = """
+Gamma work, disjoint footprint from alpha.
+Acceptance: gamma packs alongside alpha; prior art in /tmp/t03-deliver/ informs the shape.
+Files: beta.ts
+"""

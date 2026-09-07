@@ -1,0 +1,8 @@
+# hub#165 fixture: a testing_surface item without an exercise half fails
+# loud naming the field.
+statement = "Ship per-directory goal tracking for BAIS"
+style = "plain"
+hero = "plain"
+done_criteria = ["sketch refused while open"]
+testing_surface = [{ surface = "bais list shows open issues" }]
+non_goals = []

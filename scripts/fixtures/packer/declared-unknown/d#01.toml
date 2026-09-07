@@ -1,0 +1,9 @@
+id = "d#01"
+title = "declared alpha work"
+status = "Open"
+kind = "Feat"
+body = """
+Declared swipe candidate, disjoint footprint.
+Acceptance: declared packs alongside at most one unknown, loudly.
+Files: alpha.ts
+"""

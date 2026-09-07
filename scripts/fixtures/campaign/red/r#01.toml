@@ -1,0 +1,20 @@
+id = "r#01"
+title = "red hub"
+status = "Open"
+kind = "Feat"
+area = "bais/multi-agent"
+body = """
+Load-bearing hub work that will land with no diff.
+Files: red-hub.ts
+Acceptance: hub lands with its diff under review; whole-pack suite passes.
+"""
+
+[[edge]]
+from = "r#02"
+to = "r#01"
+kind = "DependsOn"
+
+[[edge]]
+from = "r#03"
+to = "r#01"
+kind = "DependsOn"

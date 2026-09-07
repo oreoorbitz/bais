@@ -20,7 +20,7 @@
 // Unlike bi/bagl, bais imports its own parser directly — same package, no
 // dynamic pathToFileURL resolution needed.
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { parseBaisFile } from "./toml.js";
 
@@ -80,6 +80,199 @@ export function readyIssues(all: BaisFile[]): BaisFile[] {
 		}
 	}
 	return all.filter((f) => f.issue.status === "Open" && !blocked.has(f.issue.id));
+}
+
+// Mirror of BAML blast_radii (bi#122): per issue, the TRANSITIVE dependents
+// through the two ordering kinds (DependsOn/Blocks — the same `precedes`
+// relation the cycle detector uses), split into open_downstream (work
+// actually held, what dispatchers sort on) and total_downstream (every
+// declared dependent, including Done/Dropped/unseen). A dependent naming an
+// id that was never loaded counts in total but never in open; the hub never
+// counts itself, so cycles terminate without self-credit.
+export type BlastRadius = { id: string; open_downstream: number; total_downstream: number };
+
+export function blastRadii(all: BaisFile[]): BlastRadius[] {
+	const edges = all.flatMap((f) => f.edges);
+	const statusById = new Map(all.map((f) => [f.issue.id, f.issue.status]));
+	const directDependents = (id: string): string[] => {
+		const out: string[] = [];
+		for (const e of edges) {
+			if ((e.kind === "DependsOn" || e.kind === "Blocks") && e.to === id && !out.includes(e.from)) {
+				out.push(e.from);
+			}
+		}
+		return out;
+	};
+	return all.map((f) => {
+		const seen: string[] = [];
+		let frontier = directDependents(f.issue.id);
+		while (frontier.length > 0) {
+			const next: string[] = [];
+			for (const id of frontier) {
+				if (seen.includes(id)) continue;
+				seen.push(id);
+				for (const d of directDependents(id)) {
+					if (!seen.includes(d)) next.push(d);
+				}
+			}
+			frontier = next;
+		}
+		let open = 0;
+		let total = 0;
+		for (const id of seen) {
+			if (id === f.issue.id) continue;
+			total += 1;
+			if (statusById.get(id) === "Open") open += 1;
+		}
+		return { id: f.issue.id, open_downstream: open, total_downstream: total };
+	});
+}
+
+// Mirror of BAML parse_file_claims (bi#123): `Files:` body lines declare the
+// issue's file footprint (space-separated paths, `#` comments stripped,
+// multiple lines union, first-seen order). The CLI dry-runs packs against
+// these; undeclared issues pack freely but are flagged `files: unknown`.
+export function parseFileClaims(body: string): string[] {
+	const out: string[] = [];
+	for (const line of (body ?? "").split("\n")) {
+		const t = line.trim();
+		if (!t.startsWith("Files:")) continue;
+		let rest = t.slice("Files:".length).trim();
+		const hash = rest.indexOf("#");
+		if (hash !== -1) rest = rest.slice(0, hash).trim();
+		for (const part of rest.split(" ")) {
+			const p = part.trim();
+			if (p !== "" && !out.includes(p)) out.push(p);
+		}
+	}
+	return out;
+}
+
+// bi#130: swarm membership is a holder convention, not a schema change.
+// A holder of the form `swarm-id/agent-id` names its swarm by prefix;
+// anything else (no `/`, empty side) is a plain holder and coexists
+// untouched. `validHolder` (cli.ts) already admits `/`, so no parser or
+// envelope change was needed — this predicate is the whole stamp.
+export type SwarmMember = { swarm: string; agent: string };
+export function parseSwarmHolder(holder: string | null): SwarmMember | null {
+	if (holder == null) return null;
+	const i = holder.indexOf("/");
+	if (i <= 0 || i === holder.length - 1) return null;
+	const swarm = holder.slice(0, i);
+	const agent = holder.slice(i + 1);
+	if (swarm === "" || agent === "") return null;
+	return { swarm, agent };
+}
+
+// bi#130: group live claims by swarm prefix for `list --claims` and
+// `dispatch` occupancy. Plain holders (and nulls) are excluded, never
+// renamed — mixed plain + swarm holders coexist in the same output.
+export type SwarmGroup = { swarm: string; members: { id: string; holder: string; agent: string }[] };
+export function groupSwarmClaims(claims: { id: string; holder: string | null }[]): SwarmGroup[] {
+	const bySwarm = new Map<string, SwarmGroup>();
+	for (const c of claims) {
+		const m = parseSwarmHolder(c.holder);
+		if (m == null || c.holder == null) continue;
+		let g = bySwarm.get(m.swarm);
+		if (!g) {
+			g = { swarm: m.swarm, members: [] };
+			bySwarm.set(m.swarm, g);
+		}
+		g.members.push({ id: c.id, holder: c.holder, agent: m.agent });
+	}
+	for (const g of bySwarm.values()) g.members.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+	return [...bySwarm.values()].sort((a, b) => (a.swarm < b.swarm ? -1 : a.swarm > b.swarm ? 1 : 0));
+}
+
+// Mirror of BAML dispatch_pack (bi#123): the workload-aware swarm pack as a
+// pure function. Candidates are ready (Open + unblocked) and unleased;
+// greedy by open blast radius (ties: id ascending), skipping packed/leased
+// issues and file clashes with already-packed slots. `leased` is the
+// precomputed live-claim set (the host owns the clock); `footprints` maps
+// issue id to declared files. Never mutates — the CLI dry-runs it and each
+// agent claims for itself.
+//
+// hub#175: unknown footprints (no `Files:` line — a bare `Files:` still
+// counts as declared: touches-nothing is a real claim) are mutually
+// exclusive in a swipe pack. Empty file lists never collide vacuously, so
+// the clash predicate above cannot see them: the greedy pick below still
+// fills the budget, then the first unknown in slot order keeps its slot
+// and the rest are withheld (same kept/withheld semantics as the
+// scripts-lane splitUnknownPack in bais/scripts/briefs.mjs, which stays a
+// no-op second filter over these slots). Kept slots renumber dense. The
+// call site warns LOUD via warnUnknownWithheld / warnUnknownShared.
+export type FileClaim = { issue_id: string; files: string[] };
+export type AgentSlot = { slot: number; issue_id: string };
+
+// A `Files:` prefix means declared — even `Files:` empty. No prefix means
+// unknown. Same test as parseFileClaims's prefix scan and the dispatch call
+// sites; kept beside dispatchPack because the exclusion reads bodies while
+// the clash predicate reads the footprints map.
+export function isDeclaredFootprint(body: string): boolean {
+	return (body ?? "").split("\n").some((l) => l.trim().startsWith("Files:"));
+}
+
+// hub#175 warning lines — verbatim mirrors of warnUnknownWithheld /
+// warnUnknownShared in bais/scripts/briefs.mjs (the scripts lane owns the
+// exact shapes; dispatch.mjs §13 pins them). Duplicated, not imported:
+// the CLI runtime must not depend on scripts/ (same requirement class as
+// the hub#163 renderer resolution). mirror-parity.mjs pins these against
+// the scripts canonical.
+export function warnUnknownWithheld(ids: string[]): string {
+	const list = [...ids].map(String);
+	const noun = list.length === 1 ? "footprint" : "footprints";
+	return `[bais] unknown ${noun} withheld from swipe pack: ${list.join(", ")} (no Files: line proves no clash-freedom — at most one unknown per pack; declare Files: first per bi#125)`;
+}
+
+export function warnUnknownShared(unknownId: string, declaredIds: string[]): string {
+	return `[bais] unknown footprint ${unknownId} shares a swipe pack with declared ${[...declaredIds].map(String).join(", ")} (no Files: — confirm scope with the operator before writing)`;
+}
+
+export function dispatchPack(
+	all: BaisFile[],
+	leased: string[],
+	footprints: Map<string, string[]> | FileClaim[],
+	budget: number,
+): AgentSlot[] {
+	const slots: AgentSlot[] = [];
+	if (budget <= 0) return slots;
+	const fp = Array.isArray(footprints) ? new Map(footprints.map((f) => [f.issue_id, f.files])) : footprints;
+	const radii = new Map(blastRadii(all).map((r) => [r.id, r]));
+	const ready = readyIssues(all);
+	const bodies = new Map(all.map((f) => [f.issue.id, f.issue.body ?? ""]));
+	const filesFor = (id: string): string[] => fp.get(id) ?? [];
+	const clash = (a: string[], b: string[]): boolean => a.some((x) => b.includes(x));
+	const packed: string[] = [];
+	const packedFiles: string[] = [];
+	while (slots.length < budget) {
+		let bestId = "";
+		let bestOpen = -1;
+		for (const c of ready) {
+			if (packed.includes(c.issue.id) || leased.includes(c.issue.id)) continue;
+			const open = radii.get(c.issue.id)?.open_downstream ?? 0;
+			if (clash(filesFor(c.issue.id), packedFiles)) continue;
+			if (open > bestOpen || (open === bestOpen && (bestId === "" || c.issue.id < bestId))) {
+				bestId = c.issue.id;
+				bestOpen = open;
+			}
+		}
+		if (bestId === "") break;
+		packed.push(bestId);
+		for (const f of filesFor(bestId)) {
+			if (!packedFiles.includes(f)) packedFiles.push(f);
+		}
+		slots.push({ slot: slots.length, issue_id: bestId });
+	}
+	const kept: AgentSlot[] = [];
+	let seenUnknown = false;
+	for (const s of slots) {
+		if (!isDeclaredFootprint(bodies.get(s.issue_id) ?? "")) {
+			if (seenUnknown) continue;
+			seenUnknown = true;
+		}
+		kept.push({ slot: kept.length, issue_id: s.issue_id });
+	}
+	return kept;
 }
 
 // Mirror of BAML id_project: "bi#04" -> "bi". An id with no "#" has no scope.
@@ -178,7 +371,8 @@ export function cyclicIds(all: BaisFile[]): string[] {
 //   Evidence: verdict(bi#59)      # reviewer-verdict issue filed in this .bais (bi#59)
 //
 // `drill(NAME)` resolves iff NAME is a known drill: a fault-drills letter
-// (a/b/c/d/r) or a script stem present in scripts/ (knownDrillNames).
+// (a/b/c/d/r) or a script stem present in the hub's drill namespace
+// (scripts/ plus co-located sibling-package scripts/ — knownDrillNames).
 // `verdict(ID)` resolves iff ID is a loaded issue id; a cross-project id
 // is reported External (advisory, never fatal — same convention as
 // dangling refs). A Done issue with zero refs fails as missing-close-
@@ -302,8 +496,16 @@ export type CloseEvidenceProblem = {
 };
 
 // Fault-drill letters (scripts/fault-drills.mjs drill (a)/(b)/(c)/(d)/(r))
-// always resolve; script stems resolve iff a matching *.mjs exists in
-// scriptsDir (absent dir = letters only, so other projects still check).
+// always resolve; script stems resolve iff a matching *.mjs exists in the
+// hub's drill namespace: scriptsDir plus every co-located sibling-package
+// scripts/ dir under the same hub root (hub#164). The root hub lives at the
+// repo root where <root>/scripts does not exist — without the union, closes
+// citing drill(audit)/drill(keeper)/... fail unresolvable-drill even though
+// bais/scripts/audit.mjs and bi/scripts/keeper.mjs are real green suites.
+// Absent dirs contribute nothing, so a tmpdir or single-package hub still
+// resolves letters only (check-evidence.mjs pins that contract). Existence
+// is resolvability: check does not execute suites — suite-greenness is proven
+// by running them (dispatch/audit/tiers gates), not by this predicate.
 // issuesDir is <root>/.bais/issues; drill scripts live at <root>/scripts.
 export function scriptsDirFor(issuesDir: string): string {
 	return join(resolve(issuesDir, "..", ".."), "scripts");
@@ -311,12 +513,25 @@ export function scriptsDirFor(issuesDir: string): string {
 
 export function knownDrillNames(scriptsDir: string): string[] {
 	const names = ["a", "b", "c", "d", "r"];
+	const dirs = [resolve(scriptsDir)];
 	try {
-		for (const f of readdirSync(scriptsDir).filter((f) => f.endsWith(".mjs")).sort()) {
-			const stem = f.slice(0, -4);
-			if (!names.includes(stem)) names.push(stem);
+		const hubRoot = resolve(scriptsDir, "..");
+		for (const sub of readdirSync(hubRoot).sort()) {
+			const d = join(hubRoot, sub, "scripts");
+			if (d === dirs[0]) continue;
+			try {
+				if (existsSync(d)) dirs.push(d);
+			} catch {}
 		}
 	} catch {}
+	for (const dir of dirs) {
+		try {
+			for (const f of readdirSync(dir).filter((f) => f.endsWith(".mjs")).sort()) {
+				const stem = f.slice(0, -4);
+				if (!names.includes(stem)) names.push(stem);
+			}
+		} catch {}
+	}
 	return names;
 }
 
@@ -328,6 +543,196 @@ export function parseCloseEvidence(body: string): CloseEvidenceRef[] {
 	for (const line of (body ?? "").split("\n")) {
 		const m = /^\s*Evidence\s*:\s*(drill|verdict)\s*\(\s*([^)]*?)\s*\)\s*(?:#.*)?$/.exec(line);
 		if (m) out.push({ kind: m[1] as CloseEvidenceKind, ref: m[2].trim() });
+	}
+	return out;
+}
+
+// ── Computed urgency (bi#51) + cost join (bi#52) ──────────────────────────
+// Mirror of BAML urgency/urgency_severity/blocks_fan_out/is_sole_blocker/
+// sole_unblocks/urgency_blocks/urgency_stalled_days/urgency_stalled/
+// urgency_cost_cap/urgency_cost (bais/baml_src/main.baml urgency section)
+// plus the budget.baml accumulators task_incurred_tokens/task_incurred_usd.
+// Same FFI rationale as the header: BAML
+// owns the definition proved by `baml test` (tests "urgency orders fan-out
+// hub above leaf", "severity-5 overrides a high structural score", "60-day
+// trivia loses to fresh severity-4", "staleness saturates: older alone never
+// keeps winning", "urgency receipt adds up and names every component",
+// "missing or future creation day counts as fresh", "null severity
+// contributes nothing", "shared blockers split the one-away bonus but keep
+// fan-out"); the host mirrors the arithmetic because the SDK cannot carry
+// the new functions (proposals/05) AND because BAML has no wall time.
+//
+// Clock split (bi#42): the host owns clocks, BAML owns policy. The host
+// stamps each issue's creation day (whole days since epoch, from file mtime
+// — the "file mtime / git log day" unit main.baml:788-794 names) into the
+// live-signal table and passes wall-clock `now` in the same unit. A missing
+// entry — or a creation day in the future — counts as fresh (0 days).
+// Urgency is DERIVED: it never rewrites human severity, and every score
+// ships with its components (the anti-Goodhart receipt).
+export type Urgency = {
+	issue_id: string;
+	score: number;
+	severity_part: number;
+	fan_out: number;
+	sole_unblocks: number;
+	blocks_part: number;
+	stalled_days: number;
+	stalled_part: number;
+	incurred_tokens: number;
+	cost_part: number;
+};
+
+// Declared signal: 1-4 linear (capped below the structural max of 6); 5 is
+// the override hatch (15, above the max non-override total of 12).
+export function urgencySeverity(severity: number | null): number {
+	if (severity == null) return 0;
+	if (severity >= 5) return 15;
+	if (severity <= 0) return 0;
+	return severity;
+}
+
+// Structural signal: Blocks fan-out counts EDGES, not distinct targets
+// (same as BAML blocks_fan_out — a doubled edge declaration double-counts).
+export function blocksFanOut(issueId: string, edges: BaisEdge[]): number {
+	let n = 0;
+	for (const e of edges) {
+		if (e.from === issueId && e.kind === "Blocks") n += 1;
+	}
+	return n;
+}
+
+// One-completion-away: no OTHER issue blocks `target` (edges only).
+export function isSoleBlocker(issueId: string, target: string, edges: BaisEdge[]): boolean {
+	for (const e of edges) {
+		if (e.kind === "Blocks" && e.to === target && e.from !== issueId) return false;
+	}
+	return true;
+}
+
+export function soleUnblocks(issueId: string, edges: BaisEdge[]): number {
+	let n = 0;
+	for (const e of edges) {
+		if (e.from === issueId && e.kind === "Blocks" && isSoleBlocker(issueId, e.to, edges)) n += 1;
+	}
+	return n;
+}
+
+export function urgencyBlocks(issueId: string, edges: BaisEdge[]): number {
+	return Math.min(blocksFanOut(issueId, edges), 4) + Math.min(soleUnblocks(issueId, edges), 2);
+}
+
+export function urgencyStalledDays(issueId: string, costs: Map<string, number>, now: number): number {
+	const created = costs.has(issueId) ? (costs.get(issueId) as number) : now;
+	const parked = now - created;
+	return parked < 0 ? 0 : parked;
+}
+
+// A week per point, saturating at 2 (BAML int division truncates; days are
+// clamped >= 0 above, so Math.floor agrees exactly).
+export function urgencyStalled(stalledDays: number): number {
+	return Math.min(Math.floor(stalledDays / 7), 2);
+}
+
+// ── Cost attribution join (bi#52) ─────────────────────────────────────────
+// BAML owns the accumulation policy (ns_event/budget.baml
+// task_incurred_tokens/task_incurred_usd, pure fold over admitted incurred
+// rows); the host owns METERING (measuring tokens and emitting CostIncurred
+// through the reserve/drawdown checks). This mirror lets urgency serve the
+// join without a bridge round-trip. Burn-to-look-important defense (see
+// main.baml urgency header): the component saturates at 2, so the max
+// non-override total is 4 + 6 + 2 + 2 = 14, below the severity-5 hatch
+// (15); the receipt names cost_part + incurred_tokens so burn is visible;
+// only admitted incurred rows count (unknown spend reads as 0); oversight
+// outlier review (budget_overruns/caps_over_budget) is the second eye.
+// URGENCY_COST_CAP_TOKENS must agree with BAML urgency_cost_cap().
+export const URGENCY_COST_CAP_TOKENS = 1000;
+
+// Minimal structural row for the accumulator: the projection's CostEntry
+// carries more, but the fold only reads these three fields.
+export type CostSpend = { task: string; kind: string; tokens: number };
+
+export function taskIncurredTokens(costs: CostSpend[], task: string): number {
+	let total = 0;
+	for (const c of costs) {
+		if (c.kind === "incurred" && c.task === task) total += c.tokens;
+	}
+	return total;
+}
+
+export function taskIncurredUsd(costs: (CostSpend & { usd: number })[], task: string): number {
+	let total = 0;
+	for (const c of costs) {
+		if (c.kind === "incurred" && c.task === task) total += c.usd;
+	}
+	return total;
+}
+
+// Half the cap nudges (+1), at/over the cap saturates (+2). Mirror of BAML
+// urgency_cost — integer thresholds, no float drift.
+export function urgencyCost(incurredTokens: number): number {
+	if (incurredTokens <= 0) return 0;
+	if (incurredTokens >= URGENCY_COST_CAP_TOKENS) return 2;
+	if (incurredTokens >= URGENCY_COST_CAP_TOKENS / 2) return 1;
+	return 0;
+}
+
+// Per-task metered spend. Optional (defaults to unmetered) so existing
+// callers keep their exact behavior — unknown spend never inflates. The
+// --json rows carry incurred_tokens + cost_part for audit either way.
+export function urgencySpentTokens(
+	issueId: string,
+	spent: Map<string, number> | undefined,
+): number {
+	const raw = spent?.has(issueId) ? (spent.get(issueId) as number) : 0;
+	return raw < 0 ? 0 : raw;
+}
+
+export function urgencyFor(
+	issue: { id: string; severity: number | null },
+	edges: BaisEdge[],
+	costs: Map<string, number>,
+	now: number,
+	spent?: Map<string, number>,
+): Urgency {
+	const sev = urgencySeverity(issue.severity);
+	const fan = blocksFanOut(issue.id, edges);
+	const sole = soleUnblocks(issue.id, edges);
+	const blocks = urgencyBlocks(issue.id, edges);
+	const days = urgencyStalledDays(issue.id, costs, now);
+	const stalled = urgencyStalled(days);
+	const incurred = urgencySpentTokens(issue.id, spent);
+	const cost = urgencyCost(incurred);
+	return {
+		issue_id: issue.id,
+		score: sev + blocks + stalled + cost,
+		severity_part: sev,
+		fan_out: fan,
+		sole_unblocks: sole,
+		blocks_part: blocks,
+		stalled_days: days,
+		stalled_part: stalled,
+		incurred_tokens: incurred,
+		cost_part: cost,
+	};
+}
+
+export const MS_PER_DAY = 86400000;
+
+export function nowDays(nowMs: number = Date.now()): number {
+	return Math.floor(nowMs / MS_PER_DAY);
+}
+
+// Creation-day table from file mtimes (whole days). A file with no stat
+// (renamed mid-read, filter views) is left ABSENT so urgencyStalledDays
+// counts it fresh — unknown age must never inflate urgency.
+export function creationDaysFromMtimes(issuesDir: string, ids: string[]): Map<string, number> {
+	const out = new Map<string, number>();
+	for (const id of ids) {
+		try {
+			out.set(id, Math.floor(statSync(join(issuesDir, `${id}.toml`)).mtimeMs / MS_PER_DAY));
+		} catch {
+			// absent on purpose: reads as fresh downstream
+		}
 	}
 	return out;
 }
@@ -361,6 +766,59 @@ export function closeEvidenceIn(
 					out.push({ id: e.id, reason: "unresolvable-verdict", ref: `verdict(${r.ref})`, kind: "verdict", status: external ? "External" : "Missing" });
 				}
 			}
+		}
+	}
+	return out;
+}
+
+// bi#131: swarm slot verdicts — the closing record of a dispatched issue.
+// A dispatched close cites its pack with one body line shaped like
+// Evidence: (bi#83) so `bais check` verifies it the same way:
+//
+//   Swarm: pack(<pack-id>) slot(<n>) (landed|failed) by(<merger>)  # optional comment
+//
+// pack/slot join back to the dispatch pack the issue filled (consumed by
+// reviewer verdicts, bi#59 area — this shape is the join key, not the
+// join); landed|failed is the slot outcome; by(merger) names who folded
+// it. Gate posture mirrors close-evidence but weaker: the line is never
+// required (most closes were never dispatched — requiring it would fail
+// the existing Done graph), but a `Swarm:`-prefixed line that does not
+// parse is LOUD and fatal (malformed fails, never silently ignored).
+// Non-Done issues are checked too: a malformed shape is a shape
+// violation wherever it sits; well-formed lines on Open issues are
+// carried (oversight joins slots to packs off the parsed set).
+export type SwarmVerdict = { pack: string; slot: number; verdict: "landed" | "failed"; merger: string };
+export type SwarmProblem = {
+	id: string; // issue carrying the malformed line
+	reason: "malformed-swarm-verdict";
+	ref: string | null; // the raw offending line (trimmed), null when never reached
+	status: "Missing"; // always fatal — a shape violation, not an external ref
+};
+
+// One `Swarm: ...` verdict per matching body line (trailing `#`
+// comment stripped). Anything else on the line is not a verdict —
+// prose never counts, same as parseCloseEvidence.
+const SWARM_VERDICT_RE =
+	/^\s*Swarm\s*:\s*pack\(\s*([^)\s]+)\s*\)\s*slot\(\s*(\d+)\s*\)\s*(landed|failed)\s+by\(\s*([^)\s]+)\s*\)\s*(?:#.*)?$/;
+export function parseSwarmVerdicts(body: string): SwarmVerdict[] {
+	const out: SwarmVerdict[] = [];
+	for (const line of (body ?? "").split("\n")) {
+		const m = SWARM_VERDICT_RE.exec(line);
+		if (m) out.push({ pack: m[1].trim(), slot: Number(m[2]), verdict: m[3] as "landed" | "failed", merger: m[4].trim() });
+	}
+	return out;
+}
+
+// Malformed = a line whose left edge claims to be a verdict
+// (`Swarm:` prefix, case-sensitive like `Evidence:`) but does not parse
+// above. Entries are {id,status,body} so both the scan path and the
+// store path share this predicate.
+export function swarmVerdictProblemsIn(entries: { id: string; status: string; body: string }[]): SwarmProblem[] {
+	const out: SwarmProblem[] = [];
+	for (const e of entries) {
+		for (const line of (e.body ?? "").split("\n")) {
+			if (!/^\s*Swarm\s*:/.test(line)) continue;
+			if (!SWARM_VERDICT_RE.test(line)) out.push({ id: e.id, reason: "malformed-swarm-verdict", ref: line.trim(), status: "Missing" });
 		}
 	}
 	return out;

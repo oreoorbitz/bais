@@ -1,0 +1,7 @@
+id = "s#05"
+title = "garbled lease"
+status = "Doing"
+kind = "Feat"
+body = "b"
+holder = "ghost-3"
+lease = "2000-99-99T99:99:99Z"

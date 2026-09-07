@@ -1,0 +1,8 @@
+id = "t#02"
+title = "unscoped beta"
+status = "Open"
+kind = "Feat"
+body = """
+Beta work with no declared footprint yet.
+Acceptance: beta renders without crashing the host.
+"""

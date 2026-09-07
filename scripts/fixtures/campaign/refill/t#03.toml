@@ -1,0 +1,10 @@
+id = "t#03"
+title = "leaf three"
+status = "Open"
+kind = "Feat"
+area = "bais/multi-agent"
+body = """
+Second leaf after the hub.
+Files: leaf-three.ts
+Acceptance: leaf lands with its diff under review; whole-pack suite passes.
+"""

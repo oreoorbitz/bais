@@ -1,0 +1,16 @@
+[skill]
+id = "skill-demo-01"
+title = "Verify the issue premise against the live repo before implementing"
+tags = ["process", "review"]
+filed_in = "demo-156/squad-1"
+body = """
+Ground-first application: before writing code for an issue, grep the
+acceptance premise against the live tree. Witnessed 2026-09-06 on
+hub#159: the body asked to "cite the skill in the spawn-brief template",
+but grep showed briefs.mjs line 125 already cites ground-first — bullet
+1 was done, remainder was merger-checklist + witnessed case only.
+Without the grep the squad would have re-implemented a landed line.
+Applies whenever an issue body is older than the last sweep, or names
+a file/line that may have moved. Costs one grep; saves a redundant
+diff and a false "done".
+"""

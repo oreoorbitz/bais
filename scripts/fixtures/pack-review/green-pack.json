@@ -1,0 +1,33 @@
+{
+  "pack": "t-green",
+  "suite": "pass",
+  "slots": [
+    {
+      "slot": 0,
+      "id": "t#01",
+      "title": "declared alpha",
+      "files": ["alpha.ts"],
+      "files_state": "declared",
+      "item": "pass",
+      "diff": "diff --git a/alpha.ts b/alpha.ts\n+export const alpha = 1;\n"
+    },
+    {
+      "slot": 1,
+      "id": "t#02",
+      "title": "declared beta",
+      "files": ["beta.ts"],
+      "files_state": "declared",
+      "item": "pass",
+      "diff": "diff --git a/beta.ts b/beta.ts\n+export const beta = 2;\n"
+    },
+    {
+      "slot": 2,
+      "id": "t#03",
+      "title": "declared gamma",
+      "files": ["gamma.ts"],
+      "files_state": "declared",
+      "item": "pass",
+      "diff": "diff --git a/gamma.ts b/gamma.ts\n+export const gamma = 3;\n"
+    }
+  ]
+}

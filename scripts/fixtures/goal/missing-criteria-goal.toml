@@ -1,0 +1,5 @@
+# hub#158 fixture: missing done_criteria fails loud naming the field.
+statement = "Ship per-directory goal tracking for BAIS"
+style = "plain"
+hero = "plain"
+non_goals = ["backlog-wide campaigns"]

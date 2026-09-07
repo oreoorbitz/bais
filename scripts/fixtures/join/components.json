@@ -1,0 +1,12 @@
+[
+  {
+    "id": "join-component-php",
+    "title": "Rewrite the legacy billing endpoint in PHP",
+    "tags": ["php", "backend"]
+  },
+  {
+    "id": "join-component-orchestration",
+    "title": "Coordinate the rollout across squads",
+    "tags": ["dispatch", "coordination"]
+  }
+]

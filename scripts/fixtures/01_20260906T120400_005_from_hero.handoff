@@ -1,0 +1,9 @@
+id: handoff-005
+from: hero
+to: titan-1
+priority: 01
+type: note
+created_at: 2026-09-06T02:04:00Z
+directed-by: hero
+
+Rotate the hub key before the next checkpoint.

@@ -1,0 +1,9 @@
+id = "t#a5"
+title = "t#a5 threshold-boundary anchor"
+status = "Done"
+kind = "Feat"
+body = """
+Bare close exactly on the threshold (open_downstream = 1): the >=
+read must still demand an audit. The bi#57 red-check flips >= to >
+and this fixture is the tripwire that goes red.
+"""

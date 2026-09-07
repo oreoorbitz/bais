@@ -1,0 +1,12 @@
+id = "phantom-tool-parity"
+title = "MCP tools/list advertises tools tools/call cannot dispatch"
+source = "review 2026-09-06: mcp-test pins tools.length==6 + unknown-tool -32602 but only ever invokes bais_oversight/bais_sample (grep: no suite calls bais_list/bais_ready/bais_graph/bais_check via tools/call)"
+property = "every tools/list-advertised tool dispatches via tools/call with valid args (no phantoms in either direction: listed-but-uncallable or callable-but-unlisted)"
+suite = "mcp-test"
+arm = "parity-no-phantoms"
+status = "graduated"
+fixture = "tmpdir hub (.bais/issues/t1.toml Done alpha); one MCP spawn: initialize + tools/list + tools/call for each of the 6 listed names (bais_graph {from:t1}, bais_sample {n:1}, rest {})"
+exact_failure = "PHANTOM <name> (code -32602): unknown tool: <name>"
+redcheck = """
+2026-09-06 stub-server stand-in (src frozen by brief — stub presents exactly the drifted bytes: tools/list advertises all 6, tools/call bais_graph answers -32602 unknown tool): probeParity returned [{name:bais_graph, code:-32602, message:unknown tool: bais_graph}] — the exact PHANTOM line. Live run after: 6/6 dispatch, parity arm green, full mcp-test green.
+"""

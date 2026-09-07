@@ -179,6 +179,7 @@ function wire(
     admitted: bool = true,
     drop_reason: string? = null,
     author: string = "did:key:z6Mk-test",
+    ts: string = "2026-09-03T00:00:00Z",
 ) -> WireEvent {
     WireEvent {
         id: id,
@@ -189,7 +190,7 @@ function wire(
         entity: entity,
         refs: [],
         lc: lc,
-        ts: "2026-09-03T00:00:00Z",
+        ts: ts,
         type: t,
         body: body,
         admitted: admitted,
@@ -257,7 +258,7 @@ function apply_set(acc: Acc, e: WireEvent) -> void {
 function apply_transition(acc: Acc, e: WireEvent) -> void {
     // Fencing gate (Phase 3): a task under an active lease only moves on an
     // exact fencing-token echo; otherwise the write is evidence, not state.
-    if (!lease_fence_ok(acc, e.entity, e.lc, body_int(e.body, "fencing"))) {
+    if (!lease_fence_ok(acc, e.entity, e.lc, body_int(e.body, "fencing"), now_wall = e.ts)) {
         acc.excluded.push(Excluded { event_id: e.id, reason: "stale-fence" });
     } else if let to: string = body_string(e.body, "to") {
         if (!is_status(to)) {
@@ -501,14 +502,28 @@ function reduce(events: WireEvent[]) -> Reduction {
         caps: [],
     };
     let max_lc = 0;
+    // Max admitted wall ts (bi#42): fixed-shape RFC3339 UTC Z compares
+    // lexicographically == chronologically. Null until the first admitted
+    // event; absent entirely on logs whose events carry no ts evidence.
+    let max_wall: string? = null;
     for (let e in ordered) {
         dispatch(acc, e);
         if (e.admitted && e.lc > max_lc) {
             max_lc = e.lc;
         }
+        if (e.admitted) {
+            if let m: string = max_wall {
+                if (m < e.ts) {
+                    max_wall = e.ts;
+                }
+            } else {
+                max_wall = e.ts;
+            }
+        }
     }
-    // Derived expiry (Phase 3): expire is never written, only swept here.
-    sweep_expiry(acc, max_lc);
+    // Derived expiry (Phase 3 + bi#42 wall companion): expire is never
+    // written, only swept here over both clocks.
+    sweep_expiry(acc, max_lc, max_wall = max_wall);
     for (let iss in acc.issues) {
         iss.labels = present_labels(acc.label_ops, iss.entity);
     }

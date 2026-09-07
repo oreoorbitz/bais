@@ -159,13 +159,25 @@ function cap_covers(c: Cap, action: string, scope: string, at_lc: int) -> bool {
 
 // Live capability at a causal position: any covering grant. Takes the
 // caps list (not Acc) so tests and hosts call it on a Reduction too.
-function cap_live(caps: Cap[], audience: string, action: string, scope: string, at_lc: int) -> bool {
+function cap_live(
+    caps: Cap[],
+    audience: string,
+    action: string,
+    scope: string,
+    at_lc: int,
+) -> bool {
     caps.find((c) -> {
         c.audience == audience && cap_covers(c, action, scope, at_lc)
-    }) != null
+    })
+        != null
 }
 
-function grant_body(audience: string, can_json: string, scope: string, expiry: int) -> map<string, unknown> {
+function grant_body(
+    audience: string,
+    can_json: string,
+    scope: string,
+    expiry: int,
+) -> map<string, unknown> {
     let b: map<string, unknown> = {};
     let _ = b.set("audience", audience);
     let _ = b.set("can", can_json);
@@ -180,7 +192,18 @@ function only_cap(r: Reduction) -> Cap {
 }
 
 test "grant materializes with actions, scope, expiry" {
-    let r = reduce([wire("CapGrant", "did:key:z6Mk-bob", 1, "g1", grant_body("did:key:z6Mk-bob", "[\"lease.claim\",\"task.write\"]", "*", 100), author = "did:key:z6Mk-alice")]);
+    let r = reduce(
+        [
+            wire(
+                "CapGrant",
+                "did:key:z6Mk-bob",
+                1,
+                "g1",
+                grant_body("did:key:z6Mk-bob", "[\"lease.claim\",\"task.write\"]", "*", 100),
+                author = "did:key:z6Mk-alice",
+            ),
+        ],
+    );
     assert.equal(r.excluded.length(), 0);
     let c = only_cap(r);
     assert.equal(c.issuer, "did:key:z6Mk-alice");
@@ -202,14 +225,41 @@ test "grant missing fields are excluded, never defaulted" {
 }
 
 test "stillborn and bad-expiry grants are evidence" {
-    let r1 = reduce([wire("CapGrant", "did:key:z6Mk-bob", 50, "g1", grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 50))]);
+    let r1 = reduce(
+        [
+            wire(
+                "CapGrant",
+                "did:key:z6Mk-bob",
+                50,
+                "g1",
+                grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 50),
+            ),
+        ],
+    );
     assert.equal(r1.excluded[0].reason, "stillborn-grant");
-    let r2 = reduce([wire("CapGrant", "did:key:z6Mk-bob", 1, "g2", grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 0))]);
+    let r2 = reduce(
+        [
+            wire(
+                "CapGrant",
+                "did:key:z6Mk-bob",
+                1,
+                "g2",
+                grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 0),
+            ),
+        ],
+    );
     assert.equal(r2.excluded[0].reason, "bad-expiry");
 }
 
 test "revoke by issuer sticks, re-revoke is a no-op" {
-    let g = wire("CapGrant", "did:key:z6Mk-bob", 1, "g1", grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 100), author = "did:key:z6Mk-alice");
+    let g = wire(
+        "CapGrant",
+        "did:key:z6Mk-bob",
+        1,
+        "g1",
+        grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 100),
+        author = "did:key:z6Mk-alice",
+    );
     let rb: map<string, unknown> = {};
     let _ = rb.set("grant_ref", "g1");
     let r = reduce(
@@ -228,7 +278,14 @@ test "revoke by issuer sticks, re-revoke is a no-op" {
 }
 
 test "revoke by audience works, by stranger is denied" {
-    let g = wire("CapGrant", "did:key:z6Mk-bob", 1, "g1", grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 100), author = "did:key:z6Mk-alice");
+    let g = wire(
+        "CapGrant",
+        "did:key:z6Mk-bob",
+        1,
+        "g1",
+        grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 100),
+        author = "did:key:z6Mk-alice",
+    );
     let rb: map<string, unknown> = {};
     let _ = rb.set("grant_ref", "g1");
     let self = reduce([g, wire("CapRevoke", "did:key:z6Mk-bob", 2, "r1", rb, author = "did:key:z6Mk-bob")]);
@@ -249,18 +306,42 @@ test "revoke of unknown grant is evidence" {
 }
 
 test "new grant after revoke re-enables (per-id stickiness)" {
-    let g1 = wire("CapGrant", "did:key:z6Mk-bob", 1, "g1", grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 100), author = "did:key:z6Mk-alice");
+    let g1 = wire(
+        "CapGrant",
+        "did:key:z6Mk-bob",
+        1,
+        "g1",
+        grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 100),
+        author = "did:key:z6Mk-alice",
+    );
     let rb: map<string, unknown> = {};
     let _ = rb.set("grant_ref", "g1");
     let r1 = wire("CapRevoke", "did:key:z6Mk-bob", 2, "r1", rb, author = "did:key:z6Mk-alice");
-    let g2 = wire("CapGrant", "did:key:z6Mk-bob", 3, "g2", grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 100), author = "did:key:z6Mk-alice");
+    let g2 = wire(
+        "CapGrant",
+        "did:key:z6Mk-bob",
+        3,
+        "g2",
+        grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "*", 100),
+        author = "did:key:z6Mk-alice",
+    );
     let r = reduce([g1, r1, g2]);
     assert.equal(r.caps.length(), 2);
     assert.equal(cap_live(r.caps, "did:key:z6Mk-bob", "task.write", "*", 50), true);
 }
 
 test "scope narrows: exact or wildcard only" {
-    let r = reduce([wire("CapGrant", "did:key:z6Mk-bob", 1, "g1", grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "task:A", 100))]);
+    let r = reduce(
+        [
+            wire(
+                "CapGrant",
+                "did:key:z6Mk-bob",
+                1,
+                "g1",
+                grant_body("did:key:z6Mk-bob", "[\"task.write\"]", "task:A", 100),
+            ),
+        ],
+    );
     let acc = r.caps;
     assert.equal(cap_live(acc, "did:key:z6Mk-bob", "task.write", "task:A", 50), true);
     assert.equal(cap_live(acc, "did:key:z6Mk-bob", "task.write", "task:B", 50), false);

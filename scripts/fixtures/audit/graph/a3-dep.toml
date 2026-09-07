@@ -1,0 +1,12 @@
+id = "t#a3"
+title = "t#a3 second dependent"
+status = "Open"
+kind = "Feat"
+body = """
+Depends on t#a1: second live downstream vote.
+"""
+
+[[edge]]
+from = "t#a3"
+to = "t#a1"
+kind = "DependsOn"

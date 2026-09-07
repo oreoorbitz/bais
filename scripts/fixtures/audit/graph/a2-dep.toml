@@ -1,0 +1,12 @@
+id = "t#a2"
+title = "t#a2 first dependent"
+status = "Open"
+kind = "Feat"
+body = """
+Depends on t#a1: keeps the anchor load-bearing while Open.
+"""
+
+[[edge]]
+from = "t#a2"
+to = "t#a1"
+kind = "DependsOn"
