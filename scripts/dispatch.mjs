@@ -516,6 +516,135 @@ const slotsOf = (out) => out.split("\n").filter((l) => l.startsWith("slot")).map
 	check(hB.code === 0 && hB.err.includes("u#01") && hB.err.includes("d#01"), `live human mode names unknown + declared partner`);
 }
 
+// 15. hub#217: curriculum scheduling — dispatch consumes the measured-
+// capability schedule (Learning-with-Challenges, arXiv:2601.22781). BAML
+// owns the rule (bais/baml_src/curriculum.baml: tier_green /
+// dispatchable_tiers / curriculum_schedule, pinned by literal-tally baml
+// tests); the mirror below is the scripts-lane consumption, same lockstep
+// pattern as dispatchPack. A fixture campaign over two measurement
+// windows shows harder-tier issues HELD with a named reason while the
+// frontier tier is red, and dispatched once the green threshold is met —
+// including against the naive CLI pack, which seats the harder tier
+// immediately.
+// NOTE for the src lane: the raw `dispatch` CLI does NOT yet consume the
+// schedule (needs bais/src/cli.ts + bi/src/bais.ts: read the BITS arm
+// tallies, run curriculum_schedule over the ready set BEFORE
+// dispatch_pack, carry `held: [{id, reason}]` in --json, and print one
+// `[bais] curriculum hold: <id> — <reason>` line per held issue on
+// stderr; exit stays 0 — held work is valid, never silent).
+{
+	// ── mirror of baml_src/curriculum.baml (hub#217) — keep in lockstep ──
+	const observations = (t) => t.pass + t.fail;
+	const passRatePct = (t) => (observations(t) === 0 ? 0 : Math.trunc((t.pass * 100) / observations(t)));
+	// RED-CHECK TARGET: the green-threshold comparison (see the red-check
+	// record at the bottom of this section).
+	const tierGreen = (t, thresholdPct) => observations(t) > 0 && t.pass * 100 >= thresholdPct * observations(t);
+	const tallyFor = (tier, tiers) => (tiers.find((t) => t.tier === tier) ?? {}).tally ?? null;
+	const rateOf = (tier, tiers) => {
+		const t = tallyFor(tier, tiers);
+		return t ? passRatePct(t) : 0;
+	};
+	const dispatchableTiers = (tiers, thresholdPct) => {
+		const out = [];
+		let remaining = [...tiers];
+		while (remaining.length > 0) {
+			let best = remaining[0];
+			for (const t of remaining) if (t.tier < best.tier) best = t;
+			out.push(best.tier);
+			if (!tierGreen(best.tally, thresholdPct)) break;
+			remaining = remaining.filter((t) => t.tier !== best.tier);
+		}
+		return out;
+	};
+	const holdReason = (item, tiers, thresholdPct) => {
+		if (tallyFor(item.tier, tiers) === null) return `tier ${item.tier} unmeasured — no tally record, fail-closed (declare measurements first)`;
+		let frontier = null;
+		for (const t of tiers) {
+			if (t.tier <= item.tier && !tierGreen(t.tally, thresholdPct)) {
+				if (frontier === null || t.tier < frontier.tier) frontier = t;
+			}
+		}
+		if (frontier) return `tier ${item.tier} held: frontier tier ${frontier.tier} pass-rate ${passRatePct(frontier.tally)}% below ${thresholdPct}% threshold (${frontier.tally.pass}/${observations(frontier.tally)} arms passing)`;
+		return `tier ${item.tier} held — outside the declared dispatch radius`;
+	};
+	const curriculumSchedule = (ready, tiers, thresholdPct) => {
+		const allowed = dispatchableTiers(tiers, thresholdPct);
+		const held = [];
+		let pool = [];
+		for (const r of ready) {
+			if (allowed.includes(r.tier)) pool.push(r);
+			else held.push({ id: r.id, reason: holdReason(r, tiers, thresholdPct) });
+		}
+		const dispatch = [];
+		while (pool.length > 0) {
+			let best = null;
+			let bestRate = 0;
+			for (const r of pool) {
+				const rate = rateOf(r.tier, tiers);
+				if (best === null || rate < bestRate
+					|| (rate === bestRate && r.foundation_rank < best.foundation_rank)
+					|| (rate === bestRate && r.foundation_rank === best.foundation_rank && r.id < best.id)) {
+					best = r;
+					bestRate = rate;
+				}
+			}
+			dispatch.push(best.id);
+			pool = pool.filter((r) => r.id !== best.id);
+		}
+		return { dispatch, held };
+	};
+	// Fixture campaign: one squad, three tiers of ready work, two
+	// measurement windows.
+	const ready = [
+		{ id: "t#a", tier: 0, foundation_rank: 1 },
+		{ id: "t#b", tier: 1, foundation_rank: 0 },
+		{ id: "t#c", tier: 2, foundation_rank: 0 },
+	];
+	const w1 = [
+		{ tier: 0, tally: { pass: 9, fail: 1, skip: 0 } }, // 90% green
+		{ tier: 1, tally: { pass: 1, fail: 1, skip: 0 } }, // 50% red frontier
+		{ tier: 2, tally: { pass: 4, fail: 0, skip: 0 } }, // 100% but gated behind tier 1
+	];
+	const s1 = curriculumSchedule(ready, w1, 80);
+	check(JSON.stringify(s1.dispatch) === '["t#b","t#a"]', `campaign window 1: red frontier holds the radius (${JSON.stringify(s1.dispatch)})`);
+	check(s1.held.length === 1 && s1.held[0].id === "t#c" && s1.held[0].reason === "tier 2 held: frontier tier 1 pass-rate 50% below 80% threshold (1/2 arms passing)", `campaign window 1: harder tier held with named reason (${JSON.stringify(s1.held[0]?.reason)})`);
+	// Naive dispatch seats the harder tier immediately — the schedule is
+	// what holds it back.
+	const d = mkfix([
+		["t#a.toml", issue("t#a", "easy", "Open", [], "", "ta.ts")],
+		["t#b.toml", issue("t#b", "frontier", "Open", [], "", "tb.ts")],
+		["t#c.toml", issue("t#c", "hard", "Open", [], "", "tc.ts")],
+	]);
+	const naive = JSON.parse(run(d, ["dispatch", "--agents", "3", "--json"]).out);
+	check(JSON.stringify(naive.slots.map((s) => s.issue.id)) === '["t#a","t#b","t#c"]', `naive pack seats the harder tier (${JSON.stringify(naive.slots.map((s) => s.issue.id))})`);
+	const governed = naive.slots.map((s) => s.issue.id).filter((id) => !s1.held.some((h) => h.id === id));
+	check(JSON.stringify(governed) === '["t#a","t#b"]', `governed pack holds the harder tier (${JSON.stringify(governed)})`);
+	// Window 2: the frontier tier is mastered to exactly the threshold —
+	// the radius expands and the harder tier dispatches.
+	const w2 = [
+		{ tier: 0, tally: { pass: 9, fail: 1, skip: 0 } },
+		{ tier: 1, tally: { pass: 4, fail: 1, skip: 0 } }, // exactly 80% — green
+		{ tier: 2, tally: { pass: 4, fail: 0, skip: 0 } },
+	];
+	const s2 = curriculumSchedule(ready, w2, 80);
+	check(JSON.stringify(s2.dispatch) === '["t#b","t#a","t#c"]', `campaign window 2: harder tier dispatches once the frontier is green (${JSON.stringify(s2.dispatch)})`);
+	check(s2.held.length === 0, `campaign window 2: nothing held`);
+	check(JSON.stringify(curriculumSchedule(ready, w2, 80)) === JSON.stringify(s2), `schedule is deterministic on identical inputs`);
+	// Fail-closed: an unmeasured tier never dispatches blind (bi#55).
+	const s3 = curriculumSchedule([{ id: "t#m", tier: 5, foundation_rank: 0 }], w2, 80);
+	check(s3.dispatch.length === 0 && s3.held.length === 1 && s3.held[0].reason.includes("unmeasured"), `unmeasured tier held fail-closed (${JSON.stringify(s3.held[0]?.reason)})`);
+	// Red-check 2026-09-07 (bi#57): with the mirror's green-threshold
+	// comparison flipped `>=` -> `>` in tierGreen above, the suite failed
+	// LOUD with 2 failure(s) FOR THE RIGHT REASON —
+	//   FAIL: campaign window 2: harder tier dispatches once the frontier
+	//   is green (["t#b","t#a"]) and FAIL: campaign window 2: nothing held
+	// — the exactly-80% frontier went red and t#c was held behind it
+	// (windows 1/naive checks stayed green: 50% is red under either
+	// comparison, so only the boundary discriminates). Restored, green.
+	// A threshold comparison that cannot go red at the boundary is
+	// camouflage, not coverage.
+}
+
 if (failures) {
 	console.error(`${failures} failure(s)`);
 	process.exit(1);

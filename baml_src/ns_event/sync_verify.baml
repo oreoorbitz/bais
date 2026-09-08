@@ -65,10 +65,12 @@ function lease_token_verdict(
         if (lease_live(l, now_lc, now_wall = now_wall)) {
             match (fencing) {
                 null => "stale-fence",
-                let f: int => if (f == l.fencing) {
-                    null
-                } else {
-                    "stale-fence"
+                let f: int => {
+                    if (f == l.fencing) {
+                        null
+                    } else {
+                        "stale-fence"
+                    }
                 },
             }
         } else if let f: int = fencing {
@@ -208,7 +210,14 @@ test "wall-expired lease refuses the dead token echo past the bound" {
                 author = "did:key:z6Mk-alice",
                 ts = "2026-09-04T00:00:00Z",
             ),
-            wire("TaskCreate", "task:OTHER", 9101, "e2", str_body("title", "b"), ts = "2026-09-04T00:02:00Z"),
+            wire(
+                "TaskCreate",
+                "task:OTHER",
+                9101,
+                "e2",
+                str_body("title", "b"),
+                ts = "2026-09-04T00:02:00Z",
+            ),
         ],
     );
     assert.equal(dead.leases.length(), 1);
@@ -264,7 +273,14 @@ test "wall-expired lease refuses the dead token echo past the bound" {
 test "live lease agrees with the owning fence gate both directions" {
     let r = reduce(
         [
-            wire("LeaseClaim", "task:A", 1, "e1", claim_body(100, 0, "a1"), author = "did:key:z6Mk-alice"),
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                claim_body(100, 0, "a1"),
+                author = "did:key:z6Mk-alice",
+            ),
         ],
     );
     assert.equal(r.leases[0].status, "active");
@@ -279,7 +295,14 @@ test "live lease agrees with the owning fence gate both directions" {
     let create = wire("TaskCreate", "task:A", 2, "e9", str_body("title", "a"));
     let ok = reduce(
         [
-            wire("LeaseClaim", "task:A", 1, "e1", claim_body(100, 0, "a1"), author = "did:key:z6Mk-alice"),
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                claim_body(100, 0, "a1"),
+                author = "did:key:z6Mk-alice",
+            ),
             create,
             wire("TaskTransition", "task:A", 3, "e3", fenced),
         ],
@@ -287,7 +310,14 @@ test "live lease agrees with the owning fence gate both directions" {
     assert.equal(ok.excluded.length(), 0);
     let bare = reduce(
         [
-            wire("LeaseClaim", "task:A", 1, "e1", claim_body(100, 0, "a1"), author = "did:key:z6Mk-alice"),
+            wire(
+                "LeaseClaim",
+                "task:A",
+                1,
+                "e1",
+                claim_body(100, 0, "a1"),
+                author = "did:key:z6Mk-alice",
+            ),
             create,
             wire("TaskTransition", "task:A", 3, "e3", plain),
         ],
@@ -301,8 +331,14 @@ test "stale checkpoint below the prune floor is refused, same-anchor re-anchors"
     assert.equal(checkpoint_sync_verdict("ab12", ["e0"], "bais.reduce@1", 9, 8), null);
     assert.equal(checkpoint_sync_verdict("ab12", ["e0"], "bais.reduce@1", 4, 0), null);
     assert.equal(checkpoint_sync_verdict("ab12", ["e0"], "bais.reduce@99", 9, 8), "version-skew");
-    assert.equal(checkpoint_sync_verdict("ab12", [], "bais.reduce@1", 9, 8), "missing-checkpoint-field");
-    assert.equal(checkpoint_sync_verdict("", ["e0"], "bais.reduce@1", 9, 8), "missing-checkpoint-field")
+    assert.equal(
+        checkpoint_sync_verdict("ab12", [], "bais.reduce@1", 9, 8),
+        "missing-checkpoint-field",
+    );
+    assert.equal(
+        checkpoint_sync_verdict("", ["e0"], "bais.reduce@1", 9, 8),
+        "missing-checkpoint-field",
+    )
 }
 
 test "evicted pub cursor is gap-unknown, live cursors replay" {

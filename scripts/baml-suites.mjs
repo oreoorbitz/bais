@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const projects = ["bits", "bagl"];
+const projects = ["bits", "bagl", "bais"];
 
 let failures = 0;
 for (const p of projects) {

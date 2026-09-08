@@ -23,6 +23,9 @@ import { findShadowHubs, formatShadow } from "./fork.js";
 import type { BlastRadius, Urgency } from "./graph.js";
 import { parseBaisFile } from "./toml.js";
 import type { WhyNot } from "./graph.js";
+import { loadPromptRecords, promptsDirFor, registryVerdict, renderProblemLine } from "./prompt_registry.js";
+import type { RegistryPhase } from "./prompt_registry.js";
+import { dismissSuggestion, loadSuggestions, MAX_PENDING, pendingSuggestions, promoteDerivation, writePromotedIssue, writeSuggestion } from "./suggestion.js";
 import { dbPathFor, hasStore, ingestIssues, storeCaps, storeCheck, storeEdges, storeFreshness, storeGraph, storeList, storeOversight, storeReady, storeSample, storeWhyNot, verifyStore, deepVerify } from "./store.js";
 import { createHub } from "./hub.js";
 import { loadPeerKey, appendForeignEvents, publishCheckpoint, verifyCheckpointRoot } from "./hub.js";
@@ -50,10 +53,20 @@ Usage:
   bais dispatch --agents N [--json] [--briefs]  # dry-run swarm pack: load-bearing first (bi#123), never mutates
                                 # carries as_of + completeness from the store
   bais goal <start|sketch|commit|status|switch> [--approve]  # per-directory campaign interview (bi#132)
+  bais goal gate [--json]                 # deterministic gates first (baml check/test + e2e scaffolds),
+                                # fingerprint-cached, auto-pauses on red — judge never wired (hub#213)
   bais goal snapshot --out <file>            # snapshot the campaign (recoverable-clear precondition, bi#136)
   bais goal clear --snapshot <file> --confirm  # snapshot-first + explicit confirm (refused otherwise)
   bais goal retire <id> --reason <R> [--archive]  # Dropped with reason (or archived), never silent delete
   bais stale [--days N] [--json]  # deterministic prune candidates with reasons, never auto-closes (bi#80)
+  bais curator [--dry-run|--apply] [--now <RFC3339>] [--actor <name>] [--json]
+                                # lifecycle sweep: dry-run (default) reports only, writes nothing;
+                                # --apply snapshots first, then ledger + state via curator.mjs (hub#212)
+  bais suggestions list [--all] [--json]    # consent-first suggestion lane (hub#211)
+  bais suggestions dismiss <sug-id>         # latch the dedup_key forever
+  bais suggestions promote <sug-id> <new-issue-id> --yes
+                                # without --yes: derivation preview, writes nothing; with --yes:
+                                # issue write first, Promoted latch only after it succeeds
   bais archive --size [--cap N] [--json]  # archive budget: exact bytes, loud warn over cap (bi#136)
   bais archive <id> [--reason R]          # move an issue to .bais/archive/
   bais delete <id> [--json]               # fully remove an issue file + projection rebuild
@@ -63,7 +76,9 @@ Usage:
   bais renew <id> --as <owner> [--for 4h]  # extend a live claim (heartbeat)
   bais reap [--now <instant>] [--json]     # expired Doing -> Open
   bais list [--json] [--claims]            # --claims appends holder/lease cols + swarm groups (bi#130)
-  bais check [--json]
+  bais check [--json] [--registry-strict]
+                                # --registry-strict: prompt-registry problems + parse failures become
+                                # fatal (hub#210); default phase is warn (advisory, exit untouched)
   bais verify [--deep] [--json]  # content fingerprint (deep: full BAML re-reduce + id sweep)
   bais graph --from <id> [--json]   # recursive CTE from the store, BFS fallback
   bais hub [--port N]               # lease coordinator (Phase 3), serves until SIGINT
@@ -715,6 +730,34 @@ if (cmd === "check") {
 	// predates them, same as claims) — both paths share these entries.
 	const swarmEntries = (await loadIssues(issuesDir)).issues.map((f) => ({ id: f.issue.id, status: f.issue.status, body: f.issue.body }));
 	const swarm = swarmVerdictProblemsIn(swarmEntries);
+	// hub#210: prompt-registry rollout (warn-first-then-fail, the style/hero
+	// hub#158 precedent). Records live in the sibling prompts lane
+	// (promptsDirFor); the eval-edge join runs over the same loaded-issue
+	// list check already builds (swarmEntries carries id+status). Warn phase
+	// is advisory — it never touches the exit code; --registry-strict flips
+	// to fail, adding registry problems + parse failures to every exit-1
+	// condition below (store/scan, text/--json alike).
+	const registryPhase: RegistryPhase = argv.includes("--registry-strict") ? "fail" : "warn";
+	const registryLoad = loadPromptRecords(promptsDirFor(issuesDir));
+	const registry = registryVerdict(
+		registryLoad.records.map((r) => r.record),
+		swarmEntries,
+		registryPhase,
+	);
+	const registryFatal = registryPhase === "fail" ? registry.problems.length + registryLoad.failures.length : 0;
+	const registryJson = (): unknown => ({
+		phase: registry.phase,
+		passed: registry.passed,
+		problems: registry.problems,
+		failures: registryLoad.failures,
+	});
+	const printRegistry = (): void => {
+		for (const f of registryLoad.failures) console.log(`prompt-registry\t${f.file}\tparse-failure\t${f.error}`);
+		for (const p of registry.problems) console.log(renderProblemLine(p));
+		console.log(
+			`prompt-registry-phase\t${registry.phase}\t${registry.phase === "warn" ? "advisory — --registry-strict flips to fail (hub#210)" : "strict — registry problems and parse failures are fatal (hub#210)"}`,
+		);
+	};
 	if (useStore) {
 		const { ok, bad, dangling, cycles, evidence } = storeCheck(issuesDir);
 		const missing = dangling.filter((d) => d.status === "Missing");
@@ -733,7 +776,7 @@ if (cmd === "check") {
 			const staleClaims = (await loadIssues(issuesDir)).issues
 				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
 				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
-			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence, staleClaims, staleStore, shadows, swarm, swarmVerdicts }, null, 2));
+			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence, staleClaims, staleStore, shadows, swarm, swarmVerdicts, promptRegistry: registryJson() }, null, 2));
 		} else {
 			for (const d of missing) console.log(`dangling\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			for (const d of external) console.log(`external\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
@@ -748,12 +791,13 @@ if (cmd === "check") {
 			const fatalEvidence = printEvidence(evidence);
 			const fatalSwarm = printSwarm(swarm);
 			printShadows();
+			printRegistry();
 			console.log(`ok\t${ok} issues, ${bad.length} bad`);
-			if (bad.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length) process.exit(1);
+			if (bad.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal) process.exit(1);
 			process.exit(0);
 		}
 		const fatalEvidence = evidence.filter((p) => p.status === "Missing").length;
-		if (bad.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length) process.exit(1);
+		if (bad.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal) process.exit(1);
 	} else {
 		const { issues, failures } = await loadIssues(issuesDir);
 		const dangling = danglingRefsIn(issues, projectName(issuesDir));
@@ -771,7 +815,7 @@ if (cmd === "check") {
 			const staleClaims = issues
 				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
 				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
-			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence, staleClaims, shadows, swarm, swarmVerdicts }, null, 2));
+			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence, staleClaims, shadows, swarm, swarmVerdicts, promptRegistry: registryJson() }, null, 2));
 		} else {
 			for (const f of issues) console.log(`ok\t${f.issue.id}`);
 			for (const b of failures) console.log(`bad\t${b.file}\t${b.error}`);
@@ -796,7 +840,8 @@ if (cmd === "check") {
 			// bi#131: malformed Swarm: verdict lines refuse loudly here.
 			const fatalSwarm = printSwarm(swarm);
 			printShadows();
-			if (failures.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length) process.exit(1);
+			printRegistry();
+			if (failures.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal) process.exit(1);
 			process.exit(0);
 		}
 
@@ -805,7 +850,7 @@ if (cmd === "check") {
 		// exited 0 in JSON mode, which made it useless as a CI gate. Same for
 		// External verdict refs (bi#83): reported, never fatal.
 		const fatalEvidence = evidence.filter((p) => p.status === "Missing").length;
-		if (failures.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length) process.exit(1);
+		if (failures.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal) process.exit(1);
 	}
 	process.exit(0);
 }
@@ -1559,7 +1604,7 @@ if (cmd === "goal") {
 	const gm = await loadGoalModule();
 	const goalFile = join(root, "goal.toml");
 	const verb = argv[1];
-	const usage = `bais goal <start|sketch|commit|status|switch|snapshot|clear|retire> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding)`;
+	const usage = `bais goal <start|sketch|commit|status|switch|snapshot|clear|retire|gate> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding; gate is hub#213)`;
 	const loadGoal = (): any => {
 		if (!existsSync(goalFile)) {
 			console.error(`bais goal: no campaign at ${goalFile} — run \`bais goal start "<statement>"\` first`);
@@ -1836,6 +1881,40 @@ if (cmd === "goal") {
 			if (useStore) await ingestIssues(issuesDir);
 			console.log(`retired\t${id}\tDropped\t${reason}`);
 		}
+	} else if (verb === "gate") {
+		// hub#213: deterministic gates first, judge never wired here (null —
+		// a red suite pauses with a named reason instead of reaching any
+		// verdict). Gates: baml check/test for the bais package when present,
+		// then the committed goal's e2e scaffolds (hub#184). The fingerprint
+		// cache (.bais/gate-cache.json) replays results on an unchanged
+		// workspace instead of re-running; retries bounded by
+		// GATE_RETRY_DEFAULT, then auto-pause.
+		const g = loadGoal();
+		const hubRoot = resolve(issuesDir, "..", "..");
+		const gates: { name: string; argv: string[]; cwd?: string; timeout?: number }[] = [];
+		if (existsSync(join(hubRoot, "bais", "baml.toml"))) {
+			gates.push(
+				{ name: "baml check (bais)", argv: ["baml", "check", "--project", "bais"], cwd: hubRoot, timeout: 300000 },
+				{ name: "baml test (bais)", argv: ["baml", "test", "--project", "bais"], cwd: hubRoot, timeout: 300000 },
+			);
+		}
+		gates.push(...gm.goalGates(g, { e2eDir: ".bais/e2e" }));
+		const res = gm.runGoalGate({
+			gates,
+			fingerprint: () => gm.workspaceFingerprint(process.cwd()),
+			cache: gm.newFileGateCache(".bais/gate-cache.json"),
+			retries: gm.GATE_RETRY_DEFAULT,
+			judge: null,
+			turnBudget: 0,
+		});
+		if (asJson) {
+			printJson(res);
+		} else {
+			for (const r of res.results) console.log(`gate\t${r.status === 0 ? "ok" : "red"}\t${r.name}${r.replayed ? "\treplay" : ""}`);
+			if (res.paused) console.error(`bais goal gate: paused — ${res.pause_reason}`);
+			else console.log(`gates green (${res.results.length})`);
+		}
+		process.exit(res.ok ? 0 : 1);
 	} else {
 		console.error(usage);
 		process.exit(1);
@@ -1905,6 +1984,141 @@ if (cmd === "stale") {
 		if (!cands.length) console.log("(no stale candidates)");
 	}
 	process.exit(cands.length ? 1 : 0);
+}
+
+// hub#211: consent-first suggestion lane. Suggestions are a record class
+// separate from Issue, living in the sibling .bais/suggestions lane
+// (file-per-record like issues, so `bais ready` stays work-only by
+// construction). list/dismiss never touch the issues dir; promote writes an
+// issue ONLY through writePromotedIssue with explicit --yes consent, and
+// the Promoted latch persists only after that write succeeds — a failed
+// promote must never latch.
+if (cmd === "suggestions") {
+	ensureInit();
+	const suggestionsDir = join(resolve(issuesDir, ".."), "suggestions");
+	const sub = argv[1];
+	const usage = `bais suggestions — consent-first suggestion lane (hub#211)
+  bais suggestions list [--all] [--json]     # pending ascending by offered_at (+ terminal records with --all)
+  bais suggestions dismiss <sug-id>          # latch the dedup_key forever
+  bais suggestions promote <sug-id> <new-issue-id> --yes   # no --yes: preview only, writes nothing`;
+	if (sub === "list") {
+		const { suggestions, failures } = loadSuggestions(suggestionsDir);
+		const showAll = argv.includes("--all");
+		const rows = (showAll ? suggestions : pendingSuggestions(suggestions)).sort(
+			(a, b) => a.offered_at - b.offered_at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+		);
+		if (asJson) {
+			printJson({ suggestions: rows, pending: pendingSuggestions(suggestions).length, cap: MAX_PENDING, unparseable: failures });
+		} else {
+			for (const s of rows) console.log(`${s.id}\t${s.status}\t${s.offered_at}\t${s.title}${showAll && s.resolution != null ? `\t${s.resolution}` : ""}`);
+			if (!rows.length) console.log(showAll ? "(no suggestions)" : "(no pending suggestions)");
+			// A record that failed to parse is loud here, never silently dropped (bi#55).
+			for (const f of failures) console.log(`bad\t${f.file}\t${f.error}`);
+		}
+		process.exit(0);
+	}
+	if (sub === "dismiss") {
+		const id = argv[2];
+		if (!id || id.startsWith("--")) {
+			console.error(usage);
+			process.exit(1);
+		}
+		try {
+			// Dismissal IS the latch: the record flips to Dismissed on disk and
+			// its dedup_key is never re-offered.
+			const d = dismissSuggestion(suggestionsDir, id);
+			if (asJson) printJson({ dismissed: d.id, dedup_key: d.dedup_key, status: d.status, resolution: d.resolution });
+			else console.log(`dismissed\t${d.id}\t${d.dedup_key}`);
+		} catch (e: any) {
+			console.error(`bais suggestions dismiss: ${String(e?.message ?? e).split("\n")[0]}`);
+			process.exit(1);
+		}
+		process.exit(0);
+	}
+	if (sub === "promote") {
+		const id = argv[2];
+		const newId = argv[3];
+		if (!id || !newId || id.startsWith("--") || newId.startsWith("--")) {
+			console.error(usage);
+			process.exit(1);
+		}
+		const { suggestions } = loadSuggestions(suggestionsDir);
+		const s = suggestions.find((x) => x.id === id);
+		if (!s) {
+			console.error(`bais suggestions promote: unknown suggestion ${id}`);
+			process.exit(1);
+		}
+		if (s.status !== "Pending") {
+			console.error(`bais suggestions promote refused: ${id} is ${s.status}, not Pending (terminal records latch their dedup_key forever)`);
+			process.exit(1);
+		}
+		const derivation = promoteDerivation(s, newId);
+		if (!argv.includes("--yes")) {
+			// Consent-first: print the derivation preview, write nothing.
+			if (asJson) printJson({ preview: derivation, consent: "refused — pass --yes to write the issue" });
+			else {
+				console.log("preview (dry run — nothing written; pass --yes to promote):");
+				console.log(JSON.stringify(derivation, null, 2));
+			}
+			process.exit(0);
+		}
+		try {
+			// Issue write first, latch second: a failed promote must never latch.
+			const file = writePromotedIssue(issuesDir, s, newId, true);
+			const latch = writeSuggestion(suggestionsDir, { ...s, status: "Promoted", resolution: `promoted-to-${newId}` });
+			if (useStore) await ingestIssues(issuesDir);
+			if (asJson) printJson({ promoted: { suggestion: s.id, issue: newId, file, latch, dedup_key: s.dedup_key } });
+			else {
+				console.log(`promoted\t${s.id}\t${newId}\t${file}`);
+				console.log(`latched\t${s.dedup_key}`);
+			}
+		} catch (e: any) {
+			console.error(`bais suggestions promote: ${String(e?.message ?? e).split("\n")[0]} — nothing latched`);
+			process.exit(1);
+		}
+		process.exit(0);
+	}
+	console.error(usage);
+	process.exit(1);
+}
+
+// hub#212: deterministic lifecycle sweep. Route-only (the hub#163
+// single-source rule): bais/scripts/curator.mjs owns the policy; this block
+// resolves argv + filesystem facts and renders. Default (no --apply) is a
+// dry-run REPORT that writes nothing — no ledger, no state file, no
+// snapshot. --apply passes the actor through and performs snapshot +
+// ledger + archive via applyActions against the hub root. --now rides the
+// same claimNowMs helper as move/renew/reap.
+if (cmd === "curator") {
+	ensureInit();
+	const cm = await loadScriptModule("curator.mjs");
+	if (argv.includes("--apply") && argv.includes("--dry-run")) {
+		console.error("bais curator: --apply and --dry-run are mutually exclusive");
+		process.exit(1);
+	}
+	const apply = argv.includes("--apply");
+	const hubRoot = resolve(issuesDir, "..", "..");
+	const nowMs = claimNowMs();
+	const actor = flagVal("--actor") ?? process.env.USER ?? "curator";
+	const nowDay = cm.dayOf(nowMs);
+	const nowIso = new Date(nowMs).toISOString();
+	const files = await cm.loadHub(hubRoot, nowMs);
+	const state = cm.loadState(hubRoot);
+	const actions = cm.curatorSweep(files.map((f: any) => f.issue), nowDay, state?.last_sweep_day ?? null);
+	const mode = apply ? "apply" : "dry-run";
+	if (asJson) {
+		printJson({ hub: hubRoot, now: nowIso, mode, first_run: state == null, counts: cm.summarize(actions), actions });
+	} else {
+		process.stdout.write(cm.formatReport({ hub: hubRoot, nowIso, mode, firstRun: state == null, actions }));
+	}
+	if (apply) {
+		const { snapDir } = cm.applyActions(hubRoot, files, actions, { nowMs, nowIso, nowDay, actor });
+		console.error(`curator: snapshot ${snapDir}`);
+		console.error(`curator: ledger ${join(hubRoot, ".bais", "curator-ledger.jsonl")} appended (actor ${actor})`);
+		// Archiving moves files out of issues/ — rebuild the projection (move precedent).
+		if (useStore) await ingestIssues(issuesDir);
+	}
+	process.exit(0);
 }
 
 // bi#136: archive budget + real delete. Archive is .bais/archive/ (flat

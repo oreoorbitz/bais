@@ -26,6 +26,16 @@
 // selftest with exactly:
 //   "FAIL selftest: sketch refused while checklist open"
 // (verified 2026-09-06: guard removed -> that FAIL observed -> restored green).
+//
+// hub#213 (hermes /goal mechanics): the interview checklist gains a tenth
+// box, "contract" — the five-field completion contract (outcome,
+// verification, constraints, boundaries, stop_when), shape-only validated
+// per the validateGoal precedent and round-tripped through goal.toml — and
+// the file gains a deterministic gate runner (runGoalGate): gates must exit
+// 0 BEFORE any judge verdict, a git-fingerprint cache replays a recorded
+// failure on unchanged workspace state without re-running, and bounded
+// retries auto-pause with a named reason on exhaustion. See the hub#213
+// sections below.
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -37,11 +47,11 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const FIXTURES = join(HERE, "fixtures", "goal");
 
-export const CHECKLIST = ["users", "scale", "platform", "constraints", "style", "acceptance", "non-goals", "testing-surface", "surface-spec"];
+export const CHECKLIST = ["users", "scale", "platform", "constraints", "style", "acceptance", "non-goals", "testing-surface", "surface-spec", "contract"];
 
 // Max interview rounds: one per box plus slack, then the rest auto-default.
 // Scoping stops being an interrogation even if the human never says "defaults".
-export const MAX_ROUNDS = 10;
+export const MAX_ROUNDS = 11;
 
 // Every interview question ends with this escape (asserted by the selftest).
 export const DEFAULTS_ESCAPE = `Reply with a value, "waive" to skip this box, or "defaults" to fill every remaining box with defaults and move on.`;
@@ -70,6 +80,9 @@ export const DEFAULTS = {
 	// NEVER purity: a pure-no-io exemption is only ever established
 	// explicitly via answerSurfaceSpec, never assumed.
 	"surface-spec": "waiver => defaults escape: no surface declared, taste unexamined",
+	// hub#213: same rule for the completion contract — defaulting records a
+	// reasoned waiver, never a silent absence of the done-definition.
+	contract: "waiver => defaults escape: no completion contract declared",
 };
 
 const BOX_QUESTIONS = {
@@ -88,6 +101,11 @@ const BOX_QUESTIONS = {
 	// or an explicitly established pure-no-io exemption.
 	"surface-spec":
 		'What does GOOD look like — which existing spec, design, or artifacts define the interface surface (UI design, presentation form, parser token spec, API shape, machine-readable format)? (one item per facet: <facet> => <spec or design ref>, items separated by \';\'; "waiver => <reason>" records an explicit taste-waiver, "pure-no-io => <reason>" records a goal with truly no I/O)',
+	// hub#213: the hermes completion contract — asked last (CHECKLIST order),
+	// five fields, each "<field> => <text>". Settle only via answerContract:
+	// all five fields, or an explicit waiver with reason.
+	contract:
+		'What is the completion contract — outcome => <what done delivers>; verification => <how done is proven>; constraints => <what binds the work>; boundaries => <what is out of scope>; stop_when => <when to stop>? (all five fields, items separated by \';\'; "waiver => <reason>" records an explicit contract-waiver)',
 };
 
 export function newGoal(statement) {
@@ -135,6 +153,9 @@ export function answer(goal, box, value) {
 	// hub#185: the testing-surface box settles loud for the same reason —
 	// a surface without an exercise half fails here, not silently.
 	if (box === "testing-surface") return answerTestingSurface(goal, value);
+	// hub#213: the contract box settles loud — a contract missing one of the
+	// five fields fails here, not silently.
+	if (box === "contract") return answerContract(goal, value);
 	if (goal.boxes[box].status !== "open") throw new Error(`box already settled: ${box}`);
 	goal.boxes[box] = { status: "filled", value: String(value ?? "") };
 	return goal;
@@ -157,6 +178,15 @@ export function waive(goal, box) {
 	if (box === "testing-surface") {
 		throw new Error(
 			`testing-surface cannot be bare-waived: supply "<surface> => <exercise>" via answer, an explicit waiver "waiver => <reason>", or "none-needed => <reason>" for a goal with genuinely no observable surface`,
+		);
+	}
+	// hub#213: the contract box cannot be bare-waived either — a skipped
+	// done-definition without a reason is exactly the silent gap the
+	// five-field contract exists to stop. Skipping stays one line via
+	// "waiver => <reason>"; *silent* skipping dies here.
+	if (box === "contract") {
+		throw new Error(
+			`contract cannot be bare-waived: supply all five fields "<field> => <text>" via answerContract, or an explicit waiver "waiver => <reason>"`,
 		);
 	}
 	if (goal.boxes[box].status !== "open") throw new Error(`box already settled: ${box}`);
@@ -282,6 +312,8 @@ export function switchGoal(goal, newStatement) {
 // non_goals = ["...", ...]
 // done_criteria = [{ text = "...", done = true|false }, ...]
 // testing_surface = [{ surface = "...", exercise = "..." }, ...]
+// surface_spec = [{ facet = "...", spec = "..." }, ...]
+// contract = [{ field = "outcome|verification|constraints|boundaries|stop_when", text = "..." }, ...]
 // [interview.<box>] status = "open|filled|waived|defaulted", value = "..."
 
 export function heroOf(goal) {
@@ -320,6 +352,11 @@ export function renderGoalToml(goal) {
 	// and pure-no-io records included — the exemption/waiver is data).
 	const sspec = goalSurfaceSpec(goal).map((s) => `{ facet = ${escStr(s.facet)}, spec = ${escStr(s.spec)} }`);
 	L.push(`surface_spec = [${sspec.join(", ")}]`);
+	// hub#213: the completion contract persists as field/text inline tables
+	// (waiver records render [] — a waived contract is data in the box value,
+	// never a contract item, mirroring the testing_surface precedent).
+	const contract = goalContract(goal).map((c) => `{ field = ${escStr(c.field)}, text = ${escStr(c.text)} }`);
+	L.push(`contract = [${contract.join(", ")}]`);
 	for (const box of CHECKLIST) {
 		L.push(`[interview.${JSON.stringify(box)}]`);
 		L.push(`status = ${escStr(goal.boxes[box].status)}`);
@@ -353,6 +390,18 @@ export function parseGoalToml(text) {
 			goal.boxes[box] = { status: status[1], value: value ? JSON.parse(value[1]) : "" };
 		}
 	}
+	// hub#213: pre-contract goal.toml files carry no [interview.contract]
+	// section. Missing is grandfathered (the validateGoal shape-only
+	// precedent: pre-213 goals stay green) — the box settles as a defaulted
+	// waiver record naming the grandfathering, never as a silent open box
+	// (which would refuse sketch on every legacy goal) and never as a real
+	// contract (goalContract yields [] for waiver records).
+	if (!String(text).match(/^\[interview\.("?)contract\1\]/m)) {
+		goal.boxes.contract = {
+			status: "defaulted",
+			value: "waiver => legacy goal.toml (pre-hub#213): no contract section recorded",
+		};
+	}
 	goal._parsed = {
 		style: field("style"),
 		hero: field("hero"),
@@ -364,6 +413,11 @@ export function parseGoalToml(text) {
 		// hoisted function declaration appended below).
 		surface_spec: extractGoalList(text, "surface_spec")
 			.items.map(parseGoalSurfaceSpecItem)
+			.filter((c) => c !== null && !c.malformed),
+		// hub#213: field/text inline tables (parseGoalContractItem is a
+		// hoisted function declaration in the hub#213 section).
+		contract: extractGoalList(text, "contract")
+			.items.map(parseGoalContractItem)
 			.filter((c) => c !== null && !c.malformed),
 	};
 	return goal;
@@ -411,7 +465,12 @@ import { readdirSync } from "node:fs";
 // enforcement stays shape-only (missing/empty grandfathered — pre-spec
 // goals stay green) until the hub#153 BITS e2e consumer lands, mirroring
 // the hub#165 testing_surface precedent.
-export const GOAL_REQUIRED_FIELDS = ["statement", "done_criteria", "style", "hero", "testing_surface", "surface_spec"];
+// hub#213 extends the required set with contract: required for new goals via
+// the interview box (the sketch guard enforces it); file-level enforcement
+// stays shape-only (missing/empty grandfathered — pre-contract goals stay
+// green, and parseGoalToml settles the box as a defaulted waiver record),
+// mirroring the hub#165/hub#166 precedents.
+export const GOAL_REQUIRED_FIELDS = ["statement", "done_criteria", "style", "hero", "testing_surface", "surface_spec", "contract"];
 
 const HUB_ROOT = join(HERE, "..", "..");
 const HUB_STYLES_DIR = join(HUB_ROOT, ".bais", "styles");
@@ -581,6 +640,44 @@ export function validateGoal(text, { knownStyles = null, knownHeroes = null, sty
 				);
 			}
 		});
+	}
+
+	// contract (hub#213): shape-only enforcement, mirroring
+	// testing_surface/surface_spec. Present items must each carry a usable
+	// field AND text; the field must be one of the five contract fields.
+	// A non-empty contract must name ALL five fields exactly once — a
+	// partial contract is exactly the gap the contract exists to close.
+	// Missing/empty is grandfathered (see GOAL_REQUIRED_FIELDS note) so
+	// pre-contract goals stay green.
+	const contract213 = extractGoalList(src, "contract");
+	if (contract213.found) {
+		const parsed = contract213.items.map(parseGoalContractItem).filter((c) => c !== null);
+		parsed.forEach((c, i) => {
+			if (c.malformed || c.field.trim() === "" || c.text.trim() === "") {
+				errors.push(
+					`invalid goal.toml: "contract"[${i}] needs a usable field and text (got ${JSON.stringify(contract213.items[i])})`,
+				);
+			} else if (!CONTRACT_FIELDS.includes(c.field)) {
+				errors.push(
+					`invalid goal.toml: "contract"[${i}] has unknown field ${JSON.stringify(c.field)} (known: ${CONTRACT_FIELDS.join(", ")})`,
+				);
+			}
+		});
+		const usable = parsed.filter((c) => !c.malformed && c.field.trim() !== "" && CONTRACT_FIELDS.includes(c.field));
+		if (usable.length > 0) {
+			for (const f of CONTRACT_FIELDS) {
+				if (!usable.some((c) => c.field === f)) {
+					errors.push(`invalid goal.toml: "contract" is a five-field completion contract — missing "${f}"`);
+				}
+			}
+			const seen = new Set();
+			for (const c of usable) {
+				if (seen.has(c.field)) {
+					errors.push(`invalid goal.toml: "contract" duplicates field ${JSON.stringify(c.field)}`);
+				}
+				seen.add(c.field);
+			}
+		}
 	}
 
 	const style = extractGoalString(src, "style");
@@ -942,6 +1039,332 @@ function parseGoalSurfaceItem(item) {
 		}
 	}
 	return { surface: "", exercise: "", malformed: true };
+}
+
+// --- completion contract (hub#213, scripts lane) ---
+//
+// Hermes' persistent-goals loop defines done as a five-field completion
+// contract: outcome (what done delivers), verification (how done is
+// proven), constraints (what binds the work), boundaries (what is out of
+// scope), stop_when (when to stop). It maps 1:1 onto BAIS acceptance
+// bullets — the acceptance box captures the criteria, the contract box
+// captures the completion definition a campaign's gates + judge evaluate
+// against. Captured before sketch like every box (the sketch guard refuses
+// while any box is open); settles loud via answerContract (answer()
+// delegates for this box) as `;`-separated `<field> => <text>` items with
+// all five fields present exactly once, or an explicit "waiver => <reason>"
+// record. Legacy goal.toml files (no [interview.contract] section) are
+// grandfathered by parseGoalToml as a defaulted waiver record, and the
+// file-level gate (validateGoal) enforces shape-only: present items need a
+// known field and usable text, a non-empty contract needs all five fields;
+// missing/empty stays green.
+//
+// Load-bearing hunk (hub#213/bi#57 red-check target): the five-field
+// completeness check in parseContractValue. Dropping the missing-field
+// throw must trip the selftest below with exactly:
+//   "FAIL selftest: partial contract settle fails loud naming the missing field"
+// (verify: remove the missing-field throw -> that FAIL observed -> restore green).
+
+export const CONTRACT_FIELDS = ["outcome", "verification", "constraints", "boundaries", "stop_when"];
+
+const CONTRACT_NEED = `supply all five fields "<field> => <text>" ("; "-separated; fields: ${CONTRACT_FIELDS.join(", ")}), or an explicit waiver "waiver => <reason>"`;
+
+// Loud settle-time validation for the contract box. Throws naming the box
+// on every silent-gap path (empty, malformed, unknown or duplicate field,
+// partial contract, reasonless waiver); the box stays open so sketch keeps
+// refusing.
+export function parseContractValue(value) {
+	const raw = String(value ?? "");
+	if (raw.trim() === "") {
+		throw new Error(`invalid contract: empty — ${CONTRACT_NEED}`);
+	}
+	const parts = raw
+		.split(";")
+		.map((s) => s.trim())
+		.filter((s) => s !== "");
+	if (parts.length === 0) {
+		throw new Error(`invalid contract: empty — ${CONTRACT_NEED}`);
+	}
+	const items = parts.map((part) => {
+		const i = part.indexOf("=>");
+		if (i < 0) {
+			throw new Error(`invalid contract: every item needs "<field> => <text>" (got ${JSON.stringify(part)}) — ${CONTRACT_NEED}`);
+		}
+		const field = part.slice(0, i).trim().toLowerCase();
+		const text = part.slice(i + 2).trim();
+		if (!field) {
+			throw new Error(`invalid contract: item needs a field before "=>" (got ${JSON.stringify(part)})`);
+		}
+		if (!text) {
+			if (field === "waiver") {
+				throw new Error(`invalid contract: "waiver" needs a reason ("waiver => <reason>") — reasonless contract-skips fail loud`);
+			}
+			throw new Error(`invalid contract: field "${field}" needs text after "=>" (got ${JSON.stringify(part)})`);
+		}
+		if (field !== "waiver" && !CONTRACT_FIELDS.includes(field)) {
+			throw new Error(`invalid contract: unknown field "${field}" (known: ${CONTRACT_FIELDS.join(", ")})`);
+		}
+		return { field, text };
+	});
+	const real = items.filter((it) => it.field !== "waiver");
+	if (real.length > 0) {
+		const missing = CONTRACT_FIELDS.filter((f) => !real.some((it) => it.field === f));
+		if (missing.length > 0) {
+			throw new Error(
+				`invalid contract: five-field completion contract missing "${missing.join('", "')}" — a partial contract fails loud, ${CONTRACT_NEED}`,
+			);
+		}
+		const seen = new Set();
+		for (const it of real) {
+			if (seen.has(it.field)) {
+				throw new Error(`invalid contract: duplicate field "${it.field}" — each of the five fields appears exactly once`);
+			}
+			seen.add(it.field);
+		}
+	}
+	return items;
+}
+
+// Settle the contract box (status filled) after loud validation.
+export function answerContract(goal, value) {
+	if (!("contract" in goal.boxes)) throw new Error("unknown checklist box: contract");
+	if (goal.boxes.contract.status !== "open") throw new Error("box already settled: contract");
+	parseContractValue(value);
+	goal.boxes.contract = { status: "filled", value: String(value ?? "") };
+	return goal;
+}
+
+// Declared contract: well-formed `<field> => <text>` items only. Open boxes,
+// waiver records (defaults escape, rounds cap, legacy grandfathering), and
+// malformed values yield [] — waivers are data, never contract items
+// (the goalSurface precedent).
+export function goalContract(goal) {
+	const box = goal.boxes.contract;
+	if (!box || box.status === "open") return [];
+	const raw = String(box.value ?? "");
+	if (raw.trim() === "") return [];
+	let items;
+	try {
+		items = parseContractValue(raw);
+	} catch {
+		return [];
+	}
+	return items.filter((it) => it.field !== "waiver").map((it) => ({ field: it.field, text: it.text }));
+}
+
+// Which path the box took: open | contract | waiver.
+export function contractKind(goal) {
+	const box = goal.boxes.contract;
+	if (!box || box.status === "open") return "open";
+	const raw = String(box.value ?? "");
+	if (raw.trim() === "") return "open";
+	return goalContract(goal).length > 0 ? "contract" : "waiver";
+}
+
+// File-level contract item: inline tables need both halves; bare strings
+// count as field-only (no text half). Mirrors parseGoalSurfaceSpecItem.
+function parseGoalContractItem(item) {
+	const t = String(item).trim();
+	if (t === "") return null;
+	if (t.startsWith("{")) {
+		const fm = t.match(/field *= *("(?:[^"\\]|\\.)*")/);
+		const tm = t.match(/text *= *("(?:[^"\\]|\\.)*")/);
+		let field = "";
+		let text = "";
+		try {
+			field = fm ? JSON.parse(fm[1]) : "";
+		} catch {
+			return { field: "", text: "", malformed: true };
+		}
+		try {
+			text = tm ? JSON.parse(tm[1]) : "";
+		} catch {
+			return { field: "", text: "", malformed: true };
+		}
+		return { field, text, malformed: false };
+	}
+	const sm = t.match(/^("(?:[^"\\]|\\.)*")$/);
+	if (sm) {
+		try {
+			return { field: JSON.parse(sm[1]), text: "", malformed: false };
+		} catch {
+			return { field: "", text: "", malformed: true };
+		}
+	}
+	return { field: "", text: "", malformed: true };
+}
+
+// --- deterministic gate runner + fingerprint cache + bounded retries (hub#213) ---
+//
+// Hermes' second mechanic: quality gates — DETERMINISTIC commands (baml
+// check/test, the committed .bais/e2e scaffolds per hub#184) that must exit
+// 0 BEFORE any LLM judge verdict runs. Three rules:
+//
+//   1. Gates first, judge second. The judge callback is invoked only when
+//      every gate is green; a red gate means no judge call, ever. The judge
+//      is fail-open (a throwing judge yields a warn, never a crash) with a
+//      hard turn budget passed through as the real backstop.
+//   2. Git-fingerprint cache. Gate results are cached keyed to a workspace
+//      fingerprint (git HEAD + status/diff content hash). Re-evaluating an
+//      unchanged fingerprint replays the recorded result — a recorded
+//      FAILURE included — without re-running the suite, so a stuck agent
+//      cannot burn wall-clock re-running an identical red suite.
+//   3. Bounded retries + auto-pause. The suite is attempted at most
+//      retries+1 times; each attempt re-evaluates the fingerprint (a retry
+//      on changed state re-runs, a retry on unchanged state replays).
+//      Exhaustion auto-pauses with a named reason
+//      ("gate_red_retries_exhausted: ...") instead of looping forever.
+//
+// The runner is pure-ish: fingerprint, run, cache, and judge are injected,
+// so the selftest is offline-deterministic. The CLI owns real processes
+// (defaultGateRun) and persistence (newFileGateCache); goalGates maps a
+// committed goal's e2e cases to gate argv (deterministic commands per
+// hub#184).
+//
+// Load-bearing hunk (hub#213/bi#57 red-check target): the gate-first guard.
+// Invoking the judge when a gate is red (e.g. moving the judge call out of
+// the `green` branch) must trip the selftest below with exactly:
+//   "FAIL selftest: judge never invoked while a gate is red"
+// (verified 2026-09-07: guard neutered -> that FAIL observed -> restored green).
+
+// Bounded retries per gate evaluation: retries+1 attempts total, then the
+// campaign auto-pauses instead of burning wall-clock.
+export const GATE_RETRY_DEFAULT = 2;
+
+const GATE_CACHE_MAX = 32;
+
+// Git fingerprint of the workspace state the gates ran against: HEAD plus
+// the status/diff content, hashed. Untracked files join by name (porcelain)
+// — the CLI wiring note in the hub#213 issue covers content-hashing them.
+export function workspaceFingerprint(cwd, { spawn = spawnSync } = {}) {
+	const run = (args) => {
+		const r = spawn("git", args, { cwd, encoding: "utf8", timeout: 30000 });
+		return `${r.stdout ?? ""}\n${r.stderr ?? ""}`;
+	};
+	const h = createHash("sha256");
+	h.update(run(["rev-parse", "HEAD"]), "utf8");
+	h.update("", "utf8");
+	h.update(run(["status", "--porcelain"]), "utf8");
+	h.update("", "utf8");
+	h.update(run(["diff", "HEAD"]), "utf8");
+	return h.digest("hex");
+}
+
+// Real process gate run: spawnSync the argv, report exit status + output
+// tail. A spawn error (missing binary, timeout) is a red gate, never a
+// throw — gates fail loud as results, not exceptions.
+export function defaultGateRun(gate) {
+	const r = spawnSync(gate.argv[0], gate.argv.slice(1), {
+		cwd: gate.cwd,
+		encoding: "utf8",
+		timeout: gate.timeout ?? 120000,
+	});
+	const output = `${r.stdout ?? ""}${r.stderr ?? ""}${r.error ? String(r.error) : ""}`;
+	return { status: typeof r.status === "number" ? r.status : 1, output };
+}
+
+// The committed goal's deterministic gates: one per e2e scaffold (hub#184),
+// run under plain node. Pure — the CLI prepends baml check/test gates.
+export function goalGates(goal, { e2eDir = ".bais/e2e", node = "node" } = {}) {
+	const cases = Array.isArray(goal?.sketch?.e2e) ? goal.sketch.e2e : [];
+	return cases.map((c) => ({ name: c.case, argv: [node, join(e2eDir, `${c.case}.mjs`)] }));
+}
+
+// File-backed JSON gate-result cache keyed by fingerprint (the CLI owns the
+// path; .bais/gate-cache.json per the wiring spec). Bounded: oldest entries
+// drop past GATE_CACHE_MAX so campaigns cannot grow it without limit.
+export function newFileGateCache(path) {
+	let records = {};
+	try {
+		records = JSON.parse(readFileSync(path, "utf8"));
+	} catch {
+		records = {};
+	}
+	return {
+		get: (fp) => records[fp] ?? null,
+		set: (fp, record) => {
+			records[fp] = record;
+			const keys = Object.keys(records);
+			while (keys.length > GATE_CACHE_MAX) delete records[keys.shift()];
+			writeFileSync(path, `${JSON.stringify(records, null, 2)}\n`);
+		},
+	};
+}
+
+const tail = (s, n = 400) => {
+	const t = String(s ?? "");
+	return t.length <= n ? t : t.slice(t.length - n);
+};
+
+// Evaluate the deterministic gates with fingerprint caching and bounded
+// retries; only when every gate is green may the judge run. Returns:
+//   { ok, results, attempts, executed, replayed, paused, pause_reason, judge }
+// results: [{ name, status, output_tail, replayed }] — first red gate stops
+// the suite (fail-fast: later gates never run on a red attempt).
+export function runGoalGate({
+	gates,
+	fingerprint,
+	cache = null,
+	run = defaultGateRun,
+	retries = GATE_RETRY_DEFAULT,
+	judge = null,
+	turnBudget = 0,
+} = {}) {
+	const suite = Array.isArray(gates) ? gates : [];
+	const fp = typeof fingerprint === "function" ? fingerprint : () => String(fingerprint ?? "");
+	const maxAttempts = Math.max(1, (retries | 0) + 1);
+	let results = [];
+	let attempts = 0;
+	let executed = 0;
+	let replayed = false;
+	let green = false;
+	for (attempts = 1; attempts <= maxAttempts; attempts++) {
+		const print = fp();
+		const hit = cache && typeof cache.get === "function" ? cache.get(print) : null;
+		if (hit && Array.isArray(hit.results)) {
+			replayed = true;
+			results = hit.results.map((r) => ({ ...r, replayed: true }));
+		} else {
+			replayed = false;
+			results = [];
+			for (const g of suite) {
+				const r = run(g);
+				executed++;
+				results.push({ name: String(g.name ?? g.argv?.join(" ") ?? "gate"), status: r.status, output_tail: tail(r.output), replayed: false });
+				if (r.status !== 0) break;
+			}
+			if (cache && typeof cache.set === "function") {
+				cache.set(print, { fingerprint: print, ok: results.every((r) => r.status === 0), results });
+			}
+		}
+		green = suite.length > 0 && results.length === suite.length && results.every((r) => r.status === 0);
+		if (suite.length === 0) green = false;
+		if (green) break;
+	}
+	if (!green) {
+		attempts = Math.min(attempts, maxAttempts);
+		const red = results.find((r) => r.status !== 0);
+		const reason =
+			suite.length === 0
+				? "gate_empty: no deterministic gates declared — the judge never runs without a green gate suite"
+				: `gate_red_retries_exhausted: gate ${JSON.stringify(red?.name ?? "unknown")} exit ${red?.status ?? "?"} after ${attempts}/${maxAttempts} attempts${replayed ? " (unchanged fingerprint — replayed, not re-run)" : ""}`;
+		// Gate-first guard (the hub#213 red-check target): the return below
+		// happens BEFORE the judge block — a red suite can never reach it.
+		return { ok: false, results, attempts, executed, replayed, paused: true, pause_reason: reason, judge: { invoked: false, verdict: null } };
+	}
+	const out = { ok: true, results, attempts, executed, replayed, paused: false, pause_reason: "", judge: { invoked: false, verdict: null } };
+	if (typeof judge === "function") {
+		// Fail-open judge with the hard turn budget as backstop: a throwing
+		// or verdict-less judge warns and never blocks the green gates.
+		try {
+			const verdict = judge({ results, turnBudget });
+			out.judge = { invoked: true, verdict: verdict ?? null };
+			if (verdict == null) out.judge.warn = "judge returned no verdict (fail-open)";
+		} catch (e) {
+			out.judge = { invoked: true, verdict: null, warn: `judge threw (fail-open): ${String(e && e.message)}` };
+		}
+	}
+	return out;
 }
 
 // --- selftest (acceptance fixtures) ---
@@ -1488,6 +1911,246 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 		pend199.total === 2 && pend199.green === 0 && pend199.pending.length === 2,
 		`unrun e2e cases are pending, never silently green (got ${JSON.stringify(pend199)})`,
 	);
+
+	// hub#213: the five-field completion contract (hermes /goal mechanics).
+	// Settle path: all five fields fill the box; goalContract reads them
+	// back in order; contractKind reports "contract".
+	const ctr213 = newGoal("contracted campaign");
+	answer(
+		ctr213,
+		"contract",
+		"outcome => bais goal gate ships; verification => baml test + gate selftest exit 0; constraints => offline, no new deps; boundaries => no cli.ts edits; stop_when => gate green on two consecutive fingerprints",
+	);
+	check(ctr213.boxes.contract.status === "filled", "five-field contract settles the contract box");
+	check(
+		JSON.stringify(goalContract(ctr213).map((c) => c.field)) === JSON.stringify(CONTRACT_FIELDS),
+		`goalContract reads all five fields in order (got ${JSON.stringify(goalContract(ctr213))})`,
+	);
+	check(contractKind(ctr213) === "contract", "settled contract kind is contract");
+	check(
+		goalContract(ctr213).find((c) => c.field === "stop_when").text.includes("two consecutive"),
+		"stop_when text survives verbatim",
+	);
+	// Loud settles: partial, unknown-field, duplicate, empty, and reasonless
+	// values throw naming the box; the box stays open so sketch refuses.
+	let partial213 = "";
+	try {
+		answer(newGoal("x"), "contract", "outcome => a; verification => b; constraints => c; boundaries => d");
+	} catch (e) {
+		partial213 = String(e && e.message);
+	}
+	check(
+		partial213.includes("contract") && partial213.includes("stop_when"),
+		`partial contract settle fails loud naming the missing field (got ${JSON.stringify(partial213)})`,
+	);
+	let unknown213 = "";
+	try {
+		answer(newGoal("x"), "contract", "outcome => a; verification => b; constraints => c; boundaries => d; stop_when => e; vibes => f");
+	} catch (e) {
+		unknown213 = String(e && e.message);
+	}
+	check(
+		unknown213.includes("contract") && unknown213.includes("vibes"),
+		`unknown contract field fails loud naming it (got ${JSON.stringify(unknown213)})`,
+	);
+	let dup213 = "";
+	try {
+		answer(newGoal("x"), "contract", "outcome => a; outcome => b; verification => c; constraints => d; boundaries => e; stop_when => f");
+	} catch (e) {
+		dup213 = String(e && e.message);
+	}
+	check(dup213.includes("duplicate"), `duplicate contract field fails loud (got ${JSON.stringify(dup213)})`);
+	let bareCtr213 = "";
+	try {
+		waive(newGoal("x"), "contract");
+	} catch (e) {
+		bareCtr213 = String(e && e.message);
+	}
+	check(
+		bareCtr213.includes("contract") && bareCtr213.includes("waiver =>"),
+		`bare waive of contract fails loud with the explicit path (got ${JSON.stringify(bareCtr213)})`,
+	);
+	// Reasoned waiver settles but yields no contract items (waivers are
+	// data, never a contract); the defaults escape records a waiver, never
+	// a silent absence.
+	const cwaiv213 = newGoal("waived contract");
+	answer(cwaiv213, "contract", "waiver => spike goal, done defined by review");
+	check(
+		contractKind(cwaiv213) === "waiver" && goalContract(cwaiv213).length === 0,
+		"reasoned contract waiver settles as data, never as contract items",
+	);
+	const cdef213 = newGoal("defaults contract");
+	useDefaults(cdef213);
+	check(
+		cdef213.boxes.contract.value.includes("waiver =>") && checklistComplete(cdef213) && sketch(cdef213).ok === true,
+		"the defaults escape records a reasoned contract waiver and sketch proceeds",
+	);
+	// Legacy grandfathering: pre-hub#213 fixtures carry no contract section —
+	// the box settles as a defaulted waiver naming the grandfathering, the
+	// checklist stays complete, and goalContract yields [].
+	check(
+		surf165.boxes.contract.status === "defaulted" && surf165.boxes.contract.value.includes("legacy goal.toml"),
+		`legacy fixture without a contract section is grandfathered (got ${JSON.stringify(surf165.boxes.contract)})`,
+	);
+	check(contractKind(surf165) === "waiver" && goalContract(surf165).length === 0, "grandfathered contract yields no items");
+	// Round-trip: the contract box value and the [goal] contract inline
+	// tables survive render/parse byte-for-byte. Real acceptance criteria
+	// keep the rendered done_criteria non-empty for validateGoal below.
+	answer(ctr213, "acceptance", "gate selftest exits 0; baml test green");
+	useDefaults(ctr213);
+	const ctrBack213 = parseGoalToml(renderGoalToml(ctr213));
+	check(
+		ctrBack213.boxes.contract.value === ctr213.boxes.contract.value,
+		"contract box round-trips through goal.toml",
+	);
+	check(
+		JSON.stringify(ctrBack213._parsed.contract.map((c) => [c.field, c.text])) ===
+			JSON.stringify(goalContract(ctr213).map((c) => [c.field, c.text])),
+		"[goal] contract round-trips every declared field",
+	);
+	check(contractKind(ctrBack213) === "contract", "round-tripped contract kind is contract");
+	// Shape-only validation: the rendered contract validates clean; a
+	// partial contract fails naming the missing field; an unknown field
+	// fails naming it; missing/empty is grandfathered.
+	const ctrValid213 = validateGoal(renderGoalToml(ctr213), { knownStyles: ["plain"], knownHeroes: ["plain"] });
+	check(
+		ctrValid213.ok === true && ctrValid213.errors.length === 0,
+		`declared contract validates clean (errors: ${JSON.stringify(ctrValid213.errors)})`,
+	);
+	const ctrPartialValid213 = validateGoal(
+		`[goal]\nstatement = "x"\nstyle = "plain"\nhero = "plain"\ndone_criteria = ["a"]\ncontract = [{ field = "outcome", text = "a" }]\n`,
+		{ knownStyles: ["plain"], knownHeroes: ["plain"] },
+	);
+	check(
+		ctrPartialValid213.ok === false && ctrPartialValid213.errors.some((e) => e.includes("contract") && e.includes("verification")),
+		`partial contract fails validation naming the missing field (errors: ${JSON.stringify(ctrPartialValid213.errors)})`,
+	);
+	const ctrUnknownValid213 = validateGoal(
+		`[goal]\nstatement = "x"\nstyle = "plain"\nhero = "plain"\ndone_criteria = ["a"]\ncontract = [{ field = "vibes", text = "a" }]\n`,
+		{ knownStyles: ["plain"], knownHeroes: ["plain"] },
+	);
+	check(
+		ctrUnknownValid213.ok === false && ctrUnknownValid213.errors.some((e) => e.includes("contract") && e.includes("vibes")),
+		`unknown contract field fails validation naming it (errors: ${JSON.stringify(ctrUnknownValid213.errors)})`,
+	);
+	const ctrEmptyValid213 = validateGoal(
+		`[goal]\nstatement = "x"\nstyle = "plain"\nhero = "plain"\ndone_criteria = ["a"]\ncontract = []\n`,
+		{ knownStyles: ["plain"], knownHeroes: ["plain"] },
+	);
+	check(ctrEmptyValid213.ok === true, "empty contract is grandfathered (missing/empty stays green)");
+
+	// hub#213: the deterministic gate runner. Fixture goal = the committed
+	// surface goal — its e2e scaffolds (already written to a tmpdir above,
+	// failing-first per hub#184) are the deterministic gates.
+	const gates213 = goalGates(commit184, { e2eDir: e2eDir184 });
+	check(gates213.length === 2 && gates213.every((g) => Array.isArray(g.argv)), "goalGates maps committed e2e cases to gate argv");
+	// (a) Deterministic gate run + auto-pause: the red scaffold suite runs,
+	// fails fast on the first red gate, and exhausts bounded retries into an
+	// auto-pause with a named reason. Injected run counts executions.
+	let runs213 = 0;
+	const cacheA213 = new Map();
+	const redRun213 = runGoalGate({
+		gates: gates213,
+		fingerprint: "fp-fixture-red",
+		cache: { get: (k) => cacheA213.get(k) ?? null, set: (k, v) => cacheA213.set(k, v) },
+		run: (g) => {
+			runs213++;
+			const r = defaultGateRun(g);
+			return r;
+		},
+		retries: GATE_RETRY_DEFAULT,
+	});
+	check(
+		redRun213.ok === false && redRun213.paused === true && redRun213.pause_reason.includes("gate_red_retries_exhausted"),
+		`red gate suite auto-pauses with a named reason (got ${JSON.stringify(redRun213.pause_reason)})`,
+	);
+	check(
+		redRun213.judge.invoked === false,
+		"red gate suite leaves the judge uninvoked",
+	);
+	check(
+		redRun213.results.length === 1 && redRun213.results[0].status === 1,
+		`gate suite fails fast on the first red gate (got ${JSON.stringify(redRun213.results.map((r) => [r.name, r.status]))})`,
+	);
+	// (b) Fingerprint skip: retries 2 and 3 hit the unchanged fingerprint and
+	// REPLAY the recorded failure instead of re-running — exactly one gate
+	// execution across three attempts.
+	check(
+		redRun213.attempts === GATE_RETRY_DEFAULT + 1 && runs213 === 1,
+		`unchanged fingerprint replays the recorded failure without re-running (attempts ${redRun213.attempts}, executions ${runs213})`,
+	);
+	check(redRun213.replayed === true && redRun213.results[0].replayed === true, "the replayed result is marked as a replay");
+	// (c) Retries re-run on changed state: a fresh fingerprint per attempt
+	// re-runs the gate each attempt, then still auto-pauses.
+	let runsB213 = 0;
+	let fpN213 = 0;
+	const redRunB213 = runGoalGate({
+		gates: gates213,
+		fingerprint: () => `fp-changing-${fpN213++}`,
+		cache: newFileGateCache(join(e2eDir184, "gate-cache-test.json")),
+		run: (g) => {
+			runsB213++;
+			return defaultGateRun(g);
+		},
+		retries: 2,
+	});
+	check(
+		redRunB213.paused === true && runsB213 === 3 && redRunB213.replayed === false,
+		`changed fingerprint re-runs the gate each attempt before auto-pause (executions ${runsB213})`,
+	);
+	// (d) Green gates: the judge runs exactly once with the turn budget, and
+	// a judge throwing fails open (warn, never a crash). A cached green
+	// replay still permits the judge — gates-first, judge-second.
+	const greenGates213 = [{ name: "always-green", argv: ["node", "-e", "process.exit(0)"] }];
+	let judgeCalls213 = 0;
+	const greenRun213 = runGoalGate({
+		gates: greenGates213,
+		fingerprint: "fp-fixture-green",
+		run: defaultGateRun,
+		judge: ({ turnBudget: tb }) => {
+			judgeCalls213++;
+			return tb === 5 ? "accept" : "wrong-budget";
+		},
+		turnBudget: 5,
+	});
+	check(
+		greenRun213.ok === true && greenRun213.paused === false && judgeCalls213 === 1 && greenRun213.judge.verdict === "accept",
+		`green gates run the judge once with the turn budget (got ${JSON.stringify(greenRun213.judge)})`,
+	);
+	const failOpen213 = runGoalGate({
+		gates: greenGates213,
+		fingerprint: "fp-fixture-green-2",
+		run: defaultGateRun,
+		judge: () => {
+			throw new Error("model exploded");
+		},
+	});
+	check(
+		failOpen213.ok === true && failOpen213.judge.invoked === true && /fail-open/.test(failOpen213.judge.warn ?? ""),
+		`throwing judge fails open with a warn (got ${JSON.stringify(failOpen213.judge)})`,
+	);
+	// (e) The hub#213 red-check anchor (bi#57): the judge is NEVER invoked
+	// while a gate is red. The judge callback records every call; the guard
+	// in runGoalGate returns before the judge block on a red suite.
+	let judgeRed213 = 0;
+	const neverJudge213 = runGoalGate({
+		gates: gates213,
+		fingerprint: "fp-fixture-never-judge",
+		run: defaultGateRun,
+		retries: 0,
+		judge: () => {
+			judgeRed213++;
+			return "accept";
+		},
+	});
+	check(
+		neverJudge213.ok === false && neverJudge213.judge.invoked === false && judgeRed213 === 0,
+		"judge never invoked while a gate is red",
+	);
+	// Real fingerprint helper: deterministic on a fixed git state, and a
+	// hex digest (shape-only — the content is the repo's business).
+	const fpLive213 = workspaceFingerprint(HUB_ROOT);
+	check(/^[0-9a-f]{64}$/.test(fpLive213), "workspaceFingerprint yields a sha256 hex digest");
 
 	process.exit(failures ? 1 : 0);
 }
