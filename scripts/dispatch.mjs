@@ -15,6 +15,7 @@ import { join, dirname } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { parseFiles, warnPartial, warnReentry, buildPack, splitUnknownPack, warnUnknownWithheld, warnUnknownShared, buildCohorts, renderCohortBrief, warnCohortSplit, warnCohortExclude, assertBriefLines, parseAcceptance } from "./briefs.mjs";
+import { foundationRank, compareFoundation, foundationSeatingWarn } from "./goal.mjs";
 
 const CLI = "/Users/adrian/code/orion/orion-learn-baml/bais/dist/src/cli.js";
 let failures = 0;
@@ -276,8 +277,8 @@ const slotsOf = (out) => out.split("\n").filter((l) => l.startsWith("slot")).map
 	check(warnReentry(["t#01", "t#03"]) === "[bais] reentry: 2 held slots still claimed (t#01, t#03); next pack after the merger confirms the fold", `reentry plural format exact`);
 	check(warnReentry([]) === null && warnReentry() === null, `no held slots stays quiet`);
 	const d = mkfix([
-		["t#01.toml", issue("t#01", "hub", "Open")],
-		["t#02.toml", issue("t#02", "leaf", "Open", [["t#02", "t#01", "DependsOn"]])],
+		["t#01.toml", issue("t#01", "hub", "Open", [], "", "hub.ts")],
+		["t#02.toml", issue("t#02", "leaf", "Open", [["t#02", "t#01", "DependsOn"]], "", "leaf.ts")],
 	]);
 	const first = buildPack(d, 2);
 	check(warnReentry(first.leased) === null, `first dispatch runs quiet`);
@@ -643,6 +644,140 @@ const slotsOf = (out) => out.split("\n").filter((l) => l.startsWith("slot")).map
 	// comparison, so only the boundary discriminates). Restored, green.
 	// A threshold comparison that cannot go red at the boundary is
 	// camouflage, not coverage.
+}
+
+// 16. hub#219 item 1 (hub#186): foundation-first dispatch seating, wired.
+// goal.mjs owns the pure derivation (foundationRank/compareFoundation/
+// foundationSeatingWarn, imported above); bais/src/cli.ts dispatch
+// re-seats the packed slots foundation-rank-first (rank 0 = the declared
+// baseline + its precedes-ancestors, the same precedesAncestors set the
+// layer-drift audit walks), then blast descending, then lexical id;
+// --json carries foundation: 0|1 per slot; every enhancement seated
+// while the baseline is unlanded prints the warn-first seating line
+// VERBATIM on stderr (and in the --json warnings array). The declared
+// baseline is the hub#219 item 6 activation: .bais/sketch.toml
+// [[node]] id = "baseline" with issue = "<id>" — without that key the
+// pack is byte-identical to the legacy radius-first order (the named
+// off state, never an invented baseline).
+//
+// Fixture graph (radii in parens): t#00 core (1) <-DependsOn- t#01
+// baseline (0); t#02 enhancement (1) <-DependsOn- t#03 leaf (0). Naive
+// radius-first packs [t#00, t#02, t#01, t#03] — the enhancement t#02
+// out-seats the baseline on blast radius. Foundation seating ranks
+// {t#00, t#01} first: [t#00, t#01, t#02, t#03].
+//
+// Red-check 2026-09-08 (bi#57): with rankOf's membership neutered in
+// bais/src/cli.ts (`foundationSet.has(id) ? 0 : 1` -> `false ? 0 : 1` —
+// src lane, rebuild required), the suite failed LOUD with 3 failure(s)
+// FOR THE RIGHT REASON —
+//   FAIL: fixture baseline seats before the higher-blast enhancement
+//     (["t#00","t#02","t#01","t#03"] — the naive order returned: t#02
+//     (br 1) out-seated the baseline t#01 (br 0), the exact
+//     issue-number-becomes-priority bug hub#186 killed)
+//   FAIL: fixture --json carries foundation ranks ([1,1,1,1])
+//   FAIL: landed baseline seats quiet (ranks [1,1,1] vs [0,1,1] — the
+//     foundation ancestor t#00 lost its tier)
+// while the mirror pins and the undeclared-baseline fixture stayed green
+// (all-rank-1 reseats radius-first, byte-equal to naive — that fixture
+// discriminates the off state, not the rank rule). Restored, green. A
+// seating sort that cannot go red on an out-seated baseline is
+// camouflage, not coverage.
+{
+	// Mirror pins (lockstep with goal.mjs's own selftest): the comparator
+	// is the primary sort key, blast desc second, lexical id third.
+	const preEdges = [
+		{ from: "core", to: "baseline", kind: "precedes" },
+		{ from: "tooling", to: "core", kind: "precedes" },
+	];
+	check(
+		foundationRank("baseline", "baseline", preEdges) === 0 &&
+			foundationRank("core", "baseline", preEdges) === 0 &&
+			foundationRank("tooling", "baseline", preEdges) === 0 &&
+			foundationRank("enh", "baseline", preEdges) === 1,
+		`mirror: foundationRank 0 for baseline + precedes-ancestors, 1 otherwise`,
+	);
+	const pack16 = [
+		{ id: "enh", blast: 9 },
+		{ id: "baseline", blast: 1 },
+		{ id: "core", blast: 0 },
+		{ id: "enh-a", blast: 9 },
+	];
+	pack16.sort((a, b) => compareFoundation(a.id, b.id, "baseline", preEdges) || b.blast - a.blast || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+	check(
+		JSON.stringify(pack16.map((s) => s.id)) === '["baseline","core","enh","enh-a"]',
+		`mirror: foundation sort — rank, then blast desc, then id (${JSON.stringify(pack16.map((s) => s.id))})`,
+	);
+	check(
+		foundationSeatingWarn("t#02", "t#01") === "[bais] enhancement t#02 seated before baseline t#01 landed",
+		`mirror: seating warn string pinned`,
+	);
+	// CLI fixture: declared baseline via sketch.toml issue= key.
+	const sketchOn = `# .bais/sketch.toml — approved goal sketch (hub#184). Nodes + edges; e2e scaffolds live in .bais/e2e/.
+[[node]]
+id = "baseline"
+title = "walking skeleton"
+issue = "t#01"
+radius = []
+
+[[node]]
+id = "c1"
+title = "enhancement layer"
+radius = []
+`;
+	const sketchOff = sketchOn.replace('issue = "t#01"\n', "");
+	const files16 = [
+		["t#00.toml", issue("t#00", "core", "Open", [], "", "core.ts")],
+		["t#01.toml", issue("t#01", "baseline", "Open", [["t#01", "t#00", "DependsOn"]], "", "base.ts")],
+		["t#02.toml", issue("t#02", "enhancement", "Open", [], "", "enh.ts")],
+		["t#03.toml", issue("t#03", "leaf", "Open", [["t#03", "t#02", "DependsOn"]], "", "leaf.ts")],
+	];
+	const runH16 = (dir, args) => {
+		const r = spawnSync("node", [CLI, ...args], { cwd: dir, encoding: "utf8", timeout: 60000 });
+		return { code: r.status ?? -1, out: r.stdout ?? "", err: r.stderr ?? "" };
+	};
+	const dOn = mkfix(files16);
+	writeFileSync(join(dOn, ".bais", "sketch.toml"), sketchOn);
+	const jOn = JSON.parse(run(dOn, ["dispatch", "--agents", "4", "--json"]).out);
+	const seatedIds = jOn.slots.map((s) => s.issue.id);
+	check(
+		JSON.stringify(seatedIds) === '["t#00","t#01","t#02","t#03"]',
+		`fixture baseline seats before the higher-blast enhancement (${JSON.stringify(seatedIds)})`,
+	);
+	check(
+		JSON.stringify(jOn.slots.map((s) => s.foundation)) === "[0,0,1,1]",
+		`fixture --json carries foundation ranks (${JSON.stringify(jOn.slots.map((s) => s.foundation))})`,
+	);
+	const wantWarns = [foundationSeatingWarn("t#02", "t#01"), foundationSeatingWarn("t#03", "t#01")];
+	check(
+		wantWarns.every((w) => jOn.warnings.includes(w)),
+		`fixture --json warnings carry the seating lines verbatim (${JSON.stringify(jOn.warnings)})`,
+	);
+	const hOn = runH16(dOn, ["dispatch", "--agents", "4"]);
+	check(
+		hOn.code === 0 && wantWarns.every((w) => hOn.err.split("\n").includes(w)),
+		`fixture human mode prints the seating lines verbatim on stderr`,
+	);
+	// The baseline landed (Done): enhancements seat silent (nothing warns
+	// about building on a landed foundation).
+	run(dOn, ["move", "t#01", "Doing", "--as", "demo-219", "--for", "2h"]);
+	const dLanded = mkfix(files16.map(([n, c]) => [n, n === "t#01.toml" ? c.replace('status = "Open"', 'status = "Done"') : c]));
+	writeFileSync(join(dLanded, ".bais", "sketch.toml"), sketchOn);
+	const jLanded = JSON.parse(run(dLanded, ["dispatch", "--agents", "4", "--json"]).out);
+	check(
+		jLanded.warnings.length === 0 && JSON.stringify(jLanded.slots.map((s) => s.foundation)) === "[0,1,1]",
+		`landed baseline seats quiet (${JSON.stringify(jLanded.slots.map((s) => s.issue.id))})`,
+	);
+	// Undeclared baseline (no issue= key): the named off state — naive
+	// radius-first order, no foundation key, no seating warns.
+	const dOff = mkfix(files16);
+	writeFileSync(join(dOff, ".bais", "sketch.toml"), sketchOff);
+	const jOff = JSON.parse(run(dOff, ["dispatch", "--agents", "4", "--json"]).out);
+	check(
+		JSON.stringify(jOff.slots.map((s) => s.issue.id)) === '["t#00","t#02","t#01","t#03"]' &&
+			jOff.slots.every((s) => s.foundation === undefined) &&
+			jOff.warnings.length === 0,
+		`fixture undeclared baseline stays byte-legacy (${JSON.stringify(jOff.slots.map((s) => s.issue.id))})`,
+	);
 }
 
 if (failures) {

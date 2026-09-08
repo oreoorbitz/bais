@@ -93,6 +93,107 @@ function ready_issues(issues: Issue[], edges: Edge[]) -> Issue[] {
     })
 }
 
+// Epic policy (derived, never stored): an issue is an epic iff at least
+// one SubtaskOf edge points at it. Direction: the edge runs from the
+// subtask (child) to the epic (parent) — `from` does the work, `to`
+// coordinates it. Doing-claims consult is_epic (epic + footprint gate,
+// bais/src/cli.ts + bi/src/bais.ts) and route around epics instead of
+// reading "(epic)" prose in titles; ready/dispatch exclusion is a
+// follow-up (dispatch still packs epics with a scope warning). A big
+// task with no subtasks is not an epic; an epic whose subtasks all
+// close stays an epic (Done needs Evidence like any other Done).
+function is_epic(issue: Issue, edges: Edge[]) -> bool {
+    edges.some((e) -> {
+        e.to == issue.id && e.kind == EdgeKind.SubtaskOf
+    })
+}
+
+// The subtask ids coordinated by an epic — the work the epic closes over.
+function epic_children(epic: Issue, edges: Edge[]) -> string[] {
+    edges
+        .filter((e) -> {
+            e.to == epic.id && e.kind == EdgeKind.SubtaskOf
+        })
+        .map((e) -> {
+            e.from
+        })
+}
+
+test "epic is derived from inbound subtask edges" {
+    let epic = Issue {
+        id: "bi#26",
+        title: "e",
+        status: Status.Open,
+        kind: Kind.Feat,
+        area: null,
+        severity: null,
+        source: null,
+        body: "",
+    };
+    let child = Issue {
+        id: "bi#27",
+        title: "c",
+        status: Status.Open,
+        kind: Kind.Feat,
+        area: null,
+        severity: null,
+        source: null,
+        body: "",
+    };
+    let lone = Issue {
+        id: "bi#99",
+        title: "l",
+        status: Status.Open,
+        kind: Kind.Feat,
+        area: null,
+        severity: null,
+        source: null,
+        body: "",
+    };
+    // No edges at all: nothing is an epic, not even a big Feat.
+    assert.is_true(!is_epic(epic, []));
+    // A Related edge to the candidate changes nothing.
+    assert.is_true(!is_epic(epic, [Edge { from: "bi#27", to: "bi#26", kind: EdgeKind.Related }]));
+    // A SubtaskOf edge pointing AT the candidate makes it an epic;
+    // the reverse direction does not.
+    let sub = [Edge { from: "bi#27", to: "bi#26", kind: EdgeKind.SubtaskOf }];
+    assert.is_true(is_epic(epic, sub));
+    assert.is_true(!is_epic(child, sub));
+    assert.is_true(!is_epic(lone, sub))
+}
+
+test "epic children are the inbound subtask sources" {
+    let epic = Issue {
+        id: "bi#26",
+        title: "e",
+        status: Status.Open,
+        kind: Kind.Feat,
+        area: null,
+        severity: null,
+        source: null,
+        body: "",
+    };
+    let lone = Issue {
+        id: "bi#99",
+        title: "l",
+        status: Status.Open,
+        kind: Kind.Feat,
+        area: null,
+        severity: null,
+        source: null,
+        body: "",
+    };
+    let edges = [
+        Edge { from: "bi#27", to: "bi#26", kind: EdgeKind.SubtaskOf },
+        Edge { from: "bi#28", to: "bi#26", kind: EdgeKind.SubtaskOf },
+        Edge { from: "bi#27", to: "bi#26", kind: EdgeKind.Related },
+        Edge { from: "bi#26", to: "bi#27", kind: EdgeKind.SubtaskOf },
+    ];
+    assert.equal(epic_children(epic, edges), ["bi#27", "bi#28"]);
+    // A non-epic coordinates nothing, even beside epic edges.
+    assert.equal(epic_children(lone, edges), [])
+}
+
 // LLM entry: CreateIssue is a typed LLM function — the return type IS the schema.
 // Prompt is `${ctx.output_format}` validated by `baml check`, not prose.
 function CreateIssue(raw: string) -> Issue {

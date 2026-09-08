@@ -18,7 +18,7 @@ import { resolveHubDir } from "./resolve.js";
 function printJson(obj: unknown): void {
 	writeSync(1, JSON.stringify(obj, null, 2) + "\n");
 }
-import { baselineIssueFromSketch, blastRadii, closeEvidenceIn, creationDaysFromMtimes, cyclicIds, danglingRefsIn, declarationDistributionIn, dispatchPack, e2eCaseAnchorsIn, e2eDirFor, e2eDriftJoin, groupSwarmClaims, knownDrillNames, knownE2eStems, layerDriftIn, loadIssues, nowDays, parseFileClaims, parseGoalTestingSurface, parseSwarmVerdicts, projectName, radiusVsEvidenceIn, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
+import { baselineIssueFromSketch, blastRadii, closeEvidenceIn, creationDaysFromMtimes, cyclicIds, danglingRefsIn, declarationDistributionIn, dispatchPack, e2eCaseAnchorsIn, e2eDirFor, e2eDriftJoin, epicChildren, groupSwarmClaims, isDeclaredFootprint, isEpic, knownDrillNames, knownE2eStems, layerDriftIn, loadIssues, nowDays, parseFileClaims, parseGoalTestingSurface, parseSwarmVerdicts, precedesAncestors, projectName, radiusVsEvidenceIn, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
 import { findShadowHubs, formatShadow } from "./fork.js";
 import type { BlastRadius, Urgency } from "./graph.js";
 import { parseBaisFile } from "./toml.js";
@@ -72,7 +72,10 @@ Usage:
   bais archive --size [--cap N] [--json]  # archive budget: exact bytes, loud warn over cap (bi#136)
   bais archive <id> [--reason R]          # move an issue to .bais/archive/
   bais delete <id> [--json]               # fully remove an issue file + projection rebuild
-  bais move <id> <status> [--json] [--as <owner> --for 4h]
+  bais move <id> <status> [--json] [--as <owner> --for 4h] [--scope-confirmed]
+                                # Doing --as refuses epics (claim a child) and issues with no
+                                # Files: line (declare footprint first) — --scope-confirmed
+                                # is the operator override for verification closes/spikes
                                 # Doing without --as is an anonymous
                                 # claim: allowed, instantly stale
   bais renew <id> --as <owner> [--for 4h]  # extend a live claim (heartbeat)
@@ -532,7 +535,7 @@ if (cmd === "dispatch") {
 	);
 	const radii = new Map(blastRadii(issues).map((r) => [r.id, r]));
 	const byId = new Map(issues.map((f) => [f.issue.id, f]));
-	const slots = dispatchPack(issues, leased, footprints, budget).map((s) => {
+	const packed = dispatchPack(issues, leased, footprints, budget).map((s) => {
 		const f = byId.get(s.issue_id);
 		return {
 			slot: s.slot,
@@ -542,6 +545,55 @@ if (cmd === "dispatch") {
 			files_state: declared.has(s.issue_id) ? "declared" : "unknown",
 		};
 	});
+	// hub#219 item 1 (hub#186): foundation-first seating, warn-first. The
+	// declared baseline (.bais/sketch.toml [[node]] id = "baseline" with the
+	// hub#219 item 6 issue = "<id>" key) plus its precedes-ancestors (the
+	// same graph.ts precedesAncestors set the layer-drift audit walks, so
+	// dispatch and the audit agree on the foundation) sort BEFORE blast
+	// radius; ties fall to blast descending then lexical id. dispatchPack's
+	// selection is untouched (dispatchPack is mirrored in bi — its
+	// comparator stays radius-first); this re-seats the packed slots and
+	// renumbers dense. Undeclared baseline (no sketch node or no issue=
+	// key) is the named off state: byte-identical legacy output, no
+	// foundation key, no seating warns.
+	//
+	// Load-bearing hunk (hub#219/bi#57 red-check target): rankOf's
+	// foundation-set membership. Forcing rankOf to always return 1 must
+	// trip dispatch.mjs §16 with "fixture baseline seats before the
+	// higher-blast enhancement" (see the record there).
+	const sketchDispatch = existsSync(join(root, "sketch.toml")) ? readFileSync(join(root, "sketch.toml"), "utf8") : "";
+	const dispatchBaseline = baselineIssueFromSketch(sketchDispatch);
+	const gm219 = dispatchBaseline !== null ? await loadGoalModule() : null;
+	const foundationSet =
+		dispatchBaseline !== null
+			? new Set([dispatchBaseline, ...precedesAncestors(dispatchBaseline, issues.flatMap((f) => f.edges))])
+			: null;
+	const rankOf = (id: string): 0 | 1 => (foundationSet !== null && foundationSet.has(id) ? 0 : 1);
+	const slots =
+		foundationSet === null
+			? packed
+			: [...packed]
+					.sort(
+						(a, b) =>
+							rankOf(a.issue.id) - rankOf(b.issue.id) ||
+							b.open_downstream - a.open_downstream ||
+							(a.issue.id < b.issue.id ? -1 : a.issue.id > b.issue.id ? 1 : 0),
+					)
+					.map((s, i) => ({ ...s, slot: i, foundation: rankOf(s.issue.id) as 0 | 1 }));
+	// Warn-first seating line (hub#186 verbatim, goal.mjs owns the string):
+	// every enhancement seated while the baseline has not landed names
+	// itself — one line per enhancement slot, stderr in human modes, the
+	// warnings array in --json. The sort becoming binding is the named
+	// milestone; the line stays until then.
+	const foundationWarns: string[] = [];
+	if (dispatchBaseline !== null && gm219 !== null) {
+		const baselineStatus = byId.get(dispatchBaseline)?.issue.status;
+		if (baselineStatus !== undefined && baselineStatus !== "Done" && baselineStatus !== "Dropped") {
+			for (const s of slots) {
+				if ((s as { foundation?: number }).foundation === 1) foundationWarns.push(gm219.foundationSeatingWarn(s.issue.id, dispatchBaseline));
+			}
+		}
+	}
 	// hub#175 warning path: dispatchPack withholds 2nd+ unknowns (at most
 	// one unknown per pack) — name what the exclusion cost. withheld =
 	// unpacked ready+unleased unknowns capped by unfilled, in greedy order
@@ -563,6 +615,9 @@ if (cmd === "dispatch") {
 		const partners = slots.filter((s) => s.files_state === "declared").map((s) => s.issue.id);
 		if (partners.length) unknownWarnings.push(warnUnknownShared(keptUnknown.issue.id, partners));
 	}
+	// hub#219: the foundation seating warns ride the same channels (stderr
+	// human/briefs, the warnings array in --json).
+	unknownWarnings.push(...foundationWarns);
 	// bi#125/bi#126: --briefs renders spawn briefs instead of slot rows;
 	// every mode carries unfilled + the loud partial-pack stderr line.
 	// hub#163: renderer is single-sourced (briefs.mjs) — no local mirror.
@@ -1191,6 +1246,30 @@ if (cmd === "move") {
 				console.error(`bais move: --for ${JSON.stringify(flagVal("--for"))} needs <n>s|m|h|d`);
 				process.exit(1);
 			}
+			// Epic/scope gate (epic policy): a live claim needs a workable
+			// scope. Epics coordinate subtasks — claim a child instead;
+			// unknown footprints cannot prove clash-freedom — declare
+			// Files: first. Bare anonymous claims stay allowed (bi#49):
+			// with no lease they are instantly stale, so the gate only
+			// guards holder-bound claims. --scope-confirmed is the
+			// operator-confirmed override (verification closes and
+			// scope-finding spikes).
+			if (!argv.includes("--scope-confirmed")) {
+				const { issues } = await loadIssues(issuesDir);
+				const allEdges = issues.flatMap((f) => f.edges);
+				const kids = epicChildren(id, allEdges);
+				if (kids.length > 0) {
+					console.error(`bais move: ${id} is an epic (subtasks: ${kids.join(", ")}) — claim a child, or re-run with --scope-confirmed for a verification close`);
+					process.exit(1);
+				}
+				const me = issues.find((f) => f.issue.id === id);
+				if (!isDeclaredFootprint(me?.issue.body ?? orig)) {
+					console.error(`bais move: ${id} declares no footprint (no Files: line) — declare Files: first (bi#125), or re-run with --scope-confirmed`);
+					process.exit(1);
+				}
+			} else {
+				console.error(`[bais] scope-confirmed override on ${id} (operator confirmed scope)`);
+			}
 			next = setClaimLines(next, asOwner, toLeaseIso(claimNowMs() + dur));
 		}
 	} else if (from === "Doing") {
@@ -1627,7 +1706,7 @@ if (cmd === "handoff") {
 	// No ensureInit: validating a handoff file is project-independent
 	// (the merger checks drafts anywhere, not just inside a .bais dir).
 	if (argv[1] !== "--validate") {
-		console.error("bais handoff --validate <file.handoff> [--base <sha>] [--json]");
+		console.error("bais handoff --validate <file.handoff> [--base <sha>] [--issue <issue.toml>] [--fold-scope-strict] [--json]");
 		process.exit(1);
 	}
 	const file = argv[2];
@@ -1641,6 +1720,17 @@ if (cmd === "handoff") {
 		console.error("bais handoff --validate: --base needs <sha>");
 		process.exit(1);
 	}
+	// hub#219 item 3 (hub#192): fold-scope at fold time — the folding
+	// issue's declared Files: footprint gates the handoff's diff paths.
+	// Warn-first by default (advisory stderr lines, exit untouched);
+	// --fold-scope-strict turns refusals into errors.
+	const issueFlag = argv.indexOf("--issue");
+	const issuePath = issueFlag !== -1 ? argv[issueFlag + 1] : undefined;
+	if (issueFlag !== -1 && (issuePath == null || issuePath.startsWith("--"))) {
+		console.error("bais handoff --validate: --issue needs <issue.toml>");
+		process.exit(1);
+	}
+	const strictScope = argv.includes("--fold-scope-strict");
 	const { fileURLToPath, pathToFileURL } = await import("node:url");
 	const { dirname } = await import("node:path");
 	const here = dirname(fileURLToPath(import.meta.url));
@@ -1654,7 +1744,16 @@ if (cmd === "handoff") {
 		process.exit(1);
 	}
 	const mod = await import(pathToFileURL(validator).href);
-	const res = mod.validateHandoffFile(file, base == null ? {} : { base });
+	const res = mod.validateHandoffFile(file, {
+		...(base == null ? {} : { base }),
+		...(issuePath == null ? {} : { issueFile: issuePath }),
+		...(strictScope ? { foldScopePhase: "fail", foldBudgetPhase: "fail" } : {}),
+	});
+	// hub#219: fold-scope warnings are advisory — loud on stderr, never
+	// reshaping the stdout verdict or the exit code (warn-first).
+	for (const w of [res.foldscope?.warning, res.foldscope?.operatorConfirm]) {
+		if (w != null) console.error(w);
+	}
 	if (asJson) printJson(res);
 	else console.log(mod.formatText(res));
 	process.exit(res.ok ? 0 : 1);
@@ -1745,7 +1844,7 @@ if (cmd === "goal") {
 	const gm = await loadGoalModule();
 	const goalFile = join(root, "goal.toml");
 	const verb = argv[1];
-	const usage = `bais goal <start|sketch|commit|status|switch|snapshot|clear|retire|gate|e2e> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding; gate is hub#213; e2e is the hub#191 surface/case coverage join)`;
+	const usage = `bais goal <start|sketch|commit|status|switch|snapshot|clear|retire|gate|e2e|baseline> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding; gate is hub#213; e2e is the hub#191 surface/case coverage join; baseline is the hub#219 layer-drift audit activation)`;
 	const loadGoal = (): any => {
 		if (!existsSync(goalFile)) {
 			console.error(`bais goal: no campaign at ${goalFile} — run \`bais goal start "<statement>"\` first`);
@@ -2084,6 +2183,47 @@ if (cmd === "goal") {
 			for (const s of drift.stale) console.log(`stale\t${s.file}\t${s.anchor ?? "(none embedded)"}`);
 		}
 		process.exit(drift.gaps.length + drift.stale.length > 0 ? 1 : 0);
+	} else if (verb === "baseline") {
+		// hub#219 item 6 (hub#186→hub#193): sketch baseline activation. The
+		// baseline node names the real issue it materialized as (issue =
+		// "<id>") — the layer-drift audit's only activation switch; the
+		// audit-phase line names "undeclared" until this lands. Pure rules
+		// live in scripts/baseline-activate.mjs (single-source, hub#163);
+		// this block routes argv, checks the issue exists (materialized
+		// means REAL), writes sketch.toml, and restamps goal.toml's
+		// approved_sketch_hash (the explicit command IS the re-approval —
+		// goal_snapshot stays: materialization metadata, not plan drift).
+		const ba = await loadScriptModule("baseline-activate.mjs");
+		const lm = await loadScriptModule("lifecycle.mjs");
+		const id = argv[2];
+		if (!id || id.startsWith("--")) {
+			console.error("bais goal baseline <issue-id> — activate the sketch baseline node as the materialized issue (hub#219 item 6)");
+			process.exit(1);
+		}
+		const sketchFile = join(root, "sketch.toml");
+		if (!existsSync(sketchFile)) {
+			console.error(`bais goal baseline refused: no ${sketchFile} — run \`bais goal sketch\` + \`bais goal commit --approve\` first (hub#186)`);
+			process.exit(1);
+		}
+		if (!existsSync(join(issuesDir, `${id}.toml`))) {
+			console.error(`bais goal baseline refused: unknown issue ${id} — the baseline must materialize as a real issue first (\`bais new\`)`);
+			process.exit(1);
+		}
+		const stamped = ba.stampBaselineIssue(readFileSync(sketchFile, "utf8"), id);
+		if (!stamped.ok) {
+			console.error(`bais goal baseline ${stamped.error}`);
+			process.exit(1);
+		}
+		writeFileSync(sketchFile, stamped.text);
+		let restamped = false;
+		if (existsSync(goalFile)) {
+			const rg = ba.restampGoalApproval(readFileSync(goalFile, "utf8"), stamped.text, lm.approvedSketchHash);
+			if (rg.restamped) {
+				writeFileSync(goalFile, rg.text);
+				restamped = true;
+			}
+		}
+		console.log(`baseline\t${id}\tactivated — layer-drift audit now walks this baseline (hub#219 item 6)${restamped ? "; approved_sketch_hash restamped (explicit re-approval)" : ""}`);
 	} else {
 		console.error(usage);
 		process.exit(1);

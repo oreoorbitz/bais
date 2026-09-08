@@ -213,6 +213,17 @@ export function isDeclaredFootprint(body: string): boolean {
 	return (body ?? "").split("\n").some((l) => l.trim().startsWith("Files:"));
 }
 
+// Mirror of BAML is_epic / epic_children (epic policy): an issue is an
+// epic iff at least one SubtaskOf edge points at it — the edge runs
+// from the subtask (child) to the epic (parent). Derived, never stored;
+// gates consult this instead of reading "(epic)" prose in titles.
+export function isEpic(issueId: string, edges: BaisEdge[]): boolean {
+	return edges.some((e) => e.to === issueId && e.kind === "SubtaskOf");
+}
+export function epicChildren(epicId: string, edges: BaisEdge[]): string[] {
+	return edges.filter((e) => e.to === epicId && e.kind === "SubtaskOf").map((e) => e.from);
+}
+
 // hub#175 warning lines — verbatim mirrors of warnUnknownWithheld /
 // warnUnknownShared in bais/scripts/briefs.mjs (the scripts lane owns the
 // exact shapes; dispatch.mjs §13 pins them). Duplicated, not imported:

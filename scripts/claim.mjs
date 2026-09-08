@@ -2,7 +2,14 @@
 // fixtures only, every instant injected via --now — the full claim /
 // renew / reap cycle is a pure function of (files, now), so the same
 // script run twice must print byte-identical output (determinism is
-// asserted, not assumed). Red-check target: leaseExpired's `<=`
+// asserted, not assumed). Epic/scope gate pins (epic policy): epic and
+// unknown --as claims refuse with names; declared + child claims land;
+// --scope-confirmed overrides.
+// Red-check (bi#57) 2026-09-08: graph.ts isEpic/epicChildren blinded
+// (SubtaskOf → SubtaskOf_) → FAIL claim.epic-refused (epic claim lands),
+// FAIL claim.epic-unmoved, FAIL claim.epic-override (3 FAIL, 25 pass);
+// restored cmp-identical → 28 green.
+// Red-check target: leaseExpired's `<=`
 // boundary — flipping it to `<` must trip claim.reap-boundary.
 // Red-check observed 2026-09-05: `<` trips reap-boundary + cleared
 // (2 FAIL, 17 pass); restored `<=` returns 19 green.
@@ -26,8 +33,8 @@ const run = (dir, args) => {
 		return { code: e.status ?? -1, out: (e.stdout ?? "") + (e.stderr ?? "") };
 	}
 };
-const issue = (id, title, status) =>
-	`id = "${id}"\ntitle = "${title}"\nstatus = "${status}"\nkind = "Feat"\nbody = "b"\n`;
+const issue = (id, title, status, files = "") =>
+	`id = "${id}"\ntitle = "${title}"\nstatus = "${status}"\nkind = "Feat"\nbody = """\nb${files ? `\nFiles: ${files}` : ""}\n"""\n`;
 const mkfix = () => {
 	const d = mkdtempSync(join(tmpdir(), "claim-"));
 	mkdirSync(join(d, ".bais", "issues"), { recursive: true });
@@ -41,7 +48,7 @@ const L2H = "2026-09-05T14:00:00Z";
 function cycle() {
 	const d = mkfix();
 	const is = join(d, ".bais", "issues");
-	writeFileSync(join(is, "t#01.toml"), issue("t#01", "work", "Open"));
+	writeFileSync(join(is, "t#01.toml"), issue("t#01", "work", "Open", "work.ts"));
 	const log = [];
 	// Bare move to Doing is allowed (bi#49 contract) but anonymous:
 	// no claim lines, instantly stale, reaped on sight.
@@ -101,7 +108,7 @@ check("claim.deterministic", cycle() === once);
 	// Leaving Doing clears the claim; non-Doing renew refuses.
 	const d2 = mkfix();
 	const is2 = join(d2, ".bais", "issues");
-	writeFileSync(join(is2, "t#02.toml"), issue("t#02", "w", "Open"));
+	writeFileSync(join(is2, "t#02.toml"), issue("t#02", "w", "Open", "w.ts"));
 	run(d2, ["move", "t#02", "Doing", "--as", "a1", "--for", "1h", "--now", T0]);
 	run(d2, ["move", "t#02", "Done"]);
 	const f = readFileSync(join(is2, "t#02.toml"), "utf8");
@@ -119,6 +126,38 @@ check("claim.deterministic", cycle() === once);
 	check("claim.bad-duration", bd.code === 1 && bd.out.includes('needs <n>s|m|h|d'), JSON.stringify(bd));
 	const bh = run(d2, ["move", "t#02", "Doing", "--as", 'a"b']);
 	check("claim.bad-holder", bh.code === 1 && bh.out.includes("not an owner id"), JSON.stringify(bh));
+}
+
+// Epic/scope gate (epic policy): holder-bound claims need a workable
+// scope — epics and unknown footprints refuse with names, bare claims
+// stay allowed, --scope-confirmed overrides for verification closes.
+{
+	const d3 = mkfix();
+	const is3 = join(d3, ".bais", "issues");
+	const edge = '[[edge]]\nfrom = "t#11"\nto = "t#10"\nkind = "SubtaskOf"\n';
+	writeFileSync(join(is3, "t#10.toml"), issue("t#10", "epic", "Open", "coord.ts") + edge);
+	writeFileSync(join(is3, "t#11.toml"), issue("t#11", "child", "Open", "child.ts"));
+	writeFileSync(join(is3, "t#12.toml"), issue("t#12", "unknown", "Open"));
+	writeFileSync(join(is3, "t#13.toml"), issue("t#13", "declared", "Open", "leaf.ts"));
+	// Epic refusal names the subtasks even though Files: is declared.
+	const ep = run(d3, ["move", "t#10", "Doing", "--as", "a1", "--for", "1h", "--now", T0]);
+	check("claim.epic-refused", ep.code === 1 && ep.out.includes("is an epic (subtasks: t#11)"), JSON.stringify(ep));
+	check("claim.epic-unmoved", /^status = "Open"$/m.test(readFileSync(join(is3, "t#10.toml"), "utf8")));
+	// Unknown footprint refusal names the fix.
+	const un = run(d3, ["move", "t#12", "Doing", "--as", "a1", "--for", "1h", "--now", T0]);
+	check("claim.unknown-refused", un.code === 1 && un.out.includes("declares no footprint"), JSON.stringify(un));
+	// Declared non-epic claims land as before.
+	const ok = run(d3, ["move", "t#13", "Doing", "--as", "a1", "--for", "1h", "--now", T0]);
+	check("claim.declared-lands", ok.code === 0 && ok.out.includes("moved\tt#13\tOpen\tDoing"), JSON.stringify(ok));
+	// The child of an epic claims fine (the gate routes to children).
+	const ch = run(d3, ["move", "t#11", "Doing", "--as", "a1", "--for", "1h", "--now", T0]);
+	check("claim.child-lands", ch.code === 0 && ch.out.includes("moved\tt#11\tOpen\tDoing"), JSON.stringify(ch));
+	// Operator override lands both, loudly.
+	const oe = run(d3, ["move", "t#10", "Doing", "--as", "a1", "--for", "1h", "--now", T0, "--scope-confirmed"]);
+	const oef = readFileSync(join(is3, "t#10.toml"), "utf8");
+	check("claim.epic-override", oe.code === 0 && oe.out.includes("moved\tt#10\tOpen\tDoing") && /^holder = "a1"$/m.test(oef), JSON.stringify(oe));
+	const ou = run(d3, ["move", "t#12", "Doing", "--as", "a1", "--for", "1h", "--now", T0, "--scope-confirmed"]);
+	check("claim.unknown-override", ou.code === 0 && ou.out.includes("moved\tt#12\tOpen\tDoing"), JSON.stringify(ou));
 }
 
 if (fail) { console.log(`claim: ${fail} FAIL, ${pass} pass`); process.exit(1); }
