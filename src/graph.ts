@@ -224,6 +224,40 @@ export function epicChildren(epicId: string, edges: BaisEdge[]): string[] {
 	return edges.filter((e) => e.to === epicId && e.kind === "SubtaskOf").map((e) => e.from);
 }
 
+// Hash-vs-evidence audit (hub#224): every commit hash cited in an
+// Evidence: line must resolve in a known clone. Extraction is pure —
+// `repo@hash` scope optional (bi|bais|bits|bagl|root); the 7-char floor
+// keeps prose out, the 40-char cap keeps sha256 content-hashes out,
+// and only Evidence: lines are scanned (body prose never counts).
+// Resolution is injected (the CLI shells git; drills inject a stub),
+// returning per-hash ok + the repos actually tried — the tried-list is
+// the assumption-echo: every failure names its own basis.
+export type EvidenceHash = { hash: string; repo: string | null };
+export function evidenceHashes(body: string): EvidenceHash[] {
+	const out: EvidenceHash[] = [];
+	for (const line of (body ?? "").split("\n")) {
+		if (!line.trimStart().startsWith("Evidence:")) continue;
+		const re = /\b(?:(bi|bais|bits|bagl|root)@)?([0-9a-f]{7,40})\b/g;
+		let m: RegExpExecArray | null;
+		while ((m = re.exec(line)) !== null) out.push({ hash: m[2], repo: m[1] ?? null });
+	}
+	return out;
+}
+export type HashEvidenceRow = { id: string; hash: string; tried: string[]; reason: "hash-vs-evidence" };
+export function hashEvidenceIn(
+	entries: { id: string; body: string }[],
+	resolve: (hash: string, repo: string | null) => { ok: boolean; tried: string[] },
+): HashEvidenceRow[] {
+	const rows: HashEvidenceRow[] = [];
+	for (const e of entries) {
+		for (const h of evidenceHashes(e.body)) {
+			const r = resolve(h.hash, h.repo);
+			if (!r.ok) rows.push({ id: e.id, hash: (h.repo !== null ? `${h.repo}@` : "") + h.hash, tried: r.tried, reason: "hash-vs-evidence" });
+		}
+	}
+	return rows.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
 // hub#175 warning lines — verbatim mirrors of warnUnknownWithheld /
 // warnUnknownShared in bais/scripts/briefs.mjs (the scripts lane owns the
 // exact shapes; dispatch.mjs §13 pins them). Duplicated, not imported:

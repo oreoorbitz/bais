@@ -6,6 +6,7 @@
 // scan when no store exists. `check` validates the *issue files*; it is not
 // `baml check`, which validates bais's own BAML source.
 
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { resolveHubDir } from "./resolve.js";
@@ -18,7 +19,7 @@ import { resolveHubDir } from "./resolve.js";
 function printJson(obj: unknown): void {
 	writeSync(1, JSON.stringify(obj, null, 2) + "\n");
 }
-import { baselineIssueFromSketch, blastRadii, closeEvidenceIn, creationDaysFromMtimes, cyclicIds, danglingRefsIn, declarationDistributionIn, dispatchPack, e2eCaseAnchorsIn, e2eDirFor, e2eDriftJoin, epicChildren, groupSwarmClaims, isDeclaredFootprint, isEpic, knownDrillNames, knownE2eStems, layerDriftIn, loadIssues, nowDays, parseFileClaims, parseGoalTestingSurface, parseSwarmVerdicts, precedesAncestors, projectName, radiusVsEvidenceIn, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
+import { baselineIssueFromSketch, blastRadii, closeEvidenceIn, creationDaysFromMtimes, cyclicIds, danglingRefsIn, declarationDistributionIn, dispatchPack, e2eCaseAnchorsIn, e2eDirFor, e2eDriftJoin, epicChildren, groupSwarmClaims, hashEvidenceIn, isDeclaredFootprint, isEpic, knownDrillNames, knownE2eStems, layerDriftIn, loadIssues, nowDays, parseFileClaims, parseGoalTestingSurface, parseSwarmVerdicts, precedesAncestors, projectName, radiusVsEvidenceIn, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
 import { findShadowHubs, formatShadow } from "./fork.js";
 import type { BlastRadius, Urgency } from "./graph.js";
 import { parseBaisFile } from "./toml.js";
@@ -87,7 +88,11 @@ Usage:
                                 # --e2e-strict: unresolvable-e2e evidence + e2e-gap/e2e-stale drift
                                 # joins become fatal (hub#188/hub#191); default warn
                                 # --audit-strict: layer-drift / radius-vs-evidence /
-                                # declaration-distribution audits become fatal (hub#193); default warn
+                                # declaration-distribution / hash-vs-evidence audits become
+                                # fatal (hub#193, hub#224); default warn
+  bais check [--hash-root <dir>]...          # extra sibling-clone roots for
+                                # the hash-vs-evidence audit (fixture hubs carry
+                                # no siblings; repeatable)
   bais verify [--deep] [--json]  # content fingerprint (deep: full BAML re-reduce + id sweep)
   bais graph --from <id> [--json]   # recursive CTE from the store, BFS fallback
   bais hub [--port N]               # lease coordinator (Phase 3), serves until SIGINT
@@ -872,6 +877,38 @@ if (cmd === "check") {
 	const layerDrift = auditBaseline !== null ? layerDriftIn(checkFiles, auditBaseline) : [];
 	const radiusAudit = radiusVsEvidenceIn(checkFiles);
 	const declarationAudit = declarationDistributionIn(checkFiles);
+	// hub#224: hash-vs-evidence audit — every commit hash cited in an
+	// Evidence: line must resolve in a known clone. Sibling roots are
+	// the hub's own layout plus repeatable --hash-root dirs (fixture
+	// hubs carry no siblings, so drills pass the repo root explicitly);
+	// the tried-list on each row is the assumption-echo.
+	const hashFlagRoots: string[] = [];
+	for (let i = 0; i < argv.length; i++) {
+		if (argv[i] === "--hash-root" && i + 1 < argv.length) hashFlagRoots.push(resolve(argv[i + 1]));
+	}
+	const hashRepoRoots = [...new Set([resolve(issuesDir, "..", ".."), ...hashFlagRoots])];
+	const hashRepoDir = (root: string, name: string): string | null => {
+		const d = name === "root" ? root : join(root, name);
+		return existsSync(join(d, ".git")) ? d : null;
+	};
+	const hashResolve = (hash: string, repo: string | null): { ok: boolean; tried: string[] } => {
+		const tried: string[] = [];
+		const names = repo !== null ? [repo] : ["root", "bi", "bais", "bits", "bagl"];
+		for (const root of hashRepoRoots) {
+			for (const name of names) {
+				const d = hashRepoDir(root, name);
+				if (d === null || tried.includes(name)) continue;
+				tried.push(name);
+				try {
+					execFileSync("git", ["-C", d, "cat-file", "-e", hash], { stdio: "ignore" });
+					return { ok: true, tried };
+				} catch {}
+			}
+		}
+		if (repo !== null && tried.length === 0) return { ok: false, tried: [`${repo}(absent)`] };
+		return { ok: false, tried };
+	};
+	const hashAudit = hashEvidenceIn(checkFiles.map((f) => ({ id: f.issue.id, body: f.issue.body })), hashResolve);
 	// hub#195: the committed goal.toml is bound to the human-approved sketch
 	// by approved_sketch_hash; drift (post-approval nodes/edges edits) flags
 	// loud and fatal — the bi#136 "snapshot stale" precedent, never silently
@@ -917,7 +954,7 @@ if (cmd === "check") {
 		error: sketchStale.error,
 		case_snapshot_drift: snapshotDrift195,
 	});
-	const auditFatal = auditPhase === "fail" ? layerDrift.length + radiusAudit.length + (declarationAudit !== null ? 1 : 0) : 0;
+	const auditFatal = auditPhase === "fail" ? layerDrift.length + radiusAudit.length + hashAudit.length + (declarationAudit !== null ? 1 : 0) : 0;
 	const printAudits = (): void => {
 		for (const r of layerDrift) {
 			console.log(`audit\t${r.id}\tlayer-drift\tDoing/Done with Open baseline ancestor ${r.ancestor} (baseline ${r.baseline}) — land the foundation before the enhancement (hub#193)`);
@@ -925,11 +962,14 @@ if (cmd === "check") {
 		for (const r of radiusAudit) {
 			console.log(`audit\t${r.id}\tradius-vs-evidence\topen_downstream=${r.open_downstream} (>= 3) folded with no Evidence: e2e(<stem>) cite — surface-observable change unproven (hub#193)`);
 		}
+		for (const r of hashAudit) {
+			console.log(`audit\t${r.id}\thash-vs-evidence\t${r.hash} resolves nowhere (tried: ${r.tried.join(", ") || "no repos present"}) — cited commit unproven (hub#224)`);
+		}
 		if (declarationAudit !== null) {
 			console.log(`audit\t-\tdeclaration-distribution\t${declarationAudit.severity5}/${declarationAudit.open} Open issues (${declarationAudit.pct}%) at severity 5 — above K=${declarationAudit.k}% (hub#193)`);
 		}
 		console.log(
-			`audit-phase\t${auditPhase}\t${auditPhase === "warn" ? "advisory — --audit-strict flips to fail (hub#193)" : "strict — layer-drift, radius-vs-evidence and declaration-distribution are fatal (hub#193)"}; layer-drift baseline: ${auditBaseline ?? "undeclared (no .bais/sketch.toml baseline node with an issue= key — hub#186)"}`,
+			`audit-phase\t${auditPhase}\t${auditPhase === "warn" ? "advisory — --audit-strict flips to fail (hub#193)" : "strict — layer-drift, radius-vs-evidence, declaration-distribution and hash-vs-evidence are fatal (hub#193, hub#224)"}; layer-drift baseline: ${auditBaseline ?? "undeclared (no .bais/sketch.toml baseline node with an issue= key — hub#186)"}`,
 		);
 	};
 	const e2eJson = (): unknown => ({ phase: e2ePhase, drift: e2eDrift });
