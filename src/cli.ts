@@ -18,7 +18,7 @@ import { resolveHubDir } from "./resolve.js";
 function printJson(obj: unknown): void {
 	writeSync(1, JSON.stringify(obj, null, 2) + "\n");
 }
-import { blastRadii, creationDaysFromMtimes, cyclicIds, closeEvidenceIn, danglingRefsIn, dispatchPack, groupSwarmClaims, knownDrillNames, loadIssues, nowDays, parseFileClaims, parseSwarmVerdicts, projectName, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
+import { baselineIssueFromSketch, blastRadii, closeEvidenceIn, creationDaysFromMtimes, cyclicIds, danglingRefsIn, declarationDistributionIn, dispatchPack, e2eCaseAnchorsIn, e2eDirFor, e2eDriftJoin, groupSwarmClaims, knownDrillNames, knownE2eStems, layerDriftIn, loadIssues, nowDays, parseFileClaims, parseGoalTestingSurface, parseSwarmVerdicts, projectName, radiusVsEvidenceIn, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
 import { findShadowHubs, formatShadow } from "./fork.js";
 import type { BlastRadius, Urgency } from "./graph.js";
 import { parseBaisFile } from "./toml.js";
@@ -53,6 +53,8 @@ Usage:
   bais dispatch --agents N [--json] [--briefs]  # dry-run swarm pack: load-bearing first (bi#123), never mutates
                                 # carries as_of + completeness from the store
   bais goal <start|sketch|commit|status|switch> [--approve]  # per-directory campaign interview (bi#132)
+  bais goal e2e [--json]                  # surface/case coverage join: ok/missing/stale rows (hub#191);
+                                # exits 1 when any surface lacks a case or any case is stale
   bais goal gate [--json]                 # deterministic gates first (baml check/test + e2e scaffolds),
                                 # fingerprint-cached, auto-pauses on red — judge never wired (hub#213)
   bais goal snapshot --out <file>            # snapshot the campaign (recoverable-clear precondition, bi#136)
@@ -76,9 +78,13 @@ Usage:
   bais renew <id> --as <owner> [--for 4h]  # extend a live claim (heartbeat)
   bais reap [--now <instant>] [--json]     # expired Doing -> Open
   bais list [--json] [--claims]            # --claims appends holder/lease cols + swarm groups (bi#130)
-  bais check [--json] [--registry-strict]
+  bais check [--json] [--registry-strict] [--e2e-strict] [--audit-strict]
                                 # --registry-strict: prompt-registry problems + parse failures become
                                 # fatal (hub#210); default phase is warn (advisory, exit untouched)
+                                # --e2e-strict: unresolvable-e2e evidence + e2e-gap/e2e-stale drift
+                                # joins become fatal (hub#188/hub#191); default warn
+                                # --audit-strict: layer-drift / radius-vs-evidence /
+                                # declaration-distribution audits become fatal (hub#193); default warn
   bais verify [--deep] [--json]  # content fingerprint (deep: full BAML re-reduce + id sweep)
   bais graph --from <id> [--json]   # recursive CTE from the store, BFS fallback
   bais hub [--port N]               # lease coordinator (Phase 3), serves until SIGINT
@@ -700,20 +706,35 @@ if (cmd === "check") {
 	const printShadows = (): void => {
 		for (const s of undeclared) console.log(formatShadow(root, s));
 	};
+	// hub#188/hub#191 rollout phase (warn-first-then-fail, the hub#210
+	// prompt-registry precedent): warn is advisory — it never touches the
+	// exit code; --e2e-strict flips unresolvable-e2e evidence and the
+	// e2e-gap/e2e-stale drift joins to fatal (CI-pinnable).
+	const e2ePhase: "warn" | "fail" = argv.includes("--e2e-strict") ? "fail" : "warn";
+	// hub#193: same rollout for the layer-drift / radius-vs-evidence /
+	// declaration-distribution audit family (--audit-strict flips).
+	const auditPhase: "warn" | "fail" = argv.includes("--audit-strict") ? "fail" : "warn";
+	// The scan is the shared truth for body-envelope facts (the stale-claim
+	// precedent): one load feeds swarm shaping, e2e evidence resolution,
+	// the drift joins, and the hub#193 audits on BOTH paths below.
+	const checkLoad = await loadIssues(issuesDir);
+	const checkFiles = checkLoad.issues;
 	// bi#83: close-evidence render, shared by both paths. A Done issue with
 	// no Evidence: refs, or refs that do not resolve, is LOUD: one
 	// `evidence` line per problem. Missing (same-project unresolvable) is
 	// fatal; External (cross-project verdict ref) is advisory, never fatal —
-	// the same split dangling refs use.
+	// the same split dangling refs use. hub#188: unresolvable-e2e is
+	// warn-first — advisory while e2ePhase is warn, fatal under
+	// --e2e-strict (the rollout state prints on the e2e-phase line below).
 	const printEvidence = (evidence: { id: string; reason: string; ref: string | null; kind: string | null; status: string }[]): number => {
 		let fatal = 0;
 		for (const p of evidence) {
 			if (p.reason === "missing-close-evidence") {
-				console.log(`evidence\t${p.id}\tmissing-close-evidence\tDone with no Evidence: refs (add Evidence: drill(<name>) and/or Evidence: verdict(<id>) to the body)`);
+				console.log(`evidence\t${p.id}\tmissing-close-evidence\tDone with no Evidence: refs (add Evidence: drill(<name>), verdict(<id>), and/or e2e(<stem>) to the body)`);
 			} else {
 				console.log(`evidence\t${p.id}\t${p.reason}\t${p.ref} does not resolve`);
 			}
-			if (p.status === "Missing") fatal += 1;
+			if (p.status === "Missing" && !(e2ePhase === "warn" && p.reason === "unresolvable-e2e")) fatal += 1;
 		}
 		return fatal;
 	};
@@ -728,7 +749,7 @@ if (cmd === "check") {
 	};
 	// Swarm shaping reads bodies, which live on the scan (the projection
 	// predates them, same as claims) — both paths share these entries.
-	const swarmEntries = (await loadIssues(issuesDir)).issues.map((f) => ({ id: f.issue.id, status: f.issue.status, body: f.issue.body }));
+	const swarmEntries = checkFiles.map((f) => ({ id: f.issue.id, status: f.issue.status, body: f.issue.body }));
 	const swarm = swarmVerdictProblemsIn(swarmEntries);
 	// hub#210: prompt-registry rollout (warn-first-then-fail, the style/hero
 	// hub#158 precedent). Records live in the sibling prompts lane
@@ -758,8 +779,74 @@ if (cmd === "check") {
 			`prompt-registry-phase\t${registry.phase}\t${registry.phase === "warn" ? "advisory — --registry-strict flips to fail (hub#210)" : "strict — registry problems and parse failures are fatal (hub#210)"}`,
 		);
 	};
+	// hub#188: e2e close-evidence stems resolve against .bais/e2e/ exactly
+	// like drill stems resolve against the hub's drill namespace.
+	const e2eDir = e2eDirFor(issuesDir);
+	const e2eStems = knownE2eStems(e2eDir);
+	const checkDrills = knownDrillNames(scriptsDirFor(issuesDir));
+	// Scan-truth close evidence: the store predicate predates the e2e ref
+	// kind, so e2e-kind problems always come from this computation (the
+	// store path merges them over its own drill/verdict rows below).
+	const scanEvidence = closeEvidenceIn(swarmEntries, projectName(issuesDir), checkDrills, e2eStems);
+	// hub#191: drift joins over goal.toml text + the .bais/e2e/ listing.
+	// Warn-first, named reason per row, never auto-mutating (bi#55). A
+	// goal.toml with no declared testing_surface is grandfathered
+	// (declared=false — both joins vacuous), so pre-surface hubs stay
+	// silent; the phase line always names the rollout state.
+	const goalText = existsSync(join(root, "goal.toml")) ? readFileSync(join(root, "goal.toml"), "utf8") : "";
+	const e2eDrift = e2eDriftJoin(parseGoalTestingSurface(goalText), e2eCaseAnchorsIn(e2eDir));
+	const e2eDriftFatal = e2ePhase === "fail" ? e2eDrift.gaps.length + e2eDrift.stale.length : 0;
+	const printE2eDrift = (): void => {
+		for (const g of e2eDrift.gaps) {
+			console.log(`e2e-gap\t${g.surface}\tdeclared testing_surface item has no .bais/e2e case (anchor ${g.anchor}) — add the case or retire the surface, never silently (hub#191)`);
+		}
+		for (const s of e2eDrift.stale) {
+			console.log(`e2e-stale\t${s.file}\tgoal anchor ${s.anchor ?? "(none embedded)"} matches no declared testing_surface item — the surface was edited or renamed without touching the case (hub#191)`);
+		}
+		console.log(
+			`e2e-phase\t${e2ePhase}\t${e2ePhase === "warn" ? "advisory — --e2e-strict flips to fail (hub#188/hub#191)" : "strict — unresolvable-e2e, e2e-gap and e2e-stale are fatal (hub#188/hub#191)"}`,
+		);
+	};
+	// hub#193: progressive-enhancement audits, warn-first. The layer-drift
+	// baseline is the hub#186 declared baseline (.bais/sketch.toml
+	// [[node]] id = "baseline" with an explicit issue = "<id>" key);
+	// undeclared is a named state on the phase line, never an invented
+	// baseline. Deterministic rows, named reasons, no auto-mutation.
+	const sketchText = existsSync(join(root, "sketch.toml")) ? readFileSync(join(root, "sketch.toml"), "utf8") : "";
+	const auditBaseline = baselineIssueFromSketch(sketchText);
+	const layerDrift = auditBaseline !== null ? layerDriftIn(checkFiles, auditBaseline) : [];
+	const radiusAudit = radiusVsEvidenceIn(checkFiles);
+	const declarationAudit = declarationDistributionIn(checkFiles);
+	const auditFatal = auditPhase === "fail" ? layerDrift.length + radiusAudit.length + (declarationAudit !== null ? 1 : 0) : 0;
+	const printAudits = (): void => {
+		for (const r of layerDrift) {
+			console.log(`audit\t${r.id}\tlayer-drift\tDoing/Done with Open baseline ancestor ${r.ancestor} (baseline ${r.baseline}) — land the foundation before the enhancement (hub#193)`);
+		}
+		for (const r of radiusAudit) {
+			console.log(`audit\t${r.id}\tradius-vs-evidence\topen_downstream=${r.open_downstream} (>= 3) folded with no Evidence: e2e(<stem>) cite — surface-observable change unproven (hub#193)`);
+		}
+		if (declarationAudit !== null) {
+			console.log(`audit\t-\tdeclaration-distribution\t${declarationAudit.severity5}/${declarationAudit.open} Open issues (${declarationAudit.pct}%) at severity 5 — above K=${declarationAudit.k}% (hub#193)`);
+		}
+		console.log(
+			`audit-phase\t${auditPhase}\t${auditPhase === "warn" ? "advisory — --audit-strict flips to fail (hub#193)" : "strict — layer-drift, radius-vs-evidence and declaration-distribution are fatal (hub#193)"}; layer-drift baseline: ${auditBaseline ?? "undeclared (no .bais/sketch.toml baseline node with an issue= key — hub#186)"}`,
+		);
+	};
+	const e2eJson = (): unknown => ({ phase: e2ePhase, drift: e2eDrift });
+	const auditsJson = (): unknown => ({
+		phase: auditPhase,
+		baseline: auditBaseline,
+		layer_drift: layerDrift,
+		radius_vs_evidence: radiusAudit,
+		declaration_distribution: declarationAudit,
+	});
 	if (useStore) {
-		const { ok, bad, dangling, cycles, evidence } = storeCheck(issuesDir);
+		const store = storeCheck(issuesDir);
+		const { ok, bad, dangling, cycles } = store;
+		// hub#188: drill/verdict evidence rows come from the store; e2e-kind
+		// rows come from the scan truth (the store predicate predates the
+		// e2e ref kind — the stale-claim file-envelope precedent).
+		const evidence = [...store.evidence.filter((p) => p.kind !== "e2e"), ...scanEvidence.filter((p) => p.kind === "e2e")];
 		const missing = dangling.filter((d) => d.status === "Missing");
 		const external = dangling.filter((d) => d.status === "External");
 		// hub#178: a store older than the newest issue file serves a stale
@@ -773,17 +860,17 @@ if (cmd === "check") {
 				: null;
 		const swarmVerdicts = swarmEntries.flatMap((e) => parseSwarmVerdicts(e.body).map((v) => ({ id: e.id, ...v })));
 		if (asJson) {
-			const staleClaims = (await loadIssues(issuesDir)).issues
+			const staleClaims = checkFiles
 				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
 				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
-			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence, staleClaims, staleStore, shadows, swarm, swarmVerdicts, promptRegistry: registryJson() }, null, 2));
+			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence, staleClaims, staleStore, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson() }, null, 2));
 		} else {
 			for (const d of missing) console.log(`dangling\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			for (const d of external) console.log(`external\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			if (cycles.length) console.log(`cycle\t${cycles.join(", ")}`);
 			// Claims are file-envelope (the projection predates them):
 			// stale-claim always reads the scan truth. Advisory only.
-			for (const f of (await loadIssues(issuesDir)).issues) {
+			for (const f of checkFiles) {
 				if (f.issue.status !== "Doing" || !leaseExpired(f.lease, Date.now())) continue;
 				console.log(`stale-claim\t${f.issue.id}\t${f.holder ?? "unknown"}\t${f.lease ?? "no-lease"}`);
 			}
@@ -792,30 +879,33 @@ if (cmd === "check") {
 			const fatalSwarm = printSwarm(swarm);
 			printShadows();
 			printRegistry();
+			printE2eDrift();
+			printAudits();
 			console.log(`ok\t${ok} issues, ${bad.length} bad`);
-			if (bad.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal) process.exit(1);
+			if (bad.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal) process.exit(1);
 			process.exit(0);
 		}
-		const fatalEvidence = evidence.filter((p) => p.status === "Missing").length;
-		if (bad.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal) process.exit(1);
+		// hub#188/hub#191/hub#193: in the warn phases unresolvable-e2e and
+		// every drift/audit row are advisory — e2eDriftFatal/auditFatal are
+		// zero and unresolvable-e2e is excluded from the fatal count.
+		const fatalEvidence = evidence.filter((p) => p.status === "Missing" && !(e2ePhase === "warn" && p.reason === "unresolvable-e2e")).length;
+		if (bad.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal) process.exit(1);
 	} else {
-		const { issues, failures } = await loadIssues(issuesDir);
+		const issues = checkFiles;
+		const failures = checkLoad.failures;
 		const dangling = danglingRefsIn(issues, projectName(issuesDir));
 		const missing = dangling.filter((d) => d.status === "Missing");
 		const external = dangling.filter((d) => d.status === "External");
 		const cycles = cyclicIds(issues);
-		const evidence = closeEvidenceIn(
-			issues.map((f) => ({ id: f.issue.id, status: f.issue.status, body: f.issue.body })),
-			projectName(issuesDir),
-			knownDrillNames(scriptsDirFor(issuesDir)),
-		);
+		// hub#188: scan truth, e2e stems resolved against .bais/e2e/.
+		const evidence = scanEvidence;
 
 		const swarmVerdicts = swarmEntries.flatMap((e) => parseSwarmVerdicts(e.body).map((v) => ({ id: e.id, ...v })));
 		if (asJson) {
 			const staleClaims = issues
 				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
 				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
-			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence, staleClaims, shadows, swarm, swarmVerdicts, promptRegistry: registryJson() }, null, 2));
+			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence, staleClaims, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson() }, null, 2));
 		} else {
 			for (const f of issues) console.log(`ok\t${f.issue.id}`);
 			for (const b of failures) console.log(`bad\t${b.file}\t${b.error}`);
@@ -841,16 +931,20 @@ if (cmd === "check") {
 			const fatalSwarm = printSwarm(swarm);
 			printShadows();
 			printRegistry();
-			if (failures.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal) process.exit(1);
+			printE2eDrift();
+			printAudits();
+			if (failures.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal) process.exit(1);
 			process.exit(0);
 		}
 
 		// External is reported, never fatal — a cross-project edge is legitimate and
 		// unresolvable from one directory. Applies to --json too: the old check
 		// exited 0 in JSON mode, which made it useless as a CI gate. Same for
-		// External verdict refs (bi#83): reported, never fatal.
-		const fatalEvidence = evidence.filter((p) => p.status === "Missing").length;
-		if (failures.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal) process.exit(1);
+		// External verdict refs (bi#83): reported, never fatal. hub#188: in the
+		// warn phase unresolvable-e2e is advisory too (e2eDriftFatal/auditFatal
+		// stay zero until --e2e-strict/--audit-strict).
+		const fatalEvidence = evidence.filter((p) => p.status === "Missing" && !(e2ePhase === "warn" && p.reason === "unresolvable-e2e")).length;
+		if (failures.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal) process.exit(1);
 	}
 	process.exit(0);
 }
@@ -1604,7 +1698,7 @@ if (cmd === "goal") {
 	const gm = await loadGoalModule();
 	const goalFile = join(root, "goal.toml");
 	const verb = argv[1];
-	const usage = `bais goal <start|sketch|commit|status|switch|snapshot|clear|retire|gate> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding; gate is hub#213)`;
+	const usage = `bais goal <start|sketch|commit|status|switch|snapshot|clear|retire|gate|e2e> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding; gate is hub#213; e2e is the hub#191 surface/case coverage join)`;
 	const loadGoal = (): any => {
 		if (!existsSync(goalFile)) {
 			console.error(`bais goal: no campaign at ${goalFile} — run \`bais goal start "<statement>"\` first`);
@@ -1915,6 +2009,27 @@ if (cmd === "goal") {
 			else console.log(`gates green (${res.results.length})`);
 		}
 		process.exit(res.ok ? 0 : 1);
+	} else if (verb === "e2e") {
+		// hub#191: the surface/case coverage join as the outside-agent-
+		// parseable surface — tab rows like every other bais command, --json
+		// for agents, no LLM in the run path. ok <surface> <file> /
+		// missing <surface> <anchor> / stale <file> <anchor>; a goal.toml
+		// with no declared testing_surface is a named no-surfaces line
+		// (grandfathered, never silently empty). Exits 1 when any gap or
+		// stale row exists so CI can pin zero — same drill-suite idiom.
+		const goalText = existsSync(goalFile) ? readFileSync(goalFile, "utf8") : "";
+		const surfaces = parseGoalTestingSurface(goalText);
+		const cases = e2eCaseAnchorsIn(e2eDirFor(issuesDir));
+		const drift = e2eDriftJoin(surfaces, cases);
+		if (asJson) {
+			printJson({ declared: drift.declared, surfaces, cases, ok: drift.ok, gaps: drift.gaps, stale: drift.stale });
+		} else {
+			if (!drift.declared) console.log(`e2e\tno-surfaces\tgoal.toml declares no testing_surface — the coverage join is vacuous (hub#191)`);
+			for (const o of drift.ok) console.log(`ok\t${o.surface}\t${o.file}`);
+			for (const g of drift.gaps) console.log(`missing\t${g.surface}\t${g.anchor}`);
+			for (const s of drift.stale) console.log(`stale\t${s.file}\t${s.anchor ?? "(none embedded)"}`);
+		}
+		process.exit(drift.gaps.length + drift.stale.length > 0 ? 1 : 0);
 	} else {
 		console.error(usage);
 		process.exit(1);

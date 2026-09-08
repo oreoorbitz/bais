@@ -20,6 +20,7 @@
 // Unlike bi/bagl, bais imports its own parser directly — same package, no
 // dynamic pathToFileURL resolution needed.
 
+import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { parseBaisFile } from "./toml.js";
@@ -485,11 +486,20 @@ export function whyNotIn(all: BaisFile[], project: string, leases: HostLease[] =
 
 // bi#83 close-evidence core (dependency-free: no imports beyond node:fs
 // already at top, so it stays probeable without the BAML runtime).
-export type CloseEvidenceKind = "drill" | "verdict";
+// hub#188: third ref kind e2e(<stem>) — a Done issue cites the goal-e2e
+// case it kept green, resolving iff .bais/e2e/<stem>.mjs exists (exactly
+// the knownDrillNames rule: existence is resolvability; greenness is
+// proven by running the case, not by this predicate). One auditable
+// evidence channel: the Swarm:-verdict line (below) proved the
+// add-a-ref-kind pattern, and a separate top-level E2E: line would
+// splinter what this gate already audits. Rollout is warn-first: in the
+// warn phase cli.ts renders unresolvable-e2e as advisory (never fatal);
+// --e2e-strict flips it to fatal (the style/hero precedent).
+export type CloseEvidenceKind = "drill" | "verdict" | "e2e";
 export type CloseEvidenceRef = { kind: CloseEvidenceKind; ref: string };
 export type CloseEvidenceProblem = {
 	id: string; // Done issue carrying the bad / missing evidence
-	reason: "missing-close-evidence" | "unresolvable-drill" | "unresolvable-verdict";
+	reason: "missing-close-evidence" | "unresolvable-drill" | "unresolvable-verdict" | "unresolvable-e2e";
 	ref: string | null; // the raw ref text, null when nothing was cited
 	kind: CloseEvidenceKind | null;
 	status: "Missing" | "External"; // External (cross-project verdict) is advisory, never fatal
@@ -535,13 +545,34 @@ export function knownDrillNames(scriptsDir: string): string[] {
 	return names;
 }
 
-// One `Evidence: drill(x)` / `Evidence: verdict(y)` ref per matching
-// body line (case-sensitive kind, trimmed ref; trailing `#` comment
-// stripped). Anything else on the line is not a ref — prose never counts.
+// hub#188: e2e case stems resolve iff a matching *.mjs exists in the
+// hub's .bais/e2e/ dir (the goal-commit scaffold namespace, hub#184).
+// issuesDir is <root>/.bais/issues; cases live at <root>/.bais/e2e.
+// Absent dir contributes nothing (a tmpdir or pre-goal hub resolves no
+// stems — an e2e cite there is unresolvable-e2e, loud, never silent).
+export function e2eDirFor(issuesDir: string): string {
+	return join(resolve(issuesDir, ".."), "e2e");
+}
+
+export function knownE2eStems(e2eDir: string): string[] {
+	try {
+		return readdirSync(e2eDir)
+			.filter((f) => f.endsWith(".mjs"))
+			.map((f) => f.slice(0, -4))
+			.sort();
+	} catch {
+		return [];
+	}
+}
+
+// One `Evidence: drill(x)` / `Evidence: verdict(y)` / `Evidence: e2e(z)`
+// ref per matching body line (case-sensitive kind, trimmed ref; trailing
+// `#` comment stripped). Anything else on the line is not a ref — prose
+// never counts.
 export function parseCloseEvidence(body: string): CloseEvidenceRef[] {
 	const out: CloseEvidenceRef[] = [];
 	for (const line of (body ?? "").split("\n")) {
-		const m = /^\s*Evidence\s*:\s*(drill|verdict)\s*\(\s*([^)]*?)\s*\)\s*(?:#.*)?$/.exec(line);
+		const m = /^\s*Evidence\s*:\s*(drill|verdict|e2e)\s*\(\s*([^)]*?)\s*\)\s*(?:#.*)?$/.exec(line);
 		if (m) out.push({ kind: m[1] as CloseEvidenceKind, ref: m[2].trim() });
 	}
 	return out;
@@ -740,10 +771,14 @@ export function creationDaysFromMtimes(issuesDir: string, ids: string[]): Map<st
 // Done-only gate: every Done entry needs >= 1 evidence ref and every
 // cited ref must resolve. Entries are {id,status,body} so both the scan
 // path (BaisFile) and the store path (tasks rows) share this predicate.
+// e2eStems is optional (hub#188): callers that predate the e2e ref kind
+// resolve no e2e stems, so an e2e cite there reports unresolvable-e2e —
+// loud, never silently green.
 export function closeEvidenceIn(
 	entries: { id: string; status: string; body: string }[],
 	project: string,
 	drills: string[],
+	e2eStems: string[] = [],
 ): CloseEvidenceProblem[] {
 	const known = new Set(entries.map((e) => e.id));
 	const out: CloseEvidenceProblem[] = [];
@@ -758,6 +793,10 @@ export function closeEvidenceIn(
 			if (r.kind === "drill") {
 				if (!drills.includes(r.ref)) {
 					out.push({ id: e.id, reason: "unresolvable-drill", ref: `drill(${r.ref})`, kind: "drill", status: "Missing" });
+				}
+			} else if (r.kind === "e2e") {
+				if (!e2eStems.includes(r.ref)) {
+					out.push({ id: e.id, reason: "unresolvable-e2e", ref: `e2e(${r.ref})`, kind: "e2e", status: "Missing" });
 				}
 			} else {
 				if (!known.has(r.ref)) {
@@ -822,4 +861,327 @@ export function swarmVerdictProblemsIn(entries: { id: string; status: string; bo
 		}
 	}
 	return out;
+}
+
+// ── Goal e2e drift joins (hub#191) ─────────────────────────────────────
+// Surfaces and cases drift in both directions — goal.toml edited without
+// touching case files, case files outliving their surface — and nothing
+// detected it. Two deterministic joins over goal.toml text + the
+// .bais/e2e/ listing (pure core here, the CLI owns the IO):
+//
+//   e2e-gap:   a declared testing_surface item whose anchor matches no
+//              .bais/e2e/*.mjs scaffold header (the goal needs a case).
+//   e2e-stale: a scaffold whose embedded goal anchor matches no declared
+//              surface item (the case outlived its surface — renaming or
+//              editing a surface in goal.toml turns the join red, naming
+//              both sides; never auto-mutating, bi#55).
+//
+// The join key is the hub#184 goal anchor: sha256 of
+// `surface + "=>" + exercise` (mirror of bais/scripts/goal.mjs
+// surfaceAnchor — mirror-parity pins them equal). Grandfathering mirrors
+// the hub#165/hub#166 file-gate posture: a goal.toml with no declared
+// testing_surface reads as pre-surface, so BOTH joins are vacuous
+// (declared=false) — deleting the whole surface list silences the stale
+// join by design (rename/edit detection requires the list to stay
+// declared). Rollout is warn-first: cli.ts renders rows as advisories
+// that never touch the exit code; --e2e-strict flips to fatal.
+export type GoalSurfaceItem = { surface: string; exercise: string };
+
+// Declared testing surface: well-formed `{ surface = "...", exercise =
+// "..." }` inline tables only. Missing list, empty list, and malformed
+// items yield no item here — the validateGoal file gate (goal.mjs) owns
+// loud failure for malformed items; this reader never validates. Mirrors
+// goal.mjs's extractGoalList/splitGoalListItems (duplicated, not
+// imported: the src runtime must not depend on scripts/ — the
+// warnUnknownWithheld comment above names the requirement class).
+export function parseGoalTestingSurface(goalTomlText: string): GoalSurfaceItem[] {
+	const src = String(goalTomlText ?? "");
+	const m = /^testing_surface\s*=\s*\[([\s\S]*?)\]/m.exec(src);
+	if (!m) return [];
+	const out: GoalSurfaceItem[] = [];
+	for (const item of splitTopLevelItems(m[1])) {
+		const t = item.trim();
+		if (!t.startsWith("{")) continue; // bare strings fail the file gate, not this reader
+		const surface = inlineTableString(t, "surface");
+		const exercise = inlineTableString(t, "exercise");
+		if (surface !== null && exercise !== null && surface.trim() !== "" && exercise.trim() !== "") {
+			out.push({ surface, exercise });
+		}
+	}
+	return out;
+}
+
+// Split a TOML array body on top-level commas: brace-, bracket- and
+// string-aware, `#` comments skipped outside strings. Verbatim mirror of
+// splitGoalListItems in bais/scripts/goal.mjs.
+function splitTopLevelItems(body: string): string[] {
+	const items: string[] = [];
+	let depth = 0;
+	let cur = "";
+	let inStr = false;
+	let esc = false;
+	const lines = String(body).split("\n");
+	for (let li = 0; li < lines.length; li++) {
+		const line = lines[li];
+		for (let i = 0; i < line.length; i++) {
+			const ch = line[i];
+			if (inStr) {
+				cur += ch;
+				if (esc) esc = false;
+				else if (ch === "\\") esc = true;
+				else if (ch === '"') inStr = false;
+				continue;
+			}
+			if (ch === '"') {
+				inStr = true;
+				cur += ch;
+				continue;
+			}
+			if (ch === "#") break;
+			if (ch === "{" || ch === "[") depth++;
+			if (ch === "}" || ch === "]") depth--;
+			if (ch === "," && depth === 0) {
+				items.push(cur);
+				cur = "";
+				continue;
+			}
+			cur += ch;
+		}
+		if (inStr) cur += "\n";
+		else cur += " ";
+	}
+	if (cur.trim() !== "") items.push(cur);
+	return items.map((s) => s.trim()).filter((s) => s !== "");
+}
+
+// One JSON-string field out of an inline table (null when absent or
+// unparseable — never invented).
+function inlineTableString(item: string, name: string): string | null {
+	const m = new RegExp(`${name}\\s*=\\s*("(?:[^"\\\\]|\\\\.)*")`).exec(item);
+	if (!m) return null;
+	try {
+		return JSON.parse(m[1]);
+	} catch {
+		return null;
+	}
+}
+
+// Goal anchor: sha256 of `surface + "=>" + exercise` — verbatim mirror of
+// surfaceAnchor in bais/scripts/goal.mjs (the eventId content-hash idiom,
+// bais/scripts/fault-drills.mjs). Pure; mirror-parity recomputes both
+// sides and pins them equal.
+export function surfaceAnchor(surface: string, exercise: string): string {
+	return createHash("sha256").update(`${surface}=>${exercise}`, "utf8").digest("hex");
+}
+
+// The anchor a scaffold embeds in its header
+// (`// goal anchor: <hex> (sha256 of surface + "=>" + exercise — hub#184)`).
+// A scaffold with no anchor line cannot join — null, never invented.
+export function e2eScaffoldAnchor(content: string): string | null {
+	const m = /^\/\/ goal anchor: ([0-9a-f]{64})\b/m.exec(String(content ?? ""));
+	return m ? m[1] : null;
+}
+
+export type E2eCaseAnchor = { file: string; stem: string; anchor: string | null };
+
+// Directory half of the join (IO, same exemption as knownDrillNames):
+// every .bais/e2e/*.mjs with its embedded anchor, sorted by file. An
+// absent dir yields no cases.
+export function e2eCaseAnchorsIn(e2eDir: string): E2eCaseAnchor[] {
+	let files: string[] = [];
+	try {
+		files = readdirSync(e2eDir).filter((f) => f.endsWith(".mjs")).sort();
+	} catch {
+		return [];
+	}
+	const out: E2eCaseAnchor[] = [];
+	for (const f of files) {
+		let anchor: string | null = null;
+		try {
+			anchor = e2eScaffoldAnchor(readFileSync(join(e2eDir, f), "utf8"));
+		} catch {}
+		out.push({ file: f, stem: f.slice(0, -4), anchor });
+	}
+	return out;
+}
+
+export type E2eDriftJoin = {
+	declared: boolean; // false = pre-surface goal (grandfathered): both joins vacuous
+	ok: { surface: string; file: string }[]; // matched surface/case pairs
+	gaps: { surface: string; exercise: string; anchor: string }[]; // declared surface, no case (e2e-gap)
+	stale: { file: string; anchor: string | null }[]; // case matching no declared surface (e2e-stale)
+};
+
+// Pure join over declared surfaces + case anchors. Surfaces keep
+// declaration order, cases keep file-sorted order — deterministic rows.
+// A case matching several surfaces pairs with each (duplicate declared
+// surfaces are the file gate's problem, not hidden here); a surface with
+// several cases is covered (no gap) and every pair lands in ok.
+export function e2eDriftJoin(surfaces: GoalSurfaceItem[], cases: E2eCaseAnchor[]): E2eDriftJoin {
+	const declared = surfaces.length > 0;
+	const ok: E2eDriftJoin["ok"] = [];
+	const gaps: E2eDriftJoin["gaps"] = [];
+	const stale: E2eDriftJoin["stale"] = [];
+	if (!declared) return { declared, ok, gaps, stale };
+	const casesByAnchor = new Map<string, E2eCaseAnchor[]>();
+	for (const c of cases) {
+		if (c.anchor === null) continue;
+		const list = casesByAnchor.get(c.anchor) ?? [];
+		list.push(c);
+		casesByAnchor.set(c.anchor, list);
+	}
+	const matched = new Set<string>();
+	for (const s of surfaces) {
+		const anchor = surfaceAnchor(s.surface, s.exercise);
+		const hits = casesByAnchor.get(anchor) ?? [];
+		if (hits.length === 0) gaps.push({ surface: s.surface, exercise: s.exercise, anchor });
+		for (const h of hits) {
+			ok.push({ surface: s.surface, file: h.file });
+			matched.add(h.file);
+		}
+	}
+	for (const c of cases) {
+		if (!matched.has(c.file)) stale.push({ file: c.file, anchor: c.anchor });
+	}
+	return { declared, ok, gaps, stale };
+}
+
+// ── Progressive-enhancement audits (hub#193, warn-first) ───────────────
+// Three violations that were invisible, as deterministic advisory rows
+// with named reasons — same posture as bi#80 `bais stale`: never
+// auto-mutates (bi#55), warn phase never touches the exit code,
+// --audit-strict flips to fatal so CI can pin zero. Thresholds live in
+// data (the exported constants), not literals buried in the rules.
+export const RADIUS_EVIDENCE_MIN_OPEN_DOWNSTREAM = 3;
+export const DECLARATION_DISTRIBUTION_WARN_PCT = 10;
+
+// All ids that must land BEFORE `id`: the transitive closure of the
+// precedes relation (Blocks/DependsOn — the same two ordering kinds
+// blast_radii/cyclic_ids use). Cycle-safe (seen-bounded), the hub never
+// counts itself. Host-owned audit helper, no BAML source (the M-bais10
+// close-evidence precedent: check policy lives host-side).
+export function precedesAncestors(id: string, edges: BaisEdge[]): string[] {
+	const seen = new Set<string>([id]);
+	let frontier = [id];
+	while (frontier.length > 0) {
+		const next: string[] = [];
+		for (const cur of frontier) {
+			for (const e of edges) {
+				for (const c of [e.from, e.to]) {
+					if (seen.has(c)) continue;
+					if (precedes(e, c, cur)) {
+						seen.add(c);
+						next.push(c);
+					}
+				}
+			}
+		}
+		frontier = next;
+	}
+	seen.delete(id);
+	return [...seen].sort();
+}
+
+export type LayerDriftRow = { id: string; ancestor: string; baseline: string; reason: "layer-drift" };
+
+// layer-drift: a Doing/Done enhancement whose foundation is not landed.
+// The foundation set is the declared baseline plus its own precedes-
+// ancestors (the hub#186 baseline); any Open foundation member the
+// enhancement transitively depends on is big-bang made visible, one row
+// per (enhancement, open ancestor) naming both ids. Rows sort by id then
+// ancestor — deterministic. A baseline that cannot resolve (no sketch
+// declaration) yields no rows; the CLI names that state on the phase
+// line instead of inventing one.
+export function layerDriftIn(all: BaisFile[], baselineId: string): LayerDriftRow[] {
+	const edges = all.flatMap((f) => f.edges);
+	const statusById = new Map(all.map((f) => [f.issue.id, f.issue.status]));
+	const foundation = new Set([baselineId, ...precedesAncestors(baselineId, edges)]);
+	const rows: LayerDriftRow[] = [];
+	for (const f of all) {
+		const st = f.issue.status;
+		if (st !== "Doing" && st !== "Done") continue;
+		if (foundation.has(f.issue.id)) continue;
+		for (const anc of precedesAncestors(f.issue.id, edges)) {
+			if (foundation.has(anc) && statusById.get(anc) === "Open") {
+				rows.push({ id: f.issue.id, ancestor: anc, baseline: baselineId, reason: "layer-drift" });
+			}
+		}
+	}
+	return rows.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : a.ancestor < b.ancestor ? -1 : a.ancestor > b.ancestor ? 1 : 0));
+}
+
+// The declared baseline (hub#186): .bais/sketch.toml carries a
+// [[node]] id = "baseline"; the node names the issue it materialized as
+// via an explicit `issue = "<issue-id>"` key. No node or no key → null —
+// the audit stays silent rather than guessing (never fail-closed without
+// a named reason, bi#55: the phase line names the undeclared state).
+export function baselineIssueFromSketch(sketchText: string): string | null {
+	for (const block of String(sketchText ?? "").split("[[node]]")) {
+		if (!/^\s*id\s*=\s*"baseline"\s*$/m.test(block)) continue;
+		const m = /^\s*issue\s*=\s*("(?:[^"\\]|\\.)*")\s*$/m.exec(block);
+		if (!m) return null;
+		try {
+			const id = JSON.parse(m[1]);
+			return typeof id === "string" && id !== "" ? id : null;
+		} catch {
+			return null;
+		}
+	}
+	return null;
+}
+
+export type RadiusEvidenceRow = { id: string; open_downstream: number; reason: "radius-vs-evidence" };
+
+// radius-vs-evidence: a folded (Done) hub node holding >=
+// RADIUS_EVIDENCE_MIN_OPEN_DOWNSTREAM open downstream whose fold carried
+// no surface-observable change — no Evidence: e2e(<stem>) cite (hub#188)
+// on the issue. Abstraction-first scaffolding is manufactured, unearned
+// blast radius; a healthy campaign shows the top radius decaying as hubs
+// land. open_downstream is the same blast_radii number dispatch sorts
+// on, so the audit and the dispatcher agree on what "hub" means.
+export function radiusVsEvidenceIn(
+	all: BaisFile[],
+	minOpenDownstream: number = RADIUS_EVIDENCE_MIN_OPEN_DOWNSTREAM,
+): RadiusEvidenceRow[] {
+	const radii = new Map(blastRadii(all).map((r) => [r.id, r]));
+	const rows: RadiusEvidenceRow[] = [];
+	for (const f of all) {
+		if (f.issue.status !== "Done") continue;
+		const open = radii.get(f.issue.id)?.open_downstream ?? 0;
+		if (open < minOpenDownstream) continue;
+		const citesE2e = parseCloseEvidence(f.issue.body).some((r) => r.kind === "e2e");
+		if (!citesE2e) rows.push({ id: f.issue.id, open_downstream: open, reason: "radius-vs-evidence" });
+	}
+	return rows.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+}
+
+export type DeclarationDistributionRow = {
+	reason: "declaration-distribution";
+	open: number; // Open issues considered
+	severity5: number; // of those, at the severity-5 override hatch
+	pct: number; // severity5/open as a percentage, one decimal (floor)
+	k: number; // the warn threshold in effect (data, not a literal)
+};
+
+// declaration-distribution: more than K% of Open issues holding the
+// severity-5 override hatch (15, above every structural maximum) warns
+// loud, naming the fraction. Measure only — policy unchanged; structural
+// tie-breaks already blunt relevance inflation, and this audit covers
+// the one uncapped hatch. Strictly greater than K warns; at or under is
+// silent. K lives in DECLARATION_DISTRIBUTION_WARN_PCT, not a literal.
+export function declarationDistributionIn(
+	all: BaisFile[],
+	kPct: number = DECLARATION_DISTRIBUTION_WARN_PCT,
+): DeclarationDistributionRow | null {
+	const open = all.filter((f) => f.issue.status === "Open");
+	if (open.length === 0) return null;
+	const sev5 = open.filter((f) => f.issue.severity !== null && f.issue.severity >= 5);
+	if (sev5.length * 100 <= kPct * open.length) return null;
+	return {
+		reason: "declaration-distribution",
+		open: open.length,
+		severity5: sev5.length,
+		pct: Math.floor((sev5.length * 1000) / open.length) / 10,
+		k: kPct,
+	};
 }

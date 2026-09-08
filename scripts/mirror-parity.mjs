@@ -31,6 +31,15 @@
 //   M-bais10  parseCloseEvidence/closeEvidenceIn <- NO BAML source: host-owned
 //             bi#83 check policy (Done-only gate, drill/verdict refs). Companion:
 //             bi/scripts/check-evidence.mjs (delegation) + drill-registry.mjs (live).
+//             hub#188 adds the third ref kind e2e(stem) resolving against
+//             .bais/e2e/<stem>.mjs — pinned §E below.
+//   M-bais13  e2eDriftJoin/parseGoalTestingSurface/e2eScaffoldAnchor <- NO BAML
+//             source: host-owned hub#191 check policy (e2e-gap/e2e-stale drift
+//             joins). surfaceAnchor is pinned against the scripts-lane
+//             canonical (goal.mjs, imported below) — §E.
+//   M-bais14  layerDriftIn/radiusVsEvidenceIn/declarationDistributionIn/
+//             precedesAncestors/baselineIssueFromSketch <- NO BAML source:
+//             host-owned hub#193 audit policy (warn-first, named reasons) — §E.
 // Bais-only, pinned by companion suites (not re-pinned here):
 //   M-bais11  storeReady SQL (bais/src/store.ts:522) <- ready_issues/is_blocked,
 //             independent SQL re-implementation; pinned by cross-check.mjs §§2-3
@@ -105,14 +114,42 @@
 //   the tripwire: the literal pins read the bais side, the agree() checks
 //   catch a regression on EITHER side.
 //
+// Red-check record (hub#188/hub#191/hub#193 §E, observed live 2026-09-07,
+// agent kimi-check-joins; bais is a nested repo — backup/restore inside it):
+//   $ cp bais/src/graph.ts /tmp/checkjoins-graph-backup.ts
+//   R1 (hub#188): drop `|e2e` from the parseCloseEvidence regex
+//     (graph.ts:575), rebuild, probe
+//     => FAIL: e2e close-evidence: e2e(stem) parses as a ref kind
+//     => FAIL: e2e close-evidence: resolving cite is clean, stale cite +
+//        prose-only named (got e#01|missing-close-evidence|..., ...)
+//     => FAIL: radius-vs-evidence flags the interface-only fold, ... (x2)
+//     => mirror-parity: 4 failure(s), exit 1
+//   R2 (hub#191): neuter the gap join (e2eDriftJoin gaps.push guarded off),
+//     rebuild, probe
+//     => FAIL: e2e-gap names the uncovered surface
+//     => mirror-parity: 1 failure(s), exit 1
+//   R3 (hub#193): neuter the layer-drift rule (rows.push guarded off),
+//     rebuild, probe
+//     => FAIL: layer-drift names enhancement and Open baseline ancestor (got [])
+//     => FAIL: layer-drift covers the baseline's precedes-ancestors (got [])
+//     => mirror-parity: 2 failure(s), exit 1
+//   $ cp /tmp/checkjoins-graph-backup.ts bais/src/graph.ts (cmp-identical
+//     after each), rebuild, probe green (82 checks, exit 0). A passing gate
+//   that cannot go red is camouflage, not coverage.
+//
 // Run: node bais/scripts/mirror-parity.mjs (offline, tmpdirs only, read-only
 // against the live hubs — imports both dists, so rebuild first if .ts moved).
+import { mkdtempSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const bais = await import(join(HERE, "..", "dist", "src", "graph.js"));
 const bi = await import(join(HERE, "..", "..", "bi", "dist", "src", "bais.js"));
+// §E anchor parity: the scripts-lane canonical (surfaceAnchor, hub#184)
+// the host mirror must agree with byte for byte.
+const goalmod = await import(join(HERE, "goal.mjs"));
 
 let failures = 0;
 const check = (cond, msg) => {
@@ -410,6 +447,149 @@ const agree = (label, a, b) =>
 	check(bais.parseCloseEvidence("Evidence: drill(b) # comment\nprose Evidence: drill(x) never counts").length === 1,
 		`parseCloseEvidence: prose never counts, trailing comments strip`);
 }
+
+// ---- §E goal-e2e evidence + drift joins + progressive-enhancement audits ----
+// (hub#188/hub#191/hub#193 — host-owned check policy, the M-bais10
+// no-BAML-source precedent. Literal pins + one tmpdir hub, hand-computed;
+// the CLI wiring lives in bais/src/cli.ts check + `bais goal e2e`.)
+{
+	// hub#188: e2e(<stem>) is the third close-evidence ref kind. A Done
+	// issue with no refs fails missing-close-evidence; the same issue with
+	// a resolving e2e cite is clean; a stale cite is unresolvable-e2e.
+	check(JSON.stringify(bais.parseCloseEvidence("Evidence: e2e(alpha-flow) # kept green")) ===
+		JSON.stringify([{ kind: "e2e", ref: "alpha-flow" }]),
+		`e2e close-evidence: e2e(stem) parses as a ref kind`);
+	const evEntries = [
+		{ id: "e#01", status: "Done", body: "Evidence: e2e(alpha-flow)" }, // resolving cite
+		{ id: "e#02", status: "Done", body: "Evidence: e2e(nope)" },       // stale cite
+		{ id: "e#03", status: "Done", body: "just prose, no refs" },       // no cite at all
+	];
+	const evP = bais.closeEvidenceIn(evEntries, "e", ["a", "b", "c", "d", "r"], ["alpha-flow"]);
+	const evKey = (p) => `${p.id}|${p.reason}|${p.kind}|${p.status}`;
+	check(JSON.stringify(evP.map(evKey).sort()) ===
+		JSON.stringify(["e#02|unresolvable-e2e|e2e|Missing", "e#03|missing-close-evidence|null|Missing"].sort()),
+		`e2e close-evidence: resolving cite is clean, stale cite + prose-only named (got ${evP.map(evKey).sort().join(",")})`);
+	// tmpdir hub (drill-registry.mjs:11 precedent): stems resolve from
+	// .bais/e2e/*.mjs only; an absent dir resolves nothing.
+	{
+		const tmp = realpathSync(mkdtempSync(join(realpathSync(tmpdir()), "mirror-e2e-")));
+		mkdirSync(join(tmp, ".bais", "issues"), { recursive: true });
+		mkdirSync(join(tmp, ".bais", "e2e"), { recursive: true });
+		writeFileSync(join(tmp, ".bais", "e2e", "alpha-flow.mjs"), "// fixture case\n");
+		writeFileSync(join(tmp, ".bais", "e2e", "notes.txt"), "not a case\n");
+		check(JSON.stringify(bais.knownE2eStems(bais.e2eDirFor(join(tmp, ".bais", "issues")))) === JSON.stringify(["alpha-flow"]),
+			`e2e stems resolve from .bais/e2e/*.mjs only`);
+		check(JSON.stringify(bais.knownE2eStems(join(tmp, ".bais", "absent"))) === JSON.stringify([]),
+			`e2e stems: absent dir resolves nothing`);
+	}
+
+	// hub#191: anchor parity with the scripts-lane canonical, then the
+	// drift joins (e2e-gap / e2e-stale) over surfaces + case anchors.
+	const sA = { surface: "alpha flow", exercise: "run: node .bais/e2e/alpha-flow.mjs" };
+	const sB = { surface: "beta view", exercise: "run: node .bais/e2e/beta-view.mjs" };
+	check(bais.surfaceAnchor(sA.surface, sA.exercise) === goalmod.surfaceAnchor(sA.surface, sA.exercise),
+		`surfaceAnchor agrees with the goal.mjs canonical`);
+	const goalText =
+		`statement = "g"\n` +
+		`testing_surface = [{ surface = "alpha flow", exercise = "run: node .bais/e2e/alpha-flow.mjs" },\n` +
+		`  { surface = "beta view", exercise = "run: node .bais/e2e/beta-view.mjs" }]\n`;
+	check(JSON.stringify(bais.parseGoalTestingSurface(goalText)) === JSON.stringify([sA, sB]),
+		`parseGoalTestingSurface reads inline tables (multi-line array)`);
+	check(JSON.stringify(bais.parseGoalTestingSurface(goalText)) ===
+		JSON.stringify(goalmod.parseGoalToml(goalText)._parsed.testing_surface.map(({ surface, exercise }) => ({ surface, exercise }))),
+		`parseGoalTestingSurface agrees with goal.mjs parseGoalToml`);
+	check(JSON.stringify(bais.parseGoalTestingSurface("statement = \"g\"\n")) === JSON.stringify([]),
+		`parseGoalTestingSurface: no list declared reads as pre-surface`);
+	const caseA = { file: "alpha-flow.mjs", stem: "alpha-flow", anchor: bais.surfaceAnchor(sA.surface, sA.exercise) };
+	// Fixture: 2 declared surfaces, 1 case file -> e2e-gap names the
+	// uncovered surface with its recomputed anchor.
+	const joinGap = bais.e2eDriftJoin([sA, sB], [caseA]);
+	check(joinGap.declared === true && joinGap.gaps.length === 1 &&
+		joinGap.gaps[0].surface === "beta view" && joinGap.gaps[0].anchor === bais.surfaceAnchor(sB.surface, sB.exercise),
+		`e2e-gap names the uncovered surface`);
+	check(joinGap.ok.length === 1 && joinGap.ok[0].surface === "alpha flow" && joinGap.ok[0].file === "alpha-flow.mjs" &&
+		joinGap.stale.length === 0,
+		`e2e join: the matched pair lands in ok, nothing stale`);
+	// Fixture: surface edited in goal.toml without touching the case ->
+	// e2e-stale names the file and the unmatched anchor (both sides loud).
+	const joinStale = bais.e2eDriftJoin([{ surface: "alpha flow v2", exercise: sA.exercise }, sB], [caseA]);
+	check(joinStale.stale.length === 1 && joinStale.stale[0].file === "alpha-flow.mjs" &&
+		joinStale.stale[0].anchor === caseA.anchor,
+		`e2e-stale names the file and the unmatched anchor`);
+	// Grandfathered: no declared testing_surface -> the join is vacuous
+	// (declared=false), never a mass-stale flood on pre-surface hubs.
+	const joinVacuous = bais.e2eDriftJoin([], [caseA]);
+	check(joinVacuous.declared === false && joinVacuous.ok.length + joinVacuous.gaps.length + joinVacuous.stale.length === 0,
+		`e2e join: pre-surface goal is vacuous (grandfathered)`);
+	check(bais.e2eScaffoldAnchor(`// e2e scaffold\n// goal anchor: ${caseA.anchor} (sha256 of surface + "=>" + exercise — hub#184)\n`) === caseA.anchor &&
+		bais.e2eScaffoldAnchor("// no anchor here\n") === null,
+		`e2eScaffoldAnchor reads the header line, null when absent`);
+
+	// hub#193.1: layer-drift — a Doing/Done enhancement over an Open
+	// baseline ancestor names both ids; the baseline closing cleans it.
+	const ldOpen = [
+		F("b#01", "Open"),                                                   // declared baseline, not landed
+		F("b#02", "Doing", [E("b#02", "b#01", "DependsOn")]),                // enhancement Doing
+		F("b#03", "Open", [E("b#03", "b#02", "DependsOn")]),                 // Open issues are not audited
+	];
+	const ld = bais.layerDriftIn(ldOpen, "b#01");
+	check(ld.length === 1 && ld[0].id === "b#02" && ld[0].ancestor === "b#01" && ld[0].baseline === "b#01" &&
+		ld[0].reason === "layer-drift",
+		`layer-drift names enhancement and Open baseline ancestor (got ${JSON.stringify(ld)})`);
+	const ldLanded = [F("b#01", "Done"), ldOpen[1], ldOpen[2]];
+	check(bais.layerDriftIn(ldLanded, "b#01").length === 0,
+		`layer-drift: the same enhancement is clean once the baseline lands`);
+	// Foundation = baseline + its own precedes-ancestors: an enhancement
+	// over an Open foundation root flags even when the baseline is Done.
+	const ldChain = [
+		F("b#10", "Open"),                                                // foundation root
+		F("b#11", "Done", [E("b#11", "b#10", "DependsOn")]),              // baseline (landed)
+		F("b#12", "Doing", [E("b#12", "b#10", "DependsOn")]),             // enhancement over the root
+	];
+	const ld2 = bais.layerDriftIn(ldChain, "b#11");
+	check(ld2.length === 1 && ld2[0].id === "b#12" && ld2[0].ancestor === "b#10",
+		`layer-drift covers the baseline's precedes-ancestors (got ${JSON.stringify(ld2)})`);
+	check(bais.baselineIssueFromSketch(`# sketch\n[[node]]\nid = "baseline"\ntitle = "walk"\nissue = "hub#42"\nradius = []\n`) === "hub#42" &&
+		bais.baselineIssueFromSketch(`[[node]]\nid = "baseline"\ntitle = "walk"\nradius = []\n`) === null &&
+		bais.baselineIssueFromSketch(`[[node]]\nid = "c1"\ntitle = "x"\n`) === null,
+		`baselineIssueFromSketch: explicit issue= key, no key and no node all named`);
+	check(JSON.stringify(bais.precedesAncestors("p#03", [E("p#02", "p#01", "DependsOn"), E("p#03", "p#02", "DependsOn")])) ===
+		JSON.stringify(["p#01", "p#02"]),
+		`precedesAncestors is transitive and sorted`);
+	check(JSON.stringify(bais.precedesAncestors("p#01", [E("p#01", "p#02", "DependsOn"), E("p#02", "p#01", "DependsOn")])) ===
+		JSON.stringify(["p#02"]),
+		`precedesAncestors terminates on cycles without self-credit`);
+
+	// hub#193.2: radius-vs-evidence — a folded hub with open_downstream
+	// >= 3 and no Evidence: e2e cite flags; the e2e-citing fold is clean.
+	const rvAll = [
+		F("r#10", "Done", [], "Evidence: drill(b) # interface-only fold"),
+		F("r#11", "Open", [E("r#11", "r#10", "DependsOn")]),
+		F("r#12", "Open", [E("r#12", "r#10", "DependsOn")]),
+		F("r#13", "Open", [E("r#13", "r#10", "DependsOn")]),
+		F("r#14", "Done", [], "Evidence: drill(b)\nEvidence: e2e(alpha-flow) # surface-moving fold"),
+		F("r#15", "Open", [E("r#15", "r#14", "DependsOn")]),
+		F("r#16", "Open", [E("r#16", "r#14", "DependsOn")]),
+		F("r#17", "Open", [E("r#17", "r#14", "DependsOn")]),
+	];
+	const rv = bais.radiusVsEvidenceIn(rvAll);
+	check(rv.length === 1 && rv[0].id === "r#10" && rv[0].open_downstream === 3 && rv[0].reason === "radius-vs-evidence",
+		`radius-vs-evidence flags the interface-only fold, e2e-citing fold is clean (got ${JSON.stringify(rv)})`);
+	check(bais.radiusVsEvidenceIn(rvAll.filter((f) => f.issue.id !== "r#13")).length === 0,
+		`radius-vs-evidence: under the open-downstream threshold is silent`);
+
+	// hub#193.3: declaration-distribution — >K% of Open at severity 5
+	// warns naming the fraction; at or under K is silent; K is data.
+	const FS = (id, severity) => ({ ...F(id), issue: { ...F(id).issue, severity } });
+	const dd = bais.declarationDistributionIn([FS("d#01", 5), F("d#02"), F("d#03"), F("d#04"), F("d#05", "Done")]);
+	check(dd !== null && dd.reason === "declaration-distribution" && dd.open === 4 && dd.severity5 === 1 &&
+		dd.pct === 25 && dd.k === bais.DECLARATION_DISTRIBUTION_WARN_PCT,
+		`declaration-distribution warns naming the fraction (got ${JSON.stringify(dd)})`);
+	const ddQuiet = [FS("d#01", 5), ...["d#02", "d#03", "d#04", "d#05", "d#06", "d#07", "d#08", "d#09", "d#10"].map((id) => F(id))];
+	check(bais.declarationDistributionIn(ddQuiet) === null,
+		`declaration-distribution: exactly at K% is silent (strictly greater warns)`);
+}
+
 
 // ---- §L claim predicates (M-c1 — host owns the clock; bi side pinned) ----
 // bais/src/cli.ts carries verbatim-private copies (parseDuration/

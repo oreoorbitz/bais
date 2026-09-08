@@ -36,6 +36,28 @@
 // failure on unchanged workspace state without re-running, and bounded
 // retries auto-pause with a named reason on exhaustion. See the hub#213
 // sections below.
+//
+// hub#196 (sufficiency gate made a REAL branch): a stay-on-box reply — a
+// bare "more"/"no"/"ask more", or a reply that is itself a question — never
+// settles the box; it asks a follow-up on the SAME box and re-asks the
+// settle prompt. Follow-ups cost per-box sub-rounds (MAX_BOX_FOLLOWUPS),
+// never the global round budget, so a genuine loop on one box cannot starve
+// the rest; sub-round exhaustion escapes via the reasoned-default path
+// (hub#185 idiom: a defaulted waiver record naming the cap).
+//
+// hub#186 (skeleton-first ordering): sketch() always emits a `baseline`
+// walking-skeleton node, chains done_criteria in build order (c1→c2→…→hero)
+// instead of the flat star, and seats every criterion DependsOn baseline.
+// foundationRank/compareFoundation are the pure derivation half; dispatch
+// wiring (warn-first seating line + --json foundation flag) is dispatch.mjs
+// consumer-side.
+//
+// hub#190 (weak-oracle defenses): every e2e exercise must decompose to
+// {command, expect} (assert-true shapes fail loud at COMMIT time, not at
+// consumption), every e2e case must cite ≥1 surface_spec facet (or the
+// explicit "waiver" facet) with drifted citations reported naming the stale
+// facet, generated scaffolds carry a red-check record header, and
+// unreasoned surface_spec amendments flag loud in status() warns.
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
@@ -62,6 +84,70 @@ export const DEFAULTS_ESCAPE = `Reply with a value, "waive" to skip this box, or
 // are unchanged.
 export const SUFFICIENCY_QUESTION = "Is that enough detail, or should I ask more questions?";
 export const SUFFICIENCY_INCENTIVE = "More detail now = stronger generated e2e.";
+
+// --- stay-on-box follow-ups (hub#196, scripts lane) ---
+//
+// hub#165's sufficiency gate was decorative: the CLI read ONE line per box
+// and settled it, so an honest "no, ask more" BECAME the box value. This
+// makes the gate a real branch, pure policy in goal.mjs (the hub#163
+// single-source rule — cli.ts stays an argv router and needs no change:
+// answer() simply leaves the box open and nextQuestion() re-asks the same
+// box, so the existing one-line-per-box loop stays on the box naturally).
+//
+// A reply is STAY-ON-BOX when it is itself a question (ends "?") or a bare
+// "more"/"no"/"ask more" form. stayOnBox() records a per-box sub-round and
+// sets followupBox; nextQuestion() then asks the follow-up prompt for that
+// box instead of advancing. Sub-rounds never touch goal.rounds — an
+// extended loop on one box does not consume the rounds of later boxes.
+// Exhaustion (past MAX_BOX_FOLLOWUPS) escapes via the reasoned-default
+// path (hub#185 idiom): the box settles defaulted with a value naming the
+// cap — for the loud boxes a waiver record, never a silent absence.
+//
+// Load-bearing hunk (hub#196/bi#57 red-check target): the stay-on-box
+// branch in answer(). Removing it must trip the selftest below with
+// exactly:
+//   "FAIL selftest: stay-on-box reply never settles as the box value"
+//   "FAIL selftest: stay-on-box reply asks a follow-up instead of settling"
+// (verified 2026-09-07: branch removed -> both FAILs observed in that
+// order ("more" settles verbatim on plain boxes; on testing-surface it
+// throws with no follow-up ever asked), exit 1 -> restored green).
+export const MAX_BOX_FOLLOWUPS = 3;
+
+export function isStayOnBoxReply(value) {
+	const t = String(value ?? "").trim().toLowerCase();
+	if (t === "") return false;
+	if (t.endsWith("?")) return true;
+	return ["more", "no", "ask more", "more questions", "no, ask more", "not enough"].includes(t);
+}
+
+// The follow-up prompt re-asks the same box. The sufficiency gate +
+// incentive + defaults escape render verbatim at the end, byte-identical
+// to every settle prompt — the escape hatches stay one word at every point
+// (the reasoned waiver is the backstop, not more questions).
+export function followupQuestion(box) {
+	return `Staying on ${box} — what additional detail should we capture before settling it? ${BOX_QUESTIONS[box]} ${SUFFICIENCY_QUESTION} ${SUFFICIENCY_INCENTIVE} ${DEFAULTS_ESCAPE}`;
+}
+
+// Record a stay-on-box sub-round. Within budget: mark the box as awaiting
+// its follow-up answer and leave it open. Past budget: escape via the
+// reasoned-default path (the rounds-cap idiom, hub#185) so a loop that
+// never converges still cannot become an interrogation.
+function stayOnBox(goal, box) {
+	const n = (goal.followups?.[box] ?? 0) + 1;
+	goal.followups[box] = n;
+	if (n > MAX_BOX_FOLLOWUPS) {
+		const capped = {
+			"testing-surface": `waiver => stay-on-box follow-up cap reached (max ${MAX_BOX_FOLLOWUPS} follow-ups): no testing surface declared`,
+			"surface-spec": `waiver => stay-on-box follow-up cap reached (max ${MAX_BOX_FOLLOWUPS} follow-ups): no surface declared, taste unexamined`,
+			contract: `waiver => stay-on-box follow-up cap reached (max ${MAX_BOX_FOLLOWUPS} follow-ups): no completion contract declared`,
+		};
+		goal.boxes[box] = { status: "defaulted", value: capped[box] ?? DEFAULTS[box] };
+		goal.followupBox = null;
+		return goal;
+	}
+	goal.followupBox = box;
+	return goal;
+}
 
 export const DEFAULTS = {
 	users: "solo dev",
@@ -111,7 +197,10 @@ const BOX_QUESTIONS = {
 export function newGoal(statement) {
 	const boxes = {};
 	for (const box of CHECKLIST) boxes[box] = { status: "open", value: "" };
-	return { statement: String(statement ?? ""), boxes, rounds: 0, sketch: null, approved: false };
+	// hub#196: followups = per-box stay-on-box sub-round counts; followupBox =
+	// the box awaiting its follow-up answer (null when none). Both persist
+	// through goal.toml so a saved/resumed interview keeps the loop state.
+	return { statement: String(statement ?? ""), boxes, rounds: 0, followups: {}, followupBox: null, sketch: null, approved: false };
 }
 
 export function openBoxes(goal) {
@@ -141,12 +230,23 @@ export function nextQuestion(goal) {
 		return `Rounds cap (${MAX_ROUNDS}) reached — remaining boxes filled with defaults. ${DEFAULTS_ESCAPE}`;
 	}
 	const box = openBoxes(goal)[0];
+	// hub#196: a box awaiting its follow-up answer re-asks the follow-up
+	// prompt instead of advancing — a per-box sub-round that never consumes
+	// the global round budget of later boxes.
+	if (goal.followupBox === box) return followupQuestion(box);
+	goal.followupBox = null;
 	goal.rounds++;
 	return `${BOX_QUESTIONS[box]} ${SUFFICIENCY_QUESTION} ${SUFFICIENCY_INCENTIVE} ${DEFAULTS_ESCAPE}`;
 }
 
 export function answer(goal, box, value) {
 	if (!(box in goal.boxes)) throw new Error(`unknown checklist box: ${box}`);
+	// hub#196 (the red-check target — see the stay-on-box section header): a
+	// stay-on-box reply never settles. It asks a follow-up on the same box;
+	// the box stays open and the substance settles it later.
+	if (goal.boxes[box].status === "open" && isStayOnBoxReply(value)) return stayOnBox(goal, box);
+	// A substantive reply clears any pending follow-up before settling.
+	if (goal.followupBox === box) goal.followupBox = null;
 	// hub#166: every settle of the surface-spec box runs the loud
 	// validation — a UI goal without a design fails here, not silently.
 	if (box === "surface-spec") return answerSurfaceSpec(goal, value);
@@ -201,6 +301,27 @@ export function useDefaults(goal) {
 }
 
 // Dry-run only: pure data, writes nothing. Refused while any box is open.
+//
+// hub#186 (skeleton-first ordering): the flat star (every criterion
+// DependsOn hero) discarded the done_criteria array order — the natural
+// build order — so equal blast-radius ties fell to lexical id and issue
+// number silently became priority. The sketch now emits a `baseline`
+// walking-skeleton node, chains the criteria in declared build order
+// (c1→c2→…→hero, DependsOn), and seats every criterion DependsOn baseline
+// (plus baseline→hero so the skeleton rolls up). Ordering as structure,
+// not advice (Agentless fixed-phase pipelines, least-to-most decomposition
+// — cited in the issue body).
+//
+// Load-bearing hunk (hub#186/bi#57 red-check target): the baseline node +
+// chain. Reverting nodes/edges to the flat star must trip the selftest
+// below with exactly:
+//   "FAIL selftest: sketch emits the baseline walking-skeleton node"
+// (verified 2026-09-07: flat star restored -> that FAIL observed first,
+// with the chain-order and criterion-DependsOn-baseline checks red behind
+// it, exit 1 -> restored green).
+export const BASELINE_NODE_TITLE =
+	"walking skeleton: minimal end-to-end path through every declared testing_surface item, proved by the e2e suite";
+
 export function sketch(goal) {
 	if (!checklistComplete(goal)) {
 		return { ok: false, error: `sketch refused: checklist open (${openBoxes(goal).join(", ")})` };
@@ -208,9 +329,17 @@ export function sketch(goal) {
 	const criteria = goalCriteria(goal);
 	const nodes = [
 		{ id: "hero", title: heroOf(goal) || goal.statement, radius: ["."] },
+		{ id: "baseline", title: BASELINE_NODE_TITLE, radius: [] },
 		...criteria.map((c, i) => ({ id: `c${i + 1}`, title: c.text, radius: [] })),
 	];
-	const edges = criteria.map((_, i) => ({ from: `c${i + 1}`, to: "hero", kind: "DependsOn" }));
+	const edges = [
+		{ from: "baseline", to: "hero", kind: "DependsOn" },
+		// Build order as structure: c1→c2→…→hero (a zero/one-criterion goal
+		// collapses to baseline→hero / c1→hero).
+		...criteria.map((_, i) => ({ from: `c${i + 1}`, to: i + 1 < criteria.length ? `c${i + 2}` : "hero", kind: "DependsOn" })),
+		// Every criterion is an enhancement layer on the walking skeleton.
+		...criteria.map((_, i) => ({ from: `c${i + 1}`, to: "baseline", kind: "DependsOn" })),
+	];
 	// hub#166: the declared surface spec rides the sketch as oracle material —
 	// BITS compares against the declared spec, not the model's imagination.
 	// (The refusal above already covers the surface-spec box: sketch stays
@@ -229,6 +358,57 @@ export function sketch(goal) {
 	};
 	return { ok: true, proposal: goal.sketch };
 }
+
+// --- foundation_rank derivation (hub#186, scripts lane) ---
+//
+// The pure derivation half of skeleton-first dispatch: 0 when the issue IS
+// the baseline or a `precedes`-ancestor of it (transitive over edges
+// {from, to, kind: "precedes"} — from precedes to), else 1. The transitive
+// closure is plain BFS (the blast_radii precedent, main.baml). dispatch.mjs
+// consumes compareFoundation as the PRIMARY sort key before blast radius
+// (consumer-side wiring, warn-first: it prints FOUNDATION_SEATING_WARN for
+// one release before the sort becomes binding).
+//
+// Load-bearing hunk (hub#186/bi#57 red-check target): the foundation sort
+// key. Neutering compareFoundation to always return 0 must trip the
+// selftest below with exactly:
+//   "FAIL selftest: foundation sort seats the baseline before higher-blast enhancements"
+// (verified 2026-09-07: comparator neutered to `return 0` -> the
+// enhancement outranked the baseline on blast radius -> that FAIL
+// observed, exit 1 -> restored green).
+export function foundationRank(issueId, baselineId, edges) {
+	if (issueId === baselineId) return 0;
+	const adj = new Map();
+	for (const e of edges ?? []) {
+		if (String(e?.kind ?? "").toLowerCase() !== "precedes") continue;
+		if (!adj.has(e.from)) adj.set(e.from, []);
+		adj.get(e.from).push(e.to);
+	}
+	const seen = new Set([issueId]);
+	const queue = [issueId];
+	while (queue.length > 0) {
+		const cur = queue.shift();
+		if (cur === baselineId) return 0;
+		for (const nxt of adj.get(cur) ?? []) {
+			if (!seen.has(nxt)) {
+				seen.add(nxt);
+				queue.push(nxt);
+			}
+		}
+	}
+	return 1;
+}
+
+// Primary sort key comparator: foundation (rank 0) before enhancement
+// (rank 1), 0 within a tier so the caller's next key (blast radius, then
+// lexical id) decides. Pure.
+export function compareFoundation(a, b, baselineId, edges) {
+	return foundationRank(a, baselineId, edges) - foundationRank(b, baselineId, edges);
+}
+
+// The warn-first seating line, exact string pinned by the issue body.
+// dispatch.mjs prints it when an enhancement seats before the baseline.
+export const foundationSeatingWarn = (id, base) => `[bais] enhancement ${id} seated before baseline ${base} landed`;
 
 // Gated write: without explicit human approval NOTHING is written — the
 // write callback is never invoked. Needs a complete checklist and a sketch.
@@ -249,6 +429,21 @@ export function commit(goal, { approved = false, write = null } = {}) {
 	if (!goal.sketch) return { ok: false, wrote: [], error: "commit refused: no sketch yet" };
 	if (typeof write !== "function") return { ok: false, wrote: [], error: "commit refused: no writer" };
 	const e2e = Array.isArray(goal.sketch.e2e) ? goal.sketch.e2e : [];
+	// hub#190: mandatory fields fail loud at COMMIT time, never at
+	// consumption. Every e2e exercise must decompose to {command, expect}
+	// (an assert-true shape — no expected predicate — names the missing
+	// expect), and every case must cite ≥1 oracle facet (or the explicit
+	// "waiver" facet); a retired citation names the stale facet. Refusal
+	// happens BEFORE any write.
+	for (const c of e2e) {
+		try {
+			parseExercise(c.exercise);
+		} catch (e) {
+			return { ok: false, wrote: [], error: `commit refused: e2e case ${JSON.stringify(c.case)} fails exercise shape validation — ${String(e && e.message)}` };
+		}
+	}
+	const badJoin = oracleFacetJoin(goal).find((j) => !j.ok);
+	if (badJoin) return { ok: false, wrote: [], error: `commit refused: ${badJoin.reason}` };
 	const files = [
 		{ path: "goal.toml", content: renderGoalToml(goal) },
 		{ path: "sketch.toml", content: renderSketchToml(goal.sketch) },
@@ -266,6 +461,105 @@ export function commit(goal, { approved = false, write = null } = {}) {
 	return { ok: true, wrote: files.map((f) => `.bais/${f.path}`), error: "" };
 }
 
+// --- weak-oracle defenses (hub#190, scripts lane) ---
+//
+// Nothing stopped vacuous self-authored e2e: an assert-true case graded
+// Pass, e2e cases cited no oracle facet, and the LLM could game ground
+// truth by editing surface_spec to fit its output. Three defenses:
+//
+//   1. Determinism contract on exercise: parseExercise decomposes the
+//      exercise half to {command, expect} plain data ("<command> =>
+//      <expect>"), with an optional trailing facet citation
+//      ("facets: a, b" — parenthesized or bare, at the end of the expect
+//      half). Assert-true shapes (no expected predicate) throw loud — the
+//      surface-spec settle-validation precedent — and commit() refuses
+//      naming the case and the missing field (fail at commit time, never
+//      at consumption). Readers (goalSurface, validateGoal) stay lenient
+//      on legacy assert-true files; validateGoal warns (warn-first).
+//   2. Mandatory oracle-facet join: oracleFacetJoin derives, per committed
+//      e2e case, the cited surface_spec facets. A case citing nothing
+//      fails with the named reason oracle_facet_absent; a citation naming
+//      a facet no longer declared reports oracle_facet_drifted with the
+//      stale facet named (the surviving/stale-receipts precedent). The
+//      explicit "waiver" facet is always citable (a waived spec is data).
+//   3. Spec-capture guard: status() compares the [goal] surface_spec list
+//      against the interview-box-derived spec; divergence without a
+//      reasoned amendment record (an appended { facet = "amendment",
+//      spec = "<reason>" } item — the retire --reason idiom) flags loud in
+//      warns. git hosts goal.toml, so unreasoned spec diffs are detectable.
+//
+// Load-bearing hunk (hub#190/bi#57 red-check target): the expect
+// requirement in parseExercise. Removing it must trip the selftest below
+// with exactly:
+//   "FAIL selftest: assert-true exercise fails shape validation naming the missing expect"
+// (verified 2026-09-07: the assert-true throw + empty-expect throw
+// neutered (assert-true exercises validate as {command, expect:"pass"})
+// -> that FAIL observed first, with the warn-first, empty-expect, and
+// commit-refusal checks cascading red behind it, exit 1 -> restored
+// green).
+export function parseExercise(exercise) {
+	const raw = String(exercise ?? "").trim();
+	const need = `needs "<command> => <expect>" (optionally ending "facets: <facet>, ...") — an assert-true exercise grades vacuously`;
+	if (raw === "") throw new Error(`invalid exercise: empty — ${need}`);
+	const i = raw.indexOf("=>");
+	if (i < 0) {
+		throw new Error(`invalid exercise: assert-true shape, no expected predicate (got ${JSON.stringify(raw)}) — ${need}`);
+	}
+	const command = raw.slice(0, i).trim();
+	let expect = raw.slice(i + 2).trim();
+	if (!command) throw new Error(`invalid exercise: needs a command before "=>" (got ${JSON.stringify(raw)})`);
+	if (!expect) {
+		throw new Error(`invalid exercise: missing expected predicate after "=>" (got ${JSON.stringify(raw)}) — ${need}`);
+	}
+	let facets = [];
+	const fm = expect.match(/\(?\s*facets:\s*([^()]+?)\s*\)?\s*$/);
+	if (fm) {
+		facets = fm[1].split(",").map((s) => s.trim()).filter((s) => s !== "");
+		expect = expect.slice(0, fm.index).trim().replace(/\(\s*$/, "").trim();
+		if (!expect) {
+			throw new Error(`invalid exercise: the facet citation consumed the whole expected predicate (got ${JSON.stringify(raw)}) — ${need}`);
+		}
+	}
+	return { command, expect, facets };
+}
+
+// Per-case oracle-facet join: the LLM DECLARES (facet citations in the
+// exercise), goal.mjs DERIVES/verifies (the bi#133 declare/derive split).
+// Pure — the sketch e2e + the declared surface spec in, join rows out.
+// Each row: { case, cited, drifted, ok, reason }.
+export function oracleFacetJoin(goal) {
+	const declared = new Set(goalSurfaceSpec(goal).map((s) => s.facet));
+	const cases = Array.isArray(goal?.sketch?.e2e) ? goal.sketch.e2e : [];
+	return cases.map((c) => {
+		let cited = [];
+		try {
+			cited = parseExercise(c.exercise).facets;
+		} catch {
+			cited = [];
+		}
+		const drifted = cited.filter((f) => f !== "waiver" && !declared.has(f));
+		if (cited.length === 0) {
+			return {
+				case: c.case,
+				cited,
+				drifted,
+				ok: false,
+				reason: `oracle_facet_absent: e2e case ${JSON.stringify(c.case)} cites no surface_spec facet — cite at least one declared facet (or the explicit "waiver" facet) via "facets: ..." in the exercise`,
+			};
+		}
+		if (drifted.length > 0) {
+			return {
+				case: c.case,
+				cited,
+				drifted,
+				ok: false,
+				reason: `oracle_facet_drifted: e2e case ${JSON.stringify(c.case)} cites retired facet ${JSON.stringify(drifted[0])} (current facets: ${[...declared].join(", ") || "none"}) — re-cite a declared facet or amend surface_spec with a reasoned record`,
+			};
+		}
+		return { case: c.case, cited, drifted, ok: true, reason: "" };
+	});
+}
+
 // Acceptance tracking: done criteria checked off vs still open.
 // hub#185: the oracle state rides along — an oracle-empty goal carries the
 // oracle_absent warn (the cli.ts gate-warn precedent) so `bais goal status`
@@ -279,6 +573,30 @@ export function status(goal) {
 		warns.push(
 			`oracle_absent: campaign has no e2e oracle — testing-surface waived (${testingSurfaceWaiverReason(goal) || "no reason recorded"})`,
 		);
+	}
+	// hub#190 spec-capture guard: surface_spec is ground truth — the LLM
+	// must not amend it to fit its output without a reasoned record. The
+	// [goal] surface_spec list (file-level, what a hand/agent edit touches)
+	// is compared against the interview-box-derived spec; divergence without
+	// a reasoned amendment record ({ facet = "amendment", spec = "<reason>" }
+	// appended — the retire --reason idiom) flags loud. A missing/empty
+	// file-level list is grandfathered (pre-190 goals carry none).
+	const parsedSpec = Array.isArray(goal._parsed?.surface_spec) ? goal._parsed.surface_spec : [];
+	if (parsedSpec.length > 0) {
+		const norm = (f) => (f === "pure" ? "pure-no-io" : String(f).toLowerCase());
+		const amendments = parsedSpec.filter((s) => norm(s.facet) === "amendment");
+		const fileSpec = parsedSpec
+			.filter((s) => norm(s.facet) !== "amendment")
+			.map((s) => [norm(s.facet), String(s.spec ?? "")]);
+		const boxSpec = goalSurfaceSpec(goal).map((s) => [s.facet, s.spec]);
+		if (JSON.stringify(fileSpec) !== JSON.stringify(boxSpec)) {
+			const reasoned = amendments.length > 0 && amendments.every((a) => String(a.spec ?? "").trim() !== "");
+			if (!reasoned) {
+				warns.push(
+					`surface_spec amended without a reasoned record — the declared spec is ground truth (hub#190); append { facet = "amendment", spec = "<reason>" } to surface_spec or revert the edit`,
+				);
+			}
+		}
 	}
 	return {
 		statement: goal.statement,
@@ -361,6 +679,13 @@ export function renderGoalToml(goal) {
 		L.push(`[interview.${JSON.stringify(box)}]`);
 		L.push(`status = ${escStr(goal.boxes[box].status)}`);
 		L.push(`value = ${escStr(goal.boxes[box].value)}`);
+		// hub#196: the stay-on-box loop state persists (sub-round counts +
+		// the pending-follow-up flag) so save/resume keeps the loop. Zero
+		// counts and no-pending render nothing — pre-196 files round-trip
+		// byte-identical.
+		const fu = goal.followups?.[box] ?? 0;
+		if (fu > 0) L.push(`followups = ${fu}`);
+		if (goal.followupBox === box) L.push(`followup_pending = true`);
 	}
 	return L.join("\n") + "\n";
 }
@@ -389,6 +714,11 @@ export function parseGoalToml(text) {
 		if (status && ["open", "filled", "waived", "defaulted"].includes(status[1])) {
 			goal.boxes[box] = { status: status[1], value: value ? JSON.parse(value[1]) : "" };
 		}
+		// hub#196: restore the stay-on-box loop state. Missing lines are
+		// grandfathered (pre-196 files carry none) as zero/no-pending.
+		const fu = sec && sec[2].match(/followups *= *(\d+)/);
+		if (fu) goal.followups[box] = Number(fu[1]);
+		if (sec && /followup_pending *= *true/.test(sec[2])) goal.followupBox = box;
 	}
 	// hub#213: pre-contract goal.toml files carry no [interview.contract]
 	// section. Missing is grandfathered (the validateGoal shape-only
@@ -621,6 +951,17 @@ export function validateGoal(text, { knownStyles = null, knownHeroes = null, sty
 				errors.push(
 					`invalid goal.toml: "testing_surface"[${i}] needs a usable surface and exercise (got ${JSON.stringify(surface.items[i])})`,
 				);
+			} else {
+				// hub#190 (warn-first): an assert-true exercise (no expected
+				// predicate) warns at file level for one release — commit()
+				// already refuses it loud; legacy goals stay green here.
+				try {
+					parseExercise(c.exercise);
+				} catch (e) {
+					warns.push(
+						`"testing_surface"[${i}] exercise is assert-true (no expected predicate) — hub#190 warn-first: \`bais goal commit\` refuses until it decomposes to "<command> => <expect>" (${String(e && e.message)})`,
+					);
+				}
 			}
 		});
 	}
@@ -966,6 +1307,15 @@ export function renderE2eScaffold({ surface, exercise }) {
 // goal anchor: ${anchor} (sha256 of surface + "=>" + exercise — hub#184)
 // Generated by \`bais goal commit\` — failing-first scaffold: implement the
 // exercise above; until then this file fails loud.
+// red-check record (bi#57, hub#190 — required in every generated case file
+// header, the bits-t2.mjs pattern):
+//   hunk: the scaffold-unimplemented exit below (console.error + exit 1).
+//   expected reason: "FAIL: <surface>: scaffold-unimplemented", exit 1.
+//   observed: goal.mjs --selftest writes every generated scaffold to a
+//     tmpdir, runs it under plain node, and asserts exactly that named
+//     failure and exit code BEFORE any implementation lands — revert the
+//     exit, the selftest fails naming this case, restore. A test that
+//     cannot go red is camouflage, not coverage.
 console.error("FAIL: " + ${JSON.stringify(surface)} + ": scaffold-unimplemented");
 process.exit(1);
 `;
@@ -1713,6 +2063,14 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 	// scaffold per declared surface on the 2-surface fixture.
 	const commit184 = parseGoalToml(readFileSync(join(FIXTURES, "surface-goal.toml"), "utf8"));
 	check(checklistComplete(commit184), "commit fixture parses to a complete checklist");
+	// hub#190: commit() now refuses assert-true exercises and citationless
+	// cases loud — the commit fixture settles the well-formed {command,
+	// expect} + facet-citation form in-memory (fixture FILES untouched; the
+	// legacy form stays covered by the reader/warn-first checks below and
+	// by the hub#190 refusal fixtures). Slugs derive from surface text, so
+	// case ids are unchanged.
+	commit184.boxes["testing-surface"].value =
+		"bais list shows open issues => run: bais list --json => exit 0 and the output lists open issue ids (facets: cli output shape); bais ready orders by severity => run: bais ready => exit 0 and the highest-severity ready issue leads (facets: cli output shape)";
 	const sk184 = sketch(commit184);
 	check(sk184.ok === true, "commit fixture sketches clean");
 	const files184 = new Map();
@@ -2151,6 +2509,255 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 	// hex digest (shape-only — the content is the repo's business).
 	const fpLive213 = workspaceFingerprint(HUB_ROOT);
 	check(/^[0-9a-f]{64}$/.test(fpLive213), "workspaceFingerprint yields a sha256 hex digest");
+
+	// hub#196: the sufficiency gate is a REAL branch — a stay-on-box reply
+	// asks a follow-up on the same box and never settles as the box value.
+	const stay196 = newGoal("stay-on-box campaign");
+	nextQuestion(stay196); // users first-ask (rounds = 1)
+	answer(stay196, "users", "more");
+	check(
+		stay196.boxes.users.status === "open" && stay196.boxes.users.value === "" && stay196.followupBox === "users",
+		"stay-on-box reply never settles as the box value",
+	);
+	const fq196 = nextQuestion(stay196);
+	check(
+		typeof fq196 === "string" && fq196.startsWith("Staying on users") && !fq196.startsWith(BOX_QUESTIONS.users),
+		"stay-on-box reply asks a follow-up instead of settling",
+	);
+	check(
+		fq196.includes(SUFFICIENCY_QUESTION) && fq196.includes(SUFFICIENCY_INCENTIVE) && fq196.endsWith(DEFAULTS_ESCAPE),
+		"follow-up prompt keeps the sufficiency gate + escapes verbatim",
+	);
+	// The testing-surface fixture from the acceptance bullet: "more" asks a
+	// follow-up; the box settles only on the substantive answer, and the
+	// final value is the substance, never the word "more".
+	const tsStay196 = newGoal("surface stay-on-box");
+	for (const b of ["users", "scale", "platform", "constraints", "style", "acceptance", "non-goals"]) {
+		tsStay196.boxes[b] = { status: "filled", value: "x" };
+	}
+	answer(tsStay196, "testing-surface", "more");
+	check(
+		tsStay196.boxes["testing-surface"].status === "open" && tsStay196.followupBox === "testing-surface",
+		"stay-on-box 'more' on testing-surface leaves the box open awaiting the follow-up",
+	);
+	check(
+		nextQuestion(tsStay196).startsWith("Staying on testing-surface"),
+		"stay-on-box reply asks a follow-up instead of settling",
+	);
+	answer(tsStay196, "testing-surface", "bais list shows open issues => run: bais list --json => exit 0 (facets: waiver)");
+	check(
+		tsStay196.boxes["testing-surface"].status === "filled" &&
+			tsStay196.boxes["testing-surface"].value.includes("bais list shows open issues") &&
+			tsStay196.boxes["testing-surface"].value !== "more",
+		"settled box value is the substance, never the stay-on-box word",
+	);
+	// Per-box sub-rounds: follow-ups never consume the global round budget
+	// of later boxes.
+	const rounds196 = newGoal("sub-round isolation");
+	nextQuestion(rounds196); // users first-ask, rounds = 1
+	answer(rounds196, "users", "more");
+	nextQuestion(rounds196); // follow-up — no round consumed
+	answer(rounds196, "users", "what about scale?");
+	nextQuestion(rounds196); // follow-up — no round consumed
+	check(rounds196.rounds === 1, `per-box sub-rounds do not consume later boxes' rounds (rounds ${rounds196.rounds})`);
+	answer(rounds196, "users", "solo dev, detail settled");
+	nextQuestion(rounds196); // scale first-ask
+	check(
+		rounds196.rounds === 2 && openBoxes(rounds196)[0] === "scale",
+		"later boxes still get their first-ask after a follow-up loop",
+	);
+	// Question-shaped replies stay on the box too; a bare "no" stays.
+	const q196 = newGoal("question reply");
+	answer(q196, "users", "does scale include the sibling repos?");
+	check(q196.followupBox === "users" && q196.boxes.users.status === "open", "a question reply stays on the box");
+	// Exhaustion: past MAX_BOX_FOLLOWUPS the box escapes via the
+	// reasoned-default path naming the cap (hub#185 idiom).
+	const exhaust196 = newGoal("follow-up exhaustion");
+	for (let i = 0; i <= MAX_BOX_FOLLOWUPS; i++) answer(exhaust196, "testing-surface", "more");
+	check(
+		exhaust196.boxes["testing-surface"].status === "defaulted" &&
+			exhaust196.boxes["testing-surface"].value.includes("stay-on-box follow-up cap reached") &&
+			exhaust196.boxes["testing-surface"].value.startsWith("waiver =>"),
+		`follow-up exhaustion escapes via the reasoned-default path (got ${JSON.stringify(exhaust196.boxes["testing-surface"])})`,
+	);
+	check(exhaust196.followupBox === null, "exhaustion clears the pending follow-up");
+	// The loop state persists through goal.toml (save/resume keeps it).
+	const persist196 = newGoal("persisted follow-up");
+	answer(persist196, "users", "more");
+	const persistBack196 = parseGoalToml(renderGoalToml(persist196));
+	check(
+		persistBack196.followupBox === "users" && persistBack196.followups.users === 1,
+		`stay-on-box loop state round-trips through goal.toml (got followupBox ${JSON.stringify(persistBack196.followupBox)}, followups ${JSON.stringify(persistBack196.followups)})`,
+	);
+	check(
+		nextQuestion(persistBack196).startsWith("Staying on users"),
+		"resumed interview re-asks the follow-up on the same box",
+	);
+
+	// hub#186: skeleton-first ordering — baseline node + build-order chain.
+	const skOrder186 = newGoal("ordered campaign");
+	answer(skOrder186, "acceptance", "alpha; beta; gamma");
+	useDefaults(skOrder186);
+	const sk186 = sketch(skOrder186);
+	const nodes186 = sk186.ok === true ? sk186.proposal.nodes : [];
+	const edges186 = sk186.ok === true ? sk186.proposal.edges : [];
+	const baseline186 = nodes186.find((n) => n.id === "baseline");
+	check(
+		baseline186 !== undefined && baseline186.title === BASELINE_NODE_TITLE,
+		"sketch emits the baseline walking-skeleton node",
+	);
+	const has186 = (from, to) => edges186.some((e) => e.from === from && e.to === to && e.kind === "DependsOn");
+	check(
+		has186("c1", "c2") && has186("c2", "c3") && has186("c3", "hero") && !has186("c1", "hero"),
+		`criteria chain in declared build order c1→c2→c3→hero (got ${JSON.stringify(edges186)})`,
+	);
+	check(
+		has186("c1", "baseline") && has186("c2", "baseline") && has186("c3", "baseline") && has186("baseline", "hero"),
+		"every criterion DependsOn baseline, baseline DependsOn hero",
+	);
+	// foundation_rank: 0 for the baseline and its precedes-ancestors
+	// (transitive), 1 for everything else.
+	const pre186 = [
+		{ from: "tooling", to: "core", kind: "precedes" },
+		{ from: "core", to: "baseline", kind: "precedes" },
+		{ from: "unrelated", to: "core", kind: "DependsOn" },
+	];
+	check(
+		foundationRank("baseline", "baseline", pre186) === 0 &&
+			foundationRank("core", "baseline", pre186) === 0 &&
+			foundationRank("tooling", "baseline", pre186) === 0 &&
+			foundationRank("unrelated", "baseline", pre186) === 1 &&
+			foundationRank("enhancement", "baseline", pre186) === 1,
+		"foundation_rank: 0 for baseline and precedes-ancestors, 1 otherwise",
+	);
+	// The foundation sort seats the baseline before an enhancement with
+	// higher blast radius (dispatch's primary key; blast radius second).
+	const pack186 = [
+		{ id: "enhancement", blast: 99 },
+		{ id: "baseline", blast: 1 },
+	];
+	pack186.sort((a, b) => compareFoundation(a.id, b.id, "baseline", []) || b.blast - a.blast);
+	check(
+		pack186[0].id === "baseline",
+		"foundation sort seats the baseline before higher-blast enhancements",
+	);
+	check(
+		foundationSeatingWarn("goal#x", "baseline") === "[bais] enhancement goal#x seated before baseline baseline landed",
+		"warn-first seating line matches the pinned string",
+	);
+
+	// hub#190: weak-oracle defenses.
+	// (1) Exercise shape: assert-true fails loud naming the missing expect;
+	// a well-formed {command, expect} passes with facets extracted.
+	let assertTrue190 = "";
+	try {
+		parseExercise("run: bais list --json");
+	} catch (e) {
+		assertTrue190 = String(e && e.message);
+	}
+	check(
+		assertTrue190.includes("assert-true") && assertTrue190.includes("expect"),
+		`assert-true exercise fails shape validation naming the missing expect (got ${JSON.stringify(assertTrue190)})`,
+	);
+	const wellFormed190 = parseExercise("run: bais list --json => exit 0, lists open ids (facets: cli output shape)");
+	check(
+		wellFormed190.command === "run: bais list --json" &&
+			wellFormed190.expect === "exit 0, lists open ids" &&
+			JSON.stringify(wellFormed190.facets) === '["cli output shape"]',
+		`well-formed {command, expect} passes shape validation (got ${JSON.stringify(wellFormed190)})`,
+	);
+	let emptyExpect190 = "";
+	try {
+		parseExercise("run: bais list => ");
+	} catch (e) {
+		emptyExpect190 = String(e && e.message);
+	}
+	check(emptyExpect190.includes("expect"), `empty expect half fails loud (got ${JSON.stringify(emptyExpect190)})`);
+	// File level is warn-first: the legacy assert-true fixture validates ok
+	// but warns naming the advisory (errors stay zero).
+	const warnFirst190 = validateGoal(readFileSync(join(FIXTURES, "surface-goal.toml"), "utf8"), {
+		knownStyles: ["plain"],
+		knownHeroes: ["plain"],
+	});
+	check(
+		warnFirst190.ok === true && warnFirst190.errors.length === 0 && warnFirst190.warns.some((w) => w.includes("assert-true")),
+		`legacy assert-true exercises warn at file level, never fail (warns: ${JSON.stringify(warnFirst190.warns)})`,
+	);
+	// Commit refuses an assert-true exercise loud, naming the case + expect.
+	const badCommit190 = parseGoalToml(readFileSync(join(FIXTURES, "surface-goal.toml"), "utf8"));
+	sketch(badCommit190);
+	const badRes190 = commit(badCommit190, { approved: true, write: () => {} });
+	check(
+		badRes190.ok === false && badRes190.wrote.length === 0 && badRes190.error.includes("expect") && badRes190.error.includes("bais-list-shows-open-issues"),
+		`commit refuses an assert-true exercise naming the missing expect (got ${JSON.stringify(badRes190.error)})`,
+	);
+	// (2) Mandatory oracle-facet join: no citation fails with a named
+	// reason; a retired citation reports drifted naming the stale facet.
+	const noCite190 = newGoal("no citation");
+	answer(noCite190, "testing-surface", "flow x => run: x => exit 0");
+	answer(noCite190, "surface-spec", "real facet => the spec text");
+	useDefaults(noCite190);
+	sketch(noCite190);
+	const joinAbsent190 = oracleFacetJoin(noCite190);
+	check(
+		joinAbsent190.length === 1 && joinAbsent190[0].ok === false && joinAbsent190[0].reason.includes("oracle_facet_absent"),
+		`case with no oracle-facet citation fails the derivation with a named reason (got ${JSON.stringify(joinAbsent190)})`,
+	);
+	const noCiteRes190 = commit(noCite190, { approved: true, write: () => {} });
+	check(
+		noCiteRes190.ok === false && noCiteRes190.error.includes("oracle_facet_absent"),
+		`commit refuses a case with no oracle-facet citation (got ${JSON.stringify(noCiteRes190.error)})`,
+	);
+	const drift190 = newGoal("drifted citation");
+	answer(drift190, "testing-surface", "flow x => run: x => exit 0 (facets: ghost facet)");
+	answer(drift190, "surface-spec", "real facet => the spec text");
+	useDefaults(drift190);
+	sketch(drift190);
+	const joinDrift190 = oracleFacetJoin(drift190);
+	check(
+		joinDrift190.length === 1 && joinDrift190[0].ok === false && joinDrift190[0].reason.includes("oracle_facet_drifted") && joinDrift190[0].reason.includes("ghost facet"),
+		`case citing a retired facet reports drifted with the stale facet named (got ${JSON.stringify(joinDrift190)})`,
+	);
+	// The committed fixture's cases cite a declared facet — the join is ok.
+	const joinOk190 = oracleFacetJoin(commit184);
+	check(
+		joinOk190.length === 2 && joinOk190.every((j) => j.ok && j.cited.includes("cli output shape")),
+		`well-cited cases pass the oracle-facet join (got ${JSON.stringify(joinOk190)})`,
+	);
+	// The explicit "waiver" facet is always citable (a waived spec is data).
+	const waiverCite190 = newGoal("waiver citation");
+	answer(waiverCite190, "testing-surface", "flow x => run: x => exit 0 (facets: waiver)");
+	useDefaults(waiverCite190); // surface-spec defaults to a waiver record
+	sketch(waiverCite190);
+	check(
+		oracleFacetJoin(waiverCite190).every((j) => j.ok),
+		"a case citing the explicit waiver facet passes the join",
+	);
+	// (3) Spec-capture guard: an unreasoned surface_spec edit flags loud in
+	// goal status; a reasoned amendment record is clean.
+	const amend190 = parseGoalToml(readFileSync(join(FIXTURES, "parser-spec-goal.toml"), "utf8"));
+	check(
+		status(amend190).warns.every((w) => !w.includes("surface_spec amended")),
+		"unamended parser fixture status carries no spec-capture warn",
+	);
+	amend190._parsed.surface_spec = [{ facet: "parser tokens", spec: "whatever the model felt like emitting" }];
+	check(
+		status(amend190).warns.some((w) => w.includes("surface_spec amended without a reasoned record")),
+		"unreasoned surface_spec edit flags loud in goal status",
+	);
+	amend190._parsed.surface_spec.push({ facet: "amendment", spec: "adopted toml.abnf v1.1 token split, human-reviewed" });
+	check(
+		status(amend190).warns.every((w) => !w.includes("surface_spec amended")),
+		"reasoned surface_spec amendment is clean",
+	);
+	// (4) Every generated scaffold header carries the red-check record.
+	for (const c of e2e184) {
+		const src190 = files184.get(`e2e/${c.case}.mjs`);
+		check(
+			typeof src190 === "string" && src190.includes("// red-check record (bi#57") && src190.includes("hunk:") && src190.includes("expected reason:") && src190.includes("observed:"),
+			`scaffold ${c.case} header carries the red-check record (hunk + expected reason + observed)`,
+		);
+	}
 
 	process.exit(failures ? 1 : 0);
 }
