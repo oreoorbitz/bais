@@ -494,10 +494,17 @@ function serialize_bais_file(f: BaisFile) -> string {
         out = out + "lease = \"" + escape_basic_string(l) + "\"\n";
     }
     let body = f.issue.body;
-    if (body.includes("\"\"\"")) {
-        out = out + "body = '''\n" + body + "'''\n";
+    if (body.includes("'''") || body.ends_with("'")) {
+        // The literal fence (or a trailing quote) rules out the literal
+        // form — fall back to multiline basic with every escape processed
+        // so the re-parse round-trips.
+        out = out + "body = \"\"\"\n" + escape_basic_string(body) + "\"\"\"\n";
     } else {
-        out = out + "body = \"\"\"\n" + body + "\"\"\"\n";
+        // bi#172: literal by default. check parses literal bodies with no
+        // escape processing, so move must emit the same form — a body with
+        // single-backslash-letter spans (`\d`, `\s`) serialized as basic
+        // dies in unescape_basic_string on the writer's re-parse.
+        out = out + "body = '''\n" + body + "'''\n";
     }
     for (let e in f.edges) {
         out = out + "\n[[edge]]\n";
@@ -856,6 +863,48 @@ test "parse escapes in basic string" {
     let f = parse_bais_file(toml);
     assert.contains(f.issue.title, "\"quoted\"");
     assert.contains(f.issue.title, "\n");
+}
+
+// bi#172: bodies carrying single-backslash-letter spans (regex docs,
+// escape notes) round-trip through serialize -> parse — the move writer's
+// re-parse must not die in unescape_basic_string. Fixture mirrors the four
+// LLM-authored issues that needed rewording (bi#164 backtick-escape,
+// bi#157 \s-class, bi#160 hex-escape, bi#155 dash-escape).
+// Red-check (bi#57): reverting serialize_bais_file to the basic-first form
+// fails both tests for the named reason; observed 2026-09-08:
+//   FAIL root.toml::roundtrip literal body with backslash spans
+//   FAIL root.toml::roundtrip body containing literal fence
+//   baml.errors.ParseError { message: "unknown escape \\s" } (unescape_basic_string)
+test "roundtrip literal body with backslash spans" {
+    let issue = root.Issue {
+        id: "bi#172",
+        title: "escapes",
+        status: root.Status.Open,
+        kind: root.Kind.Bug,
+        area: null,
+        severity: null,
+        source: null,
+        body: "regex \\s+ class and \\x41 hex and \\- dash and \\` backtick\nsecond line",
+    };
+    let f2 = roundtrip_issue(issue, []);
+    assert.equal(f2.issue.body, issue.body);
+}
+
+// A body that cannot take the literal fence falls back to escaped basic
+// and still round-trips.
+test "roundtrip body containing literal fence" {
+    let issue = root.Issue {
+        id: "bi#172",
+        title: "fence",
+        status: root.Status.Open,
+        kind: root.Kind.Bug,
+        area: null,
+        severity: null,
+        source: null,
+        body: "has ''' inside and \\s span",
+    };
+    let f2 = roundtrip_issue(issue, []);
+    assert.equal(f2.issue.body, issue.body);
 }
 
 test "roundtrip serialize parse" {

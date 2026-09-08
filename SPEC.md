@@ -51,7 +51,7 @@ rationale: `toml/BAIS.md`; upstream grammar: `toml/toml.md`.)
 | `area`     | string | no       | e.g. `cli/bi`, `bridge/ffi`; absent → null        |
 | `severity` | int    | no       | TOML integer, e.g. `3`; absent → null             |
 | `source`   | string | no       | error class, e.g. `baml.errors.TypeMismatch`      |
-| `body`     | string | yes      | Markdown; usually `"""` multiline                 |
+| `body`     | string | yes      | Markdown; `'''` literal or `"""` multiline        |
 
 Strictness (all enforced by the reference parser — violations make the file
 `bad`, see §6):
@@ -115,6 +115,17 @@ kind = "Blocks"
 Write valid TOML v1.0.0, use only the keys in §2.1, put Markdown in
 `body = """..."""`, edges in `[[edge]]`, exact-case enum values. Do not invent
 keys — the parser rejects them. Then validate: `bais check`.
+
+### 2.6 Body serialization (writer rule, bi#172)
+
+`check` and `move` MUST agree on what parses, so writers serialize the body in
+exactly one direction: **literal first**. A body is emitted as a TOML literal
+multiline string (`'''...'''`, no escape processing) unless it contains the
+literal fence `'''` or ends with `'`, in which case it is emitted as a
+multiline basic string with **every** escape processed (`\` → `\\`, `"` →
+`\"`, newline → `\n`). Consequence: single-backslash-letter spans (`\s`,
+`\-`, `` \` ``) inside a literal body survive `check` → `move` → `move`
+untouched; bodies must never need rewording to close.
 
 ## 3. Graph semantics
 
