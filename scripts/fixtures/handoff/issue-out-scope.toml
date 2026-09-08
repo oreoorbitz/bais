@@ -1,0 +1,8 @@
+id = "s#02"
+title = "out-of-scope fixture issue"
+status = "Doing"
+kind = "Feat"
+body = '''
+The fold touches one path outside the declared footprint (gold-plating).
+Files: src/owned.ts
+'''

@@ -1,0 +1,8 @@
+id = "s#03"
+title = "unknown-footprint fixture issue"
+status = "Doing"
+kind = "Feat"
+body = '''
+No Files: line — the hub#175 unknown-footprint posture: operator-confirm,
+never silently safe.
+'''

@@ -23,9 +23,40 @@
 // just the missing-base push crashes on bodyLines[-1] instead — the block
 // is the load-bearing unit, not the line.) A validator that cannot go red
 // on a baseless diff is camouflage, not coverage.
+//
+// hub#219 item 3 (hub#192): fold-scope at fold time. campaign.mjs owns
+// the pure derivation (foldScope/diffPaths/diffHunks + the pinned
+// warn/refuse strings, CAMPAIGN_BUDGETS phases); this validator is the
+// fold-time consumer: pass the folding issue (`--issue <file.toml>`, or
+// opts.issueBody/issueId) and a diff handoff's `diff --git` paths are
+// checked against the issue's declared Files: footprint (+ the per-fold
+// path/hunk budget). Warn-first: the default warn phase attaches the
+// verdict to the result (`foldscope`) and prints warnings on STDERR —
+// HANDOFF VALID/INVALID on stdout and the exit code are untouched.
+// `--fold-scope-strict` (or opts.foldScopePhase/foldBudgetPhase "fail")
+// turns refusals into line-0 errors (exit 1). Undeclared footprint keeps
+// the hub#175 posture: operator-confirm warning, never silently safe.
+// Notes never scope-check (diff-only gate).
+//
+// Red-check (hub#219/bi#57, recorded 2026-09-08): with the foldScope
+// call neutered (`diff: bodyText` -> `diff: ""` — the fold carries no
+// paths, so every footprint accepts it), --selftest failed LOUD with 5
+// failure(s) FOR THE RIGHT REASON —
+//   FAIL selftest: out-of-scope fold warns naming the excess path (warn-first) (null)
+//   FAIL selftest: strict out-of-scope fold refuses naming the path (undefined)
+//   FAIL selftest: over-budget fold warns with the counts (undefined)
+//   FAIL selftest: strict over-budget fold refuses
+//   FAIL selftest: --json carries the foldscope verdict ([])
+// (gold-plating validated clean and the budget tripwire went quiet — the
+// exact scope bleed + big-bang generation hub#192 exists to catch; the
+// in-scope/unknown-footprint/note pins stayed green: empty diffs are
+// in-scope, footprint-agnostic, and diff-only). Restored, green. A scope
+// gate that cannot go red on an out-of-footprint fold is camouflage, not
+// coverage.
 
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
+import { foldScope, CAMPAIGN_BUDGETS } from "./campaign.mjs";
 
 const REQUIRED_HEADERS = ["id", "from", "to", "priority", "type", "created_at"];
 const HEADER_RE = /^([A-Za-z0-9_-]+): (.*)$/;
@@ -53,9 +84,25 @@ export const HANDOFF_EXPECTED = [
 	"filename: NN_<YYYYMMDDTHHMMSS>_<seq>_from_<sender>.handoff (NN == priority, sender == from)",
 ];
 
+// The body text of an issue TOML file (body = '''...''' or body =
+// """..."""), null when the file carries no body block. The fold-scope
+// gate needs the declared Files: lines, which live in the body.
+export function extractIssueBody(issueText) {
+	const s = String(issueText ?? "");
+	const m = s.match(/^body\s*=\s*('''|""")/m);
+	if (!m) return null;
+	const start = m.index + m[0].length;
+	const end = s.indexOf(m[1], start);
+	return end === -1 ? null : s.slice(start, end);
+}
+
 /**
  * Validate handoff text. Pure: no fs, no clock.
- * @returns {{ ok, type: string|null, base: string|null, errors: {line:number,message:string}[], expected: string[] }}
+ * opts.issueBody/issueId (hub#219 item 3): the folding issue's body + id —
+ * a diff handoff gets the foldScope check against the declared Files:
+ * footprint; the verdict lands on res.foldscope (warnings never move
+ * res.ok; "fail"-phase refusals push line-0 errors).
+ * @returns {{ ok, type: string|null, base: string|null, foldscope: object|null, errors: {line:number,message:string}[], expected: string[] }}
  */
 export function validateHandoff(text, filename, opts = {}) {
 	const errors = [];
@@ -185,19 +232,54 @@ export function validateHandoff(text, filename, opts = {}) {
 		}
 	}
 
+	// hub#219 item 3 (hub#192): fold-scope at fold time. Diff only, and
+	// only when the caller names the folding issue; campaign.mjs owns the
+	// derivation + the pinned strings. Warn phase (CAMPAIGN_BUDGETS
+	// defaults): the verdict is advisory (res.foldscope, stderr at the CLI)
+	// — never moves ok. Fail phase: refusal becomes a line-0 error.
+	let foldscope = null;
+	if (type === "diff" && opts.issueBody != null) {
+		foldscope = foldScope({
+			diff: bodyText,
+			issueBody: opts.issueBody,
+			issueId: opts.issueId ?? "(unknown issue)",
+			phase: opts.foldScopePhase ?? CAMPAIGN_BUDGETS.foldScopePhase,
+			budgetPhase: opts.foldBudgetPhase ?? CAMPAIGN_BUDGETS.foldBudgetPhase,
+		});
+		if (foldscope.refusal != null) err(0, foldscope.refusal);
+	}
+
 	const ok = errors.length === 0;
-	return { ok, file: filename, type: typeOk ? type : null, base, errors, expected: HANDOFF_EXPECTED };
+	return { ok, file: filename, type: typeOk ? type : null, base, foldscope, errors, expected: HANDOFF_EXPECTED };
 }
 
-/** Read + validate a file. Unreadable file is one line-0 error. */
+/** Read + validate a file. Unreadable file is one line-0 error. opts.issueFile reads the folding issue and extracts its body (hub#219). */
 export function validateHandoffFile(path, opts = {}) {
 	let text;
 	try {
 		text = readFileSync(path, "utf8");
 	} catch (e) {
-		return { ok: false, file: path, type: null, base: null, errors: [{ line: 0, message: `unreadable: ${e.message.split("\n")[0]}` }], expected: HANDOFF_EXPECTED };
+		return { ok: false, file: path, type: null, base: null, foldscope: null, errors: [{ line: 0, message: `unreadable: ${e.message.split("\n")[0]}` }], expected: HANDOFF_EXPECTED };
 	}
-	return validateHandoff(text, path, opts);
+	const resolved = { ...opts };
+	if (opts.issueFile != null) {
+		let issueText;
+		try {
+			issueText = readFileSync(opts.issueFile, "utf8");
+		} catch (e) {
+			return { ok: false, file: path, type: null, base: null, foldscope: null, errors: [{ line: 0, message: `unreadable issue file: ${e.message.split("\n")[0]}` }], expected: HANDOFF_EXPECTED };
+		}
+		const body = extractIssueBody(issueText);
+		if (body == null) {
+			return { ok: false, file: path, type: null, base: null, foldscope: null, errors: [{ line: 0, message: `issue file ${opts.issueFile} carries no body block (fold-scope needs the declared Files: lines)` }], expected: HANDOFF_EXPECTED };
+		}
+		resolved.issueBody = body;
+		if (resolved.issueId == null) {
+			const m = issueText.match(/^id\s*=\s*"([^"]+)"/m);
+			if (m) resolved.issueId = m[1];
+		}
+	}
+	return validateHandoff(text, path, resolved);
 }
 
 export function formatText(res) {
@@ -216,19 +298,90 @@ export function formatText(res) {
 const isMain = process.argv[1] != null && basename(process.argv[1]) === "handoff-validate.mjs";
 if (isMain) {
 	const args = process.argv.slice(2);
+	if (args.includes("--selftest")) {
+		const { dirname, join } = await import("node:path");
+		const { fileURLToPath } = await import("node:url");
+		const HERE = dirname(fileURLToPath(import.meta.url));
+		let failures = 0;
+		const check = (cond, msg) => {
+			if (!cond) {
+				failures++;
+				console.error(`FAIL selftest: ${msg}`);
+			} else console.log(`ok selftest: ${msg}`);
+		};
+		// 1. The §7 fixtures keep their pinned outcomes (spec/handoff.md).
+		const F = (n) => join(HERE, "fixtures", n);
+		check(validateHandoffFile(F("00_20260906T120000_001_from_hero.handoff")).ok, `§7 valid diff validates`);
+		check(!validateHandoffFile(F("00_20260906T120100_002_from_hero.handoff")).ok, `§7 bad priority rejected`);
+		check(!validateHandoffFile(F("00_20260906T120200_003_from_hero.handoff"), { base: "f".repeat(40) }).ok, `§7 base mismatch rejected`);
+		check(!validateHandoffFile(F("01_20260906T120300_004_from_hero.handoff")).ok, `§7 oversize note rejected`);
+		check(validateHandoffFile(F("01_20260906T120400_005_from_hero.handoff")).ok, `§7 directed note validates`);
+		// 2. hub#219 item 3: fold-scope fixtures (fixtures/handoff/).
+		const HF = (n) => join(HERE, "fixtures", "handoff", n);
+		const inScope = validateHandoffFile(HF("00_20260908T000000_001_from_hero.handoff"), { issueFile: HF("issue-in-scope.toml") });
+		check(inScope.ok && inScope.foldscope !== null && inScope.foldscope.ok, `in-scope fold validates exactly as today`);
+		const outScope = validateHandoffFile(HF("00_20260908T000000_001_from_hero.handoff"), { issueFile: HF("issue-out-scope.toml") });
+		check(
+			outScope.ok && outScope.foldscope !== null && !outScope.foldscope.ok && outScope.foldscope.warning !== null && outScope.foldscope.warning.includes("src/gold-plating.ts"),
+			`out-of-scope fold warns naming the excess path (warn-first) (${JSON.stringify(outScope.foldscope?.warning)})`,
+		);
+		const strict = validateHandoffFile(HF("00_20260908T000000_001_from_hero.handoff"), { issueFile: HF("issue-out-scope.toml"), foldScopePhase: "fail" });
+		check(
+			!strict.ok && strict.errors.some((e) => e.message.includes("src/gold-plating.ts") && e.message.includes("rejected")),
+			`strict out-of-scope fold refuses naming the path (${JSON.stringify(strict.errors[0]?.message)})`,
+		);
+		const unknown = validateHandoffFile(HF("00_20260908T000000_001_from_hero.handoff"), { issueFile: HF("issue-unknown.toml") });
+		check(
+			unknown.ok && unknown.foldscope?.operatorConfirm != null && unknown.foldscope.operatorConfirm.includes("confirm scope with the operator"),
+			`undeclared footprint routes to operator-confirm, never silently safe`,
+		);
+		// 3. Over-budget: 6 diff paths past the 5-path cap warns; strict refuses.
+		const bigBody = ["base: " + "a".repeat(40), ...Array.from({ length: 6 }, (_, i) => `diff --git a/src/f${i}.ts b/src/f${i}.ts\n--- a/src/f${i}.ts\n+++ b/src/f${i}.ts\n@@ -1 +1 @@\n-x\n+y`), "Evidence: drill(handoff-validate)"].join("\n");
+		const big = validateHandoff(`id: h-1\nfrom: hero\nto: titan-1\npriority: 00\ntype: diff\ncreated_at: 2026-09-08T00:00:00Z\n\n${bigBody}`, "00_20260908T000000_001_from_hero.handoff", { issueBody: "b\nFiles: src/\n", issueId: "s#01" });
+		check(big.ok && big.foldscope?.overBudget === true && big.foldscope.warning?.includes("6 paths"), `over-budget fold warns with the counts (${JSON.stringify(big.foldscope?.warning?.slice(0, 80))})`);
+		const bigStrict = validateHandoff(`id: h-1\nfrom: hero\nto: titan-1\npriority: 00\ntype: diff\ncreated_at: 2026-09-08T00:00:00Z\n\n${bigBody}`, "00_20260908T000000_001_from_hero.handoff", { issueBody: "b\nFiles: src/\n", issueId: "s#01", foldBudgetPhase: "fail" });
+		check(!bigStrict.ok && bigStrict.errors.some((e) => e.message.includes("6 paths") && e.message.includes("rejected")), `strict over-budget fold refuses`);
+		// 4. Notes never scope-check; --json carries the verdict.
+		const note = validateHandoffFile(F("01_20260906T120400_005_from_hero.handoff"), { issueBody: "b\nFiles: a.ts\n" });
+		check(note.ok && note.foldscope === null, `notes skip the fold-scope gate`);
+		check(JSON.stringify(inScope.foldscope.paths) === '["src/owned.ts","src/gold-plating.ts"]', `--json carries the foldscope verdict (${JSON.stringify(inScope.foldscope.paths)})`);
+		if (failures) {
+			console.error(`${failures} failure(s)`);
+			process.exit(1);
+		}
+		console.log("handoff-validate: all green");
+		process.exit(0);
+	}
 	const file = args.find((a) => !a.startsWith("--"));
 	const bi = args.indexOf("--base");
 	const base = bi !== -1 ? args[bi + 1] : undefined;
+	const ii = args.indexOf("--issue");
+	const issueFile = ii !== -1 ? args[ii + 1] : undefined;
+	const strictScope = args.includes("--fold-scope-strict");
 	const asJson = args.includes("--json");
 	if (!file) {
-		console.log('usage: handoff-validate.mjs <file.handoff> [--base <sha>] [--json]');
+		console.log("usage: handoff-validate.mjs <file.handoff> [--base <sha>] [--issue <issue.toml>] [--fold-scope-strict] [--json] [--selftest]");
 		process.exit(1);
 	}
 	if (bi !== -1 && (base == null || base.startsWith("--"))) {
 		console.log("handoff-validate.mjs: --base needs <sha>");
 		process.exit(1);
 	}
-	const res = validateHandoffFile(file, base == null ? {} : { base });
+	if (ii !== -1 && (issueFile == null || issueFile.startsWith("--"))) {
+		console.log("handoff-validate.mjs: --issue needs <issue.toml>");
+		process.exit(1);
+	}
+	const opts = {
+		...(base == null ? {} : { base }),
+		...(issueFile == null ? {} : { issueFile }),
+		...(strictScope ? { foldScopePhase: "fail", foldBudgetPhase: "fail" } : {}),
+	};
+	const res = validateHandoffFile(file, opts);
+	// hub#219: fold-scope warnings are advisory — loud on stderr, never
+	// reshaping the stdout verdict or the exit code (warn-first, hub#158).
+	for (const w of [res.foldscope?.warning, res.foldscope?.operatorConfirm]) {
+		if (w != null) console.error(w);
+	}
 	if (asJson) console.log(JSON.stringify(res, null, 2));
 	else console.log(formatText(res));
 	process.exit(res.ok ? 0 : 1);

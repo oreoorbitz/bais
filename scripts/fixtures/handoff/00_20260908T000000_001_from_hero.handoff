@@ -1,0 +1,21 @@
+id: handoff-219
+from: hero
+to: titan-1
+priority: 00
+type: diff
+created_at: 2026-09-08T00:00:00Z
+
+base: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+diff --git a/src/owned.ts b/src/owned.ts
+--- a/src/owned.ts
++++ b/src/owned.ts
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/gold-plating.ts b/src/gold-plating.ts
+--- a/src/gold-plating.ts
++++ b/src/gold-plating.ts
+@@ -1 +1 @@
+-old
++new
+Evidence: drill(handoff-validate)

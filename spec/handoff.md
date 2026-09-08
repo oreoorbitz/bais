@@ -99,6 +99,14 @@ bais handoff --validate <file.handoff> [--base <sha>] [--json]
   `base mismatch` error (rebase the handoff or fold at its base) — this
   is the bi#91 guard. `--base` on a note is itself an error (notes carry
   no base).
+- Fold-scope check (hub#192, wired hub#219): `--issue <issue.toml>` names
+  the folding issue; a diff handoff's `diff --git` paths must be a subset
+  of the issue's declared `Files:` footprint, within the per-fold
+  path/hunk budget. Warn-first: the default phase prints advisory
+  warnings on stderr (exit unchanged, verdict in `--json` as
+  `foldscope`); `--fold-scope-strict` turns refusals into errors.
+  Undeclared footprint keeps the hub#175 posture: operator-confirm,
+  never silently safe. Notes never scope-check.
 
 ## 7. Fixture gate (acceptance for bi#139)
 

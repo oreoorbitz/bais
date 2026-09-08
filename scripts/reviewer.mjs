@@ -42,10 +42,34 @@
 // `FAIL: reject pack replaces (keep)` plus `FAIL: verdict feeds hero
 // replacement end to end (general -> general ...)` (the red pack was kept,
 // so no hero was replaced); restored, green. Re-record on any hunk change.
+//
+// hub#219 item 4 (hub#197): the red-check gate extends from shape to
+// EXECUTION. campaign.mjs owns the pure verdict (verifyRedCheck + the
+// pinned warn/refuse strings, CAMPAIGN_BUDGETS.redCheckPhase); pass an
+// `execute` executor (host-owned: reverts the named hunk, re-runs the
+// suite, returns the observed output) and the recorded red-check is
+// re-run empirically. Warn-first: the default warn phase appends the
+// pinned warning to findings (attestation-only downgrade, or
+// observed-vs-expected divergence) WITHOUT moving the decision; the fail
+// phase (redCheckPhase: "fail") turns the refusal into "replace" naming
+// the hunk and the observed-vs-expected output. No executor wired keeps
+// today's shape gate byte-identical (attestation never silently counts
+// as execution — it is a named state, bi#55).
+//
+// Red-check (hub#219/bi#57, recorded 2026-09-08): with the refusal
+// override neutered (`verification.refusal !== null` forced false), the
+// selftest failed LOUD with 2 failure(s) FOR THE RIGHT REASON —
+//   FAIL: fail-phase non-reproducing red-check replaces naming hunk + observed-vs-expected (keep)
+//   FAIL: fail-phase attestation-only red-check replaces (keep)
+// (vacuous red-checks kept packs — attestation counted as execution, the
+// exact outcome-fabrication escape hub#197 exists to close). Restored,
+// green. An execution gate that cannot go red on a non-reproducing
+// red-check is camouflage, not coverage.
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { reviewPack as reviewBatch } from "./pack-review.mjs";
+import { verifyRedCheck, CAMPAIGN_BUDGETS } from "./campaign.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -68,17 +92,33 @@ export function redcheckOf(pack, redcheck = null) {
 
 // Fresh-context review of one pack/handoff under one hero. Returns the
 // review; toVerdictFeed()/toAuditTrail() project it onto consumers.
-export function reviewPack(pack, { heroName = "", redcheck = null } = {}) {
+// hub#219 item 4: `execute` (host-owned hunk-revert + suite re-run) +
+// `redCheckPhase` wire the empirical red-check — see the header.
+export function reviewPack(pack, { heroName = "", redcheck = null, execute = null, redCheckPhase = CAMPAIGN_BUDGETS.redCheckPhase } = {}) {
 	const hero = String(heroName || pack?.hero || "").trim() || "(missing hero)";
 	const batch = reviewBatch(pack);
 	const rc = redcheckOf(pack, redcheck);
+	// Execution gate (hub#197): only when the caller wires an executor —
+	// shape-only review stays byte-identical otherwise.
+	const verification = typeof execute === "function" ? verifyRedCheck({ redcheck: redcheck ?? pack?.redcheck ?? {}, execute, phase: redCheckPhase }) : null;
 	const findings = [...batch.reasons];
 	if (!rc) findings.push("no revert-hunk red-check recorded (bi#57) — unverified green is camouflage, not coverage");
-	const decision = decide(batch.verdict, rc !== null);
+	if (verification !== null) {
+		if (verification.warning !== null) findings.push(verification.warning);
+		if (verification.refusal !== null) findings.push(verification.refusal);
+	}
+	let decision = decide(batch.verdict, rc !== null);
+	// hub#219 item 4: the fail-phase refusal (attestation-only past the
+	// milestone, or the hunk not reproducing the expected failure)
+	// replaces, naming the hunk and observed-vs-expected (the refusal
+	// string itself, pinned in campaign.mjs). Warn phase advises via
+	// findings only — the decision never moves on a warning.
+	if (verification !== null && verification.refusal !== null) decision = "replace";
 	const members = `[${batch.members.join(" ")}]`;
+	const executedNote = verification !== null && !verification.attestationOnly && verification.ok ? `; executed re-run reproduced the expected failure (${verification.observed})` : "";
 	const evidence =
 		decision === "keep"
-			? `reviewer bi#59: hero ${hero} pack ${batch.pack} green — ${batch.members.length} members ${members} each with diff under review, whole-pack suite pass; red-check reverted ${rc?.hunk} -> ${rc?.observed}`
+			? `reviewer bi#59: hero ${hero} pack ${batch.pack} green — ${batch.members.length} members ${members} each with diff under review, whole-pack suite pass; red-check reverted ${rc?.hunk} -> ${rc?.observed}${executedNote}`
 			: `reviewer bi#59: hero ${hero} pack ${batch.pack} red — ${findings.join("; ")}; members ${members}`;
 	return {
 		ref: `review-${batch.pack}`,
@@ -90,6 +130,7 @@ export function reviewPack(pack, { heroName = "", redcheck = null } = {}) {
 		members: batch.members,
 		failed: batch.failed,
 		redcheck: rc,
+		redcheckVerification: verification,
 		handoff: `/tmp/rev59-deliver/${batch.pack}.report.md`,
 	};
 }
@@ -121,6 +162,19 @@ export function toAuditTrail(review) {
 		requirement: `pack ${review.pack} revert-hunk red-check recorded (bi#57)`,
 		evidence: review.redcheck ? `reverted ${review.redcheck.hunk} -> ${review.redcheck.observed}` : "RED — no red-check recorded",
 	});
+	// hub#219 item 4: when the executor ran, the trail carries the
+	// empirical half — attestation is never the last word (hub#197).
+	if (review.redcheckVerification) {
+		const v = review.redcheckVerification;
+		links.push({
+			requirement: `pack ${review.pack} red-check verified empirically at fold (hub#197)`,
+			evidence: v.attestationOnly
+				? `${v.ok ? "WARN" : "RED"} — attestation-only (no executed revert)${v.refusal ? `: ${v.refusal}` : ""}`
+				: v.ok
+					? `ok — executed re-run reproduced the expected failure (${v.observed})`
+					: `${v.refusal ? "RED" : "WARN"} — ${v.refusal ?? v.warning}`,
+		});
+	}
 	return links.map(({ requirement, evidence }) => ({ requirement, evidence }));
 }
 
@@ -225,6 +279,33 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 		check(refused === 1, `missing pack file refused`);
 		check(bare.decision === "replace", `memberless pack replaces, never silent-keep`);
 		check(nocheck.decision === "replace" && nocheck.evidence.includes("no revert-hunk red-check"), `approval without red-check replaces naming the gap`);
+		// 6. hub#219 item 4 (hub#197): the red-check gate extends from shape
+		// to execution via campaign.mjs verifyRedCheck + a host executor.
+		const execPack = { pack: "r-exec", suite: "pass", hero: "general", slots: [{ id: "r#31", item: "pass", diff: "diff --git ok" }], redcheck: { hunk: "subset-check", expected: "FAIL scope", observed: "prose record" } };
+		const reproduces = reviewPack(execPack, { execute: () => "1 failure: FAIL scope out-of-scope fold validated" });
+		check(
+			reproduces.decision === "keep" && reproduces.redcheckVerification?.ok === true && reproduces.evidence.includes("executed re-run reproduced"),
+			`executed red-check keeps with the reproduction in evidence`,
+		);
+		const diverges = reviewPack(execPack, { execute: () => "campaign: all green (62 pass)" });
+		check(
+			diverges.decision === "keep" && diverges.findings.some((f) => f.includes("did not reproduce") && f.includes("subset-check") && f.includes("FAIL scope")),
+			`warn-phase divergence advises naming hunk + observed-vs-expected, decision unmoved`,
+		);
+		const strictDiverge = reviewPack(execPack, { execute: () => "campaign: all green (62 pass)", redCheckPhase: "fail" });
+		check(
+			strictDiverge.decision === "replace" && strictDiverge.evidence.includes("did not reproduce") && strictDiverge.evidence.includes("subset-check"),
+			`fail-phase non-reproducing red-check replaces naming hunk + observed-vs-expected (${strictDiverge.decision})`,
+		);
+		const attestation = reviewPack({ ...execPack, redcheck: { hunk: "subset-check", observed: "prose only" } }, { execute: () => "irrelevant", redCheckPhase: "fail" });
+		check(attestation.decision === "replace" && attestation.evidence.includes("attestation-only"), `fail-phase attestation-only red-check replaces (${attestation.decision})`);
+		const attestationWarn = reviewPack({ ...execPack, redcheck: { hunk: "subset-check", observed: "prose only" } }, { execute: () => "irrelevant" });
+		check(attestationWarn.decision === "keep" && attestationWarn.findings.some((f) => f.includes("attestation-only")), `warn-phase attestation downgrades loud, decision unmoved`);
+		const trailExec = toAuditTrail(reproduces);
+		check(
+			trailExec.length === reproduces.members.length + 3 && trailExec.some((l) => l.requirement.includes("verified empirically") && l.evidence.startsWith("ok")),
+			`audit trail carries the empirical red-check link`,
+		);
 		if (failures) {
 			console.error(`${failures} failure(s)`);
 			process.exit(1);

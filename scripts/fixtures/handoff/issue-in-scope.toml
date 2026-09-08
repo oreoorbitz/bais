@@ -1,0 +1,8 @@
+id = "s#01"
+title = "in-scope fixture issue"
+status = "Doing"
+kind = "Feat"
+body = '''
+The fold touches exactly the declared footprint.
+Files: src/owned.ts src/gold-plating.ts
+'''
