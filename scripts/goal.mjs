@@ -58,12 +58,43 @@
 // explicit "waiver" facet) with drifted citations reported naming the stale
 // facet, generated scaffolds carry a red-check record header, and
 // unreasoned surface_spec amendments flag loud in status() warns.
+//
+// hub#195 (goal-churn continuity): goals churn in long-horizon campaigns —
+// "one overarching goal per project" stays true per campaign VERSION.
+//   1. switchGoal returns the old campaign's surfaces for an explicit
+//      keep/retire decision (applySurfaceDecisions), mirroring the retire
+//      node list; undecided surfaces keep their cases but flagged.
+//   2. commit() stamps every e2e scaffold with the campaign snapshot id
+//      (goalSnapshotId, lifecycle.mjs) it was authored under; kept cases
+//      rebind explicitly to the new snapshot id (rebindE2eSnapshot).
+//   3. The re-interview's surface-spec box defaults to the archived
+//      campaign's spec (fresh.prefill, consumed by defaultFor/useDefaults —
+//      edit, don't rewrite). In-memory: the prefill rides the fresh goal
+//      through `bais goal switch`'s immediate re-interview.
+//   4. commit() records approved_sketch_hash + goal_snapshot in goal.toml;
+//      drift flags loud in `bais check` (verifyApprovedSketch, the bi#136
+//      "snapshot stale" precedent — never silently honored).
+//
+// Load-bearing hunk (hub#195/bi#57 red-check target): the approved-sketch
+// hash write in commit() (goal.approved_sketch_hash = ... before the
+// goal.toml render). Dropping it must trip the selftest below with exactly:
+//   "FAIL selftest: commit records the approved-sketch hash in goal.toml"
+// (verified 2026-09-08: assignment removed -> that FAIL observed first,
+// with the tamper check cascading red behind it (goal.toml grandfathered
+// without the recorded hash), exit 1 -> restored green).
+// The mismatch refusal half lives in lifecycle.mjs verifyApprovedSketch
+// (its red-check: "tampered sketch.toml is refused loud against the
+// approved-sketch hash" — verified 2026-09-08: refusal neutered to
+// always-ok -> that FAIL observed with the missing-sketch drift check
+// behind it, exit 1; goal.mjs selftest's post-approval-edit check cascaded
+// red -> restored green).
 
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { approvedSketchHash, goalSnapshotId, verifyApprovedSketch } from "./lifecycle.mjs";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -294,9 +325,17 @@ export function waive(goal, box) {
 	return goal;
 }
 
+// The box default: DEFAULTS, overridden by a switch prefill (hub#195 — the
+// re-interview's surface-spec box defaults to the archived campaign's spec
+// as the starting value; edit, don't rewrite).
+export function defaultFor(goal, box) {
+	const pre = goal?.prefill?.[box];
+	return typeof pre === "string" && pre.trim() !== "" ? pre : DEFAULTS[box];
+}
+
 // The use-defaults escape: every still-open box takes its default.
 export function useDefaults(goal) {
-	for (const box of openBoxes(goal)) goal.boxes[box] = { status: "defaulted", value: DEFAULTS[box] };
+	for (const box of openBoxes(goal)) goal.boxes[box] = { status: "defaulted", value: defaultFor(goal, box) };
 	return goal;
 }
 
@@ -349,14 +388,21 @@ export function sketch(goal) {
 	// must not rename every case. The taken set is sketch-local so commit()
 	// re-deriving the same slugs from the same e2e items agrees byte for
 	// byte (commit() reuses the case ids as scaffold filenames).
-	const taken = new Set();
 	goal.sketch = {
 		nodes,
 		edges,
-		e2e: goalSurface(goal).map((s) => surfaceToBitsCase(s, taken)),
+		e2e: e2eCasesOf(goal),
 		oracle: goalSurfaceSpec(goal).map(surfaceSpecToBitsCase),
 	};
 	return { ok: true, proposal: goal.sketch };
+}
+
+// The sketch's e2e cases, derived without side effects (sketch() seeds
+// goal.sketch with them; switchGoal re-derives them for uncommitted goals
+// — hub#195). The taken set is derivation-local so slugs stay stable.
+function e2eCasesOf(goal) {
+	const taken = new Set();
+	return goalSurface(goal).map((s) => surfaceToBitsCase(s, taken));
 }
 
 // --- foundation_rank derivation (hub#186, scripts lane) ---
@@ -444,16 +490,25 @@ export function commit(goal, { approved = false, write = null } = {}) {
 	}
 	const badJoin = oracleFacetJoin(goal).find((j) => !j.ok);
 	if (badJoin) return { ok: false, wrote: [], error: `commit refused: ${badJoin.reason}` };
+	// hub#195: bind the committed goal.toml to the human-approved sketch.
+	// The hash + campaign snapshot id derive from the exact sketch.toml
+	// bytes being written, and are stamped into goal.toml (drift flags loud
+	// in `bais check` — verifyApprovedSketch) and into every e2e scaffold
+	// header (the campaign version the case was authored under). This
+	// assignment is the hub#195 red-check hunk (see the file header).
+	const sketchToml = renderSketchToml(goal.sketch);
+	goal.approved_sketch_hash = approvedSketchHash(sketchToml);
+	goal.goal_snapshot = goalSnapshotId(sketchToml);
 	const files = [
 		{ path: "goal.toml", content: renderGoalToml(goal) },
-		{ path: "sketch.toml", content: renderSketchToml(goal.sketch) },
+		{ path: "sketch.toml", content: sketchToml },
 	];
 	// Scaffold filenames reuse the e2e case ids verbatim — the anchor join
 	// between sketch cases and scaffold files is exact, never positional.
 	for (const c of e2e) {
 		files.push({
 			path: `e2e/${c.case}.mjs`,
-			content: renderE2eScaffold({ surface: c.surface, exercise: c.exercise }),
+			content: renderE2eScaffold({ surface: c.surface, exercise: c.exercise, snapshotId: goal.goal_snapshot }),
 		});
 	}
 	if (e2e.length === 0) files.push({ path: "issues/goal#oracle-gap.toml", content: renderOracleGapIssue(goal) });
@@ -612,14 +667,88 @@ export function status(goal) {
 
 // Restructure flow: archive the old campaign, start a fresh interview for
 // the new statement, list prior sketch nodes for the human to retire.
+//
+// hub#195 (goal-churn continuity): the switch no longer interviews from
+// scratch.
+//   - archived carries the old campaign's surface_spec text AND its
+//     campaign snapshot id (goal.goal_snapshot persisted at commit,
+//     re-derived from the sketch for uncommitted goals) — ground-truth
+//     continuity across churn.
+//   - fresh.prefill seeds the re-interview's surface-spec default with the
+//     archived spec (edit, don't rewrite — defaultFor/useDefaults consume
+//     it, so the defaults escape settles the archived spec, and the CLI
+//     prints it as the surface-spec starting value).
+//   - surfaces lists the old campaign's e2e cases for an explicit
+//     keep/retire decision (applySurfaceDecisions), mirroring the retire
+//     node list. Every row starts decision "undecided", flagged — undecided
+//     surfaces keep their cases but flagged, never silently carried.
+// A goal loaded from goal.toml carries no in-memory sketch; when the
+// checklist is complete the sketch is re-derived (the commit verb's
+// dry-run precedent) so the retire list and snapshot id stay populated.
+// Mid-switch (checklist open) the derivation is skipped — surfaces still
+// derive from the settled testing-surface box, and the fresh goal's own
+// sketch-guard refusal stays intact (the hub#195 acceptance: gates degrade
+// loud, not silent).
 export function switchGoal(goal, newStatement) {
 	const fresh = newGoal(newStatement);
+	const archivedSpec = goalSurfaceSpec(goal)
+		.map((s) => `${s.facet} => ${s.spec}`)
+		.join("; ");
+	if (archivedSpec !== "") fresh.prefill = { "surface-spec": archivedSpec };
+	if (!goal.sketch && checklistComplete(goal)) sketch(goal);
+	const snapshotId = goal.goal_snapshot || (goal.sketch ? goalSnapshotId(renderSketchToml(goal.sketch)) : "");
+	const cases = Array.isArray(goal.sketch?.e2e) ? goal.sketch.e2e : e2eCasesOf(goal);
 	return {
-		archived: { statement: goal.statement, status: status(goal) },
+		archived: { statement: goal.statement, status: status(goal), surface_spec: archivedSpec, snapshot_id: snapshotId },
 		fresh,
 		retire: goal.sketch ? goal.sketch.nodes.map((n) => n.id) : [],
+		surfaces: cases.map((c) => ({
+			case: c.case,
+			surface: c.surface,
+			snapshot_id: snapshotId,
+			decision: "undecided",
+			flagged: true,
+		})),
 	};
 }
+
+// The keep/retire decision over a switch's surface list (hub#195).
+// keep: surface texts or case ids to carry into the new campaign — kept
+// cases rebind EXPLICITLY to the new snapshot id (from_snapshot records the
+// origin). retire: { <surface|case>: <reason> } — retired cases stay flagged
+// WITH the reason (the retire --reason idiom; a reasonless retire is not a
+// decision). Everything else stays undecided + flagged. Pure.
+export function applySurfaceDecisions(sw, { keep = [], retire = {} } = {}, newSnapshotId = "") {
+	const keepSet = new Set(keep);
+	const keep_surfaces = [];
+	const retire_surfaces = [];
+	const undecided = [];
+	for (const s of sw?.surfaces ?? []) {
+		const reason = retire[s.surface] ?? retire[s.case];
+		if (keepSet.has(s.surface) || keepSet.has(s.case)) {
+			keep_surfaces.push({ ...s, decision: "keep", flagged: false, from_snapshot: s.snapshot_id, snapshot_id: newSnapshotId });
+		} else if (typeof reason === "string" && reason.trim() !== "") {
+			retire_surfaces.push({ ...s, decision: "retire", flagged: true, reason });
+		} else {
+			undecided.push({ ...s, decision: "undecided", flagged: true });
+		}
+	}
+	return { keep_surfaces, retire_surfaces, undecided };
+}
+
+// The explicit keep decision, physical form: rewrite an e2e case file's
+// `// goal snapshot: <id>` header to the new campaign's snapshot id. A case
+// without the header (pre-195 scaffold) gains it directly under the first
+// line — binding a legacy case to the new campaign is also an explicit act.
+export function rebindE2eSnapshot(text, newSnapshotId) {
+	const line = `// goal snapshot: ${newSnapshotId}`;
+	const src = String(text ?? "");
+	if (GOAL_SNAPSHOT_LINE.test(src)) return src.replace(GOAL_SNAPSHOT_LINE, line);
+	const lines = src.split("\n");
+	lines.splice(1, 0, line);
+	return lines.join("\n");
+}
+const GOAL_SNAPSHOT_LINE = /^\/\/ goal snapshot: .*$/m;
 
 // --- goal.toml schema (see bais/spec/goal.md) ---
 //
@@ -632,6 +761,8 @@ export function switchGoal(goal, newStatement) {
 // testing_surface = [{ surface = "...", exercise = "..." }, ...]
 // surface_spec = [{ facet = "...", spec = "..." }, ...]
 // contract = [{ field = "outcome|verification|constraints|boundaries|stop_when", text = "..." }, ...]
+// goal_snapshot = "goal-snapshot-<sha256:12>" (hub#195 — committed campaigns only)
+// approved_sketch_hash = "sha256:<hex>" (hub#195 — hash of the approved sketch.toml)
 // [interview.<box>] status = "open|filled|waived|defaulted", value = "..."
 
 export function heroOf(goal) {
@@ -675,6 +806,10 @@ export function renderGoalToml(goal) {
 	// never a contract item, mirroring the testing_surface precedent).
 	const contract = goalContract(goal).map((c) => `{ field = ${escStr(c.field)}, text = ${escStr(c.text)} }`);
 	L.push(`contract = [${contract.join(", ")}]`);
+	// hub#195: the approved-sketch binding (set by commit() — never rendered
+	// for uncommitted/legacy goals, which keeps pre-195 files byte-identical).
+	if (goal.goal_snapshot) L.push(`goal_snapshot = ${escStr(goal.goal_snapshot)}`);
+	if (goal.approved_sketch_hash) L.push(`approved_sketch_hash = ${escStr(goal.approved_sketch_hash)}`);
 	for (const box of CHECKLIST) {
 		L.push(`[interview.${JSON.stringify(box)}]`);
 		L.push(`status = ${escStr(goal.boxes[box].status)}`);
@@ -707,6 +842,12 @@ export function parseGoalToml(text) {
 		return out;
 	};
 	const goal = newGoal(field("statement"));
+	// hub#195: the approved-sketch binding (absent on pre-195 goal.toml files
+	// — only assigned when present so legacy parses stay shape-identical).
+	const snap195 = field("goal_snapshot");
+	if (snap195) goal.goal_snapshot = snap195;
+	const hash195 = field("approved_sketch_hash");
+	if (hash195) goal.approved_sketch_hash = hash195;
 	for (const box of CHECKLIST) {
 		const sec = String(text).match(new RegExp(`^\\[interview\\.("?)${box.replace(/-/g, "\\-")}\\1\\]([^\\[]*)`, "m"));
 		const status = sec && sec[2].match(/status *= *"(\w+)"/);
@@ -1300,10 +1441,16 @@ export function parseSketchToml(text) {
 // deterministic, offline. Prints `FAIL: <surface>: scaffold-unimplemented`
 // on stderr, exits 1. The surface embeds as a JSON string literal so
 // quotes/backticks in surface text cannot break the scaffold.
-export function renderE2eScaffold({ surface, exercise }) {
+// hub#195: the header records the campaign snapshot id the case was
+// authored under — cross-goal case reuse requires an explicit keep decision
+// (rebindE2eSnapshot), never a silent carry-over.
+export function renderE2eScaffold({ surface, exercise, snapshotId = "" }) {
 	const anchor = surfaceAnchor(surface, exercise);
+	const snapshotLine = snapshotId
+		? `// goal snapshot: ${snapshotId} (campaign version this case was authored under — hub#195; cross-goal reuse needs an explicit keep decision)\n`
+		: "";
 	return `// e2e scaffold for goal surface: ${JSON.stringify(surface)}
-// exercise: ${JSON.stringify(exercise)}
+${snapshotLine}// exercise: ${JSON.stringify(exercise)}
 // goal anchor: ${anchor} (sha256 of surface + "=>" + exercise — hub#184)
 // Generated by \`bais goal commit\` — failing-first scaffold: implement the
 // exercise above; until then this file fails loud.
@@ -2758,6 +2905,139 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 			`scaffold ${c.case} header carries the red-check record (hunk + expected reason + observed)`,
 		);
 	}
+
+	// hub#195: goal-churn continuity. The committed campaign (commit184
+	// above) is the old goal; a switch carries its surfaces + spec forward
+	// deliberately, and goal.toml is bound to the approved sketch by hash.
+	//
+	// (4) Approved-sketch hash: commit() records it in goal.toml; the
+	// scaffold headers record the campaign snapshot id; the committed pair
+	// verifies and a tampered sketch.toml flags loud.
+	const goalToml195 = files184.get("goal.toml");
+	check(
+		/approved_sketch_hash = "sha256:[0-9a-f]{64}"/.test(goalToml195),
+		"commit records the approved-sketch hash in goal.toml",
+	);
+	check(
+		goalToml195.includes(`goal_snapshot = "${commit184.goal_snapshot}"`),
+		`goal.toml carries the campaign snapshot id (got ${commit184.goal_snapshot})`,
+	);
+	for (const c of e2e184) {
+		check(
+			files184.get(`e2e/${c.case}.mjs`).includes(`// goal snapshot: ${commit184.goal_snapshot}`),
+			`scaffold ${c.case} records the goal snapshot id it was authored under`,
+		);
+	}
+	const sketchToml195 = files184.get("sketch.toml");
+	check(
+		verifyApprovedSketch({ goalTomlText: goalToml195, sketchTomlText: sketchToml195 }).ok,
+		"committed goal.toml + sketch.toml verify against the approved-sketch hash",
+	);
+	const tampered195 = `${sketchToml195}\n[[node]]\nid = "sneaky"\ntitle = "post-approval edit"\nradius = []\n`;
+	const tamVer195 = verifyApprovedSketch({ goalTomlText: goalToml195, sketchTomlText: tampered195 });
+	check(
+		!tamVer195.ok && tamVer195.drift && /sketch stale/.test(tamVer195.error),
+		`post-approval sketch edit flags loud against the approved-sketch hash (got ${JSON.stringify(tamVer195)})`,
+	);
+	// The parsed-back goal.toml restores the binding fields.
+	const reparsed195 = parseGoalToml(goalToml195);
+	check(
+		reparsed195.goal_snapshot === commit184.goal_snapshot && reparsed195.approved_sketch_hash === commit184.approved_sketch_hash,
+		"parseGoalToml restores goal_snapshot + approved_sketch_hash",
+	);
+
+	// (1) The switch lists the old surfaces for keep/retire decision.
+	const sw195 = switchGoal(commit184, "Ship per-directory goal tracking v2");
+	check(
+		JSON.stringify(sw195.retire) === JSON.stringify(sk184.proposal.nodes.map((n) => n.id)),
+		"switch keeps the retire node list",
+	);
+	check(
+		sw195.surfaces.length === 2 && sw195.surfaces.every((s) => s.decision === "undecided" && s.flagged),
+		`switch lists the old surfaces undecided + flagged for keep/retire decision (got ${JSON.stringify(sw195.surfaces)})`,
+	);
+	check(
+		sw195.surfaces.every((s) => s.snapshot_id === commit184.goal_snapshot),
+		"listed surfaces carry the snapshot id they were authored under",
+	);
+	// Kept cases rebind explicitly to the new snapshot id; retired surfaces'
+	// cases are flagged with the reason; undecided keep cases but flagged.
+	const newSnap195 = "goal-snapshot-0000000000aa";
+	const dec195 = applySurfaceDecisions(
+		sw195,
+		{ keep: ["bais list shows open issues"], retire: { "bais ready orders by severity": "goal moved off the ready view" } },
+		newSnap195,
+	);
+	check(
+		dec195.keep_surfaces.length === 1 &&
+			dec195.keep_surfaces[0].snapshot_id === newSnap195 &&
+			dec195.keep_surfaces[0].from_snapshot === commit184.goal_snapshot &&
+			!dec195.keep_surfaces[0].flagged,
+		`kept cases rebind explicitly to the new snapshot id (got ${JSON.stringify(dec195.keep_surfaces)})`,
+	);
+	check(
+		dec195.retire_surfaces.length === 1 &&
+			dec195.retire_surfaces[0].flagged &&
+			dec195.retire_surfaces[0].reason === "goal moved off the ready view",
+		`retired surfaces' cases are flagged with the reason (got ${JSON.stringify(dec195.retire_surfaces)})`,
+	);
+	const decNone195 = applySurfaceDecisions(sw195, {}, newSnap195);
+	check(
+		decNone195.undecided.length === 2 && decNone195.undecided.every((s) => s.flagged),
+		"undecided surfaces keep their cases but flagged",
+	);
+	// The rebind rewrites the case file to the new snapshot id (the explicit
+	// keep decision, physical form).
+	const rebound195 = rebindE2eSnapshot(files184.get(`e2e/${dec195.keep_surfaces[0].case}.mjs`), newSnap195);
+	check(
+		rebound195.includes(`// goal snapshot: ${newSnap195}`) && !rebound195.includes(commit184.goal_snapshot),
+		"rebindE2eSnapshot rewrites the case file to the new snapshot id",
+	);
+	const legacyRebind195 = rebindE2eSnapshot("// e2e scaffold for goal surface: \"x\"\nconsole.error(\"x\");\n", newSnap195);
+	check(
+		legacyRebind195.split("\n")[1] === `// goal snapshot: ${newSnap195}`,
+		"rebind binds a headerless legacy case under the first line",
+	);
+
+	// (3) The re-interview pre-fills surface_spec from the archived campaign.
+	check(
+		sw195.archived.surface_spec.includes("cli output shape"),
+		`the archived campaign's surface_spec rides the switch result (got ${JSON.stringify(sw195.archived.surface_spec)})`,
+	);
+	check(
+		defaultFor(sw195.fresh, "surface-spec").includes("cli output shape"),
+		"the re-interview pre-fills surface_spec from the archive as the default",
+	);
+	useDefaults(sw195.fresh);
+	check(
+		sw195.fresh.boxes["surface-spec"].status === "defaulted" && sw195.fresh.boxes["surface-spec"].value.includes("cli output shape"),
+		"the defaults escape settles surface-spec with the archived spec (edit, don't rewrite)",
+	);
+	check(
+		goalSurfaceSpec(sw195.fresh).some((s) => s.facet === "cli output shape"),
+		"the prefilled spec parses back into declared facets",
+	);
+
+	// (2)+(4) Mid-switch (incomplete interview): the fresh goal's gates
+	// degrade loud, not silent — the sketch-guard refusal path stays intact.
+	const midSw195 = switchGoal(parseGoalToml(readFileSync(join(FIXTURES, "open-goal.toml"), "utf8")), "mid-switch target");
+	const midSketch195 = sketch(midSw195.fresh);
+	check(
+		midSketch195.ok === false && /sketch refused: checklist open/.test(midSketch195.error),
+		`mid-switch incomplete interview: sketch-guard refusal stays loud (got ${JSON.stringify(midSketch195)})`,
+	);
+	const midCommit195 = commit(midSw195.fresh, { approved: true, write: () => {} });
+	check(
+		midCommit195.ok === false && /checklist open/.test(midCommit195.error),
+		`mid-switch commit refuses loud on the open checklist (got ${JSON.stringify(midCommit195)})`,
+	);
+	// A loaded (unsketched) complete goal still switches with populated
+	// surfaces + snapshot id — the sketch is re-derived for the archive.
+	const loadedSwitch195 = switchGoal(reparsed195, "v3 from a loaded goal.toml");
+	check(
+		loadedSwitch195.surfaces.length === 2 && loadedSwitch195.archived.snapshot_id === commit184.goal_snapshot,
+		"switch on a goal loaded from goal.toml re-derives surfaces + snapshot id",
+	);
 
 	process.exit(failures ? 1 : 0);
 }

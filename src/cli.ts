@@ -817,6 +817,51 @@ if (cmd === "check") {
 	const layerDrift = auditBaseline !== null ? layerDriftIn(checkFiles, auditBaseline) : [];
 	const radiusAudit = radiusVsEvidenceIn(checkFiles);
 	const declarationAudit = declarationDistributionIn(checkFiles);
+	// hub#195: the committed goal.toml is bound to the human-approved sketch
+	// by approved_sketch_hash; drift (post-approval nodes/edges edits) flags
+	// loud and fatal — the bi#136 "snapshot stale" precedent, never silently
+	// honored. A goal.toml without the hash is grandfathered (pre-195
+	// campaigns carry none), so legacy hubs stay green. Case-file snapshot
+	// drift (a case still bound to a retired campaign version — cross-goal
+	// reuse without an explicit keep decision) rides the e2e rollout phase
+	// like the hub#191 joins: advisory in warn, fatal under --e2e-strict.
+	const lm195 = await loadScriptModule("lifecycle.mjs");
+	const sketchStale = lm195.verifyApprovedSketch({ goalTomlText: goalText, sketchTomlText: sketchText });
+	const sketchStaleFatal = sketchStale.ok ? 0 : 1;
+	const goalSnapshot195 = ((): string => {
+		const m = goalText.match(/^goal_snapshot *= *("(?:[^"\\]|\\.)*")/m);
+		if (!m) return "";
+		try {
+			return JSON.parse(m[1]);
+		} catch {
+			return "";
+		}
+	})();
+	const e2eCaseFiles195 = ((): { file: string; text: string }[] => {
+		try {
+			return readdirSync(e2eDir)
+				.filter((f) => f.endsWith(".mjs"))
+				.sort()
+				.map((f) => ({ file: f, text: readFileSync(join(e2eDir, f), "utf8") }));
+		} catch {
+			return [];
+		}
+	})();
+	const snapshotDrift195 = lm195.e2eSnapshotDrift({ goalSnapshot: goalSnapshot195, cases: e2eCaseFiles195 });
+	const snapshotDriftFatal = e2ePhase === "fail" ? snapshotDrift195.length : 0;
+	const printSketchStale = (): void => {
+		if (!sketchStale.ok) console.log(`goal-sketch-stale\t${sketchStale.error}`);
+		for (const r of snapshotDrift195) {
+			console.log(`e2e-snapshot-stale\t${r.file}\t${r.reason}`);
+		}
+	};
+	const sketchStaleJson = (): unknown => ({
+		ok: sketchStale.ok,
+		drift: sketchStale.drift,
+		grandfathered: sketchStale.grandfathered,
+		error: sketchStale.error,
+		case_snapshot_drift: snapshotDrift195,
+	});
 	const auditFatal = auditPhase === "fail" ? layerDrift.length + radiusAudit.length + (declarationAudit !== null ? 1 : 0) : 0;
 	const printAudits = (): void => {
 		for (const r of layerDrift) {
@@ -863,7 +908,7 @@ if (cmd === "check") {
 			const staleClaims = checkFiles
 				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
 				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
-			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence, staleClaims, staleStore, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson() }, null, 2));
+			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence, staleClaims, staleStore, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson(), goalSketch: sketchStaleJson() }, null, 2));
 		} else {
 			for (const d of missing) console.log(`dangling\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			for (const d of external) console.log(`external\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
@@ -881,15 +926,16 @@ if (cmd === "check") {
 			printRegistry();
 			printE2eDrift();
 			printAudits();
+			printSketchStale();
 			console.log(`ok\t${ok} issues, ${bad.length} bad`);
-			if (bad.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal) process.exit(1);
+			if (bad.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal) process.exit(1);
 			process.exit(0);
 		}
 		// hub#188/hub#191/hub#193: in the warn phases unresolvable-e2e and
 		// every drift/audit row are advisory — e2eDriftFatal/auditFatal are
 		// zero and unresolvable-e2e is excluded from the fatal count.
 		const fatalEvidence = evidence.filter((p) => p.status === "Missing" && !(e2ePhase === "warn" && p.reason === "unresolvable-e2e")).length;
-		if (bad.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal) process.exit(1);
+		if (bad.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal) process.exit(1);
 	} else {
 		const issues = checkFiles;
 		const failures = checkLoad.failures;
@@ -905,7 +951,7 @@ if (cmd === "check") {
 			const staleClaims = issues
 				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
 				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
-			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence, staleClaims, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson() }, null, 2));
+			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence, staleClaims, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson(), goalSketch: sketchStaleJson() }, null, 2));
 		} else {
 			for (const f of issues) console.log(`ok\t${f.issue.id}`);
 			for (const b of failures) console.log(`bad\t${b.file}\t${b.error}`);
@@ -933,7 +979,8 @@ if (cmd === "check") {
 			printRegistry();
 			printE2eDrift();
 			printAudits();
-			if (failures.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal) process.exit(1);
+			printSketchStale();
+			if (failures.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal) process.exit(1);
 			process.exit(0);
 		}
 
@@ -944,7 +991,7 @@ if (cmd === "check") {
 		// warn phase unresolvable-e2e is advisory too (e2eDriftFatal/auditFatal
 		// stay zero until --e2e-strict/--audit-strict).
 		const fatalEvidence = evidence.filter((p) => p.status === "Missing" && !(e2ePhase === "warn" && p.reason === "unresolvable-e2e")).length;
-		if (failures.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal) process.exit(1);
+		if (failures.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal) process.exit(1);
 	}
 	process.exit(0);
 }
@@ -1847,10 +1894,17 @@ if (cmd === "goal") {
 		const g = loadGoal();
 		const res = gm.switchGoal(g, newStatement);
 		saveGoal(res.fresh);
-		if (asJson) printJson({ archived: res.archived, retire: res.retire, statement: res.fresh.statement });
+		// hub#195: the switch lists the old campaign's surfaces for an
+		// explicit keep/retire decision (undecided surfaces keep their cases
+		// but flagged), and the re-interview's surface-spec default is the
+		// archived campaign's spec (edit, don't rewrite).
+		if (asJson) printJson({ archived: res.archived, retire: res.retire, surfaces: res.surfaces, statement: res.fresh.statement });
 		else {
 			console.log(`archived\t${res.archived.statement}`);
+			if (res.archived.snapshot_id) console.log(`archived-snapshot\t${res.archived.snapshot_id}`);
 			for (const id of res.retire) console.log(`retire\t${id}`);
+			for (const s of res.surfaces) console.log(`surface-undecided\t${s.case}\t${s.surface}\tauthored under ${s.snapshot_id || "no recorded snapshot"} — keep (rebinds to the new snapshot id) or retire with a reason (hub#195)`);
+			if (res.archived.surface_spec) console.log(`surface-spec-default\t${res.archived.surface_spec}`);
 		}
 		await runInterview(res.fresh); // restructure flow ends in a fresh interview
 	} else if (verb === "snapshot") {
