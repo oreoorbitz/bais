@@ -750,6 +750,112 @@ export function rebindE2eSnapshot(text, newSnapshotId) {
 }
 const GOAL_SNAPSHOT_LINE = /^\/\/ goal snapshot: .*$/m;
 
+// --- surface keep/retire decisions applied to case files (hub#221) ---
+//
+// switchGoal lists the old campaign's surfaces undecided + flagged and
+// applySurfaceDecisions decides them pure — but nothing applied a recorded
+// decision to the case files on disk. `bais goal keep-surface` /
+// `retire-surface` (cli.ts argv + filesystem only) close that gap through
+// the three pure functions below (the hub#163 single-source rule):
+//   - recordSurfaceDecision resolves a surface/case target against the
+//     sketch e2e (or the re-derived cases for a loaded goal.toml — the
+//     switchGoal precedent) and appends a {surface, case, decision, reason,
+//     snapshot} record to goal.surface_decisions. A second decision for the
+//     same surface refuses loud (bi#55 — never silently re-decided); a
+//     retire without a reason refuses loud (the retire --reason idiom).
+//   - keep applies physically as rebindE2eSnapshot (the case header moves to
+//     the live campaign snapshot, so `bais check` stops flagging it).
+//   - retire applies physically as a `// surface retired: <reason>` marker
+//     under the case file's first line (comment-safe: the anchor header and
+//     node execution are untouched); `bais check` suppresses the retired
+//     surface's gap/stale/snapshot rows and prints a surface-retired line
+//     instead — decided, never silently absent.
+// The ledger renders as surface_decisions inline tables (only when non-empty
+// — the hub#195 conditional-render precedent keeps pre-221 files
+// byte-identical) and parses back in parseGoalToml.
+//
+// Load-bearing hunk (hub#221/bi#57 red-check target): the already-decided
+// refusal in recordSurfaceDecision. Removing it must trip the selftest below
+// with exactly:
+//   "FAIL selftest: already-decided surface decision refuses loud naming the surface"
+// (verified 2026-09-08: throw neutered to `if (false && prior)` -> that FAIL
+// observed first, with the ledger-untouched check red behind it, exit 1 ->
+// restored green).
+export function surfaceDecisionsOf(goal) {
+	return Array.isArray(goal?.surface_decisions) ? goal.surface_decisions : [];
+}
+
+// Pure reader for the scaffold headers renderE2eScaffold writes: line 1
+// carries the surface (JSON string literal), plus the optional snapshot
+// and anchor headers. Lets keep/retire-surface resolve targets against
+// the case files on disk, not just the live goal's surfaces — after a
+// switch the new campaign may not declare the old surfaces, but the
+// files are still decidable. The CLI owns reading the files (hub#163);
+// this owns the header shape.
+export function parseE2eCaseHeader(text) {
+	const src = String(text ?? "");
+	let surface = "";
+	const sm = src.match(/^\/\/ e2e scaffold for goal surface: ("(?:[^"\\]|\\.)*")/m);
+	if (sm) {
+		try {
+			surface = JSON.parse(sm[1]);
+		} catch {
+			surface = "";
+		}
+	}
+	const nm = src.match(/^\/\/ goal snapshot: (\S+)/m);
+	const am = src.match(/^\/\/ goal anchor: ([0-9a-f]{64})/m);
+	return { surface, snapshot: nm ? nm[1] : "", anchor: am ? am[1] : "" };
+}
+
+export function resolveSurfaceTarget(goal, target, { files = [] } = {}) {
+	const t = String(target ?? "").trim();
+	if (t === "") throw new Error("bais goal keep|retire-surface needs a <surface|case> target");
+	const cases = Array.isArray(goal?.sketch?.e2e) ? goal.sketch.e2e : e2eCasesOf(goal);
+	const hit = cases.find((c) => c.case === t || c.surface === t);
+	if (hit) return { surface: hit.surface, case: hit.case };
+	// After a switch the new campaign may not declare the old surfaces —
+	// the case files on disk (surface header + filename stem) are still
+	// decidable. files = [{ case, surface, snapshot }] gathered by the CLI.
+	const disk = (Array.isArray(files) ? files : []).find((f) => f.case === t || f.surface === t);
+	if (disk && disk.surface) return { surface: disk.surface, case: disk.case };
+	throw new Error(
+		`unknown surface ${JSON.stringify(t)} — no declared testing_surface item, e2e case, or case file matches (run \`bais goal switch\` to list decidable surfaces)`,
+	);
+}
+
+export function recordSurfaceDecision(goal, { target, decision, reason = "", snapshot = "", files = [] } = {}) {
+	if (decision !== "keep" && decision !== "retire") {
+		throw new Error(`unknown surface decision ${JSON.stringify(decision)} — want "keep" or "retire"`);
+	}
+	const { surface, case: caseId } = resolveSurfaceTarget(goal, target, { files });
+	const prior = surfaceDecisionsOf(goal).find((d) => d.surface === surface || d.case === caseId);
+	if (prior) {
+		throw new Error(
+			`surface already decided: ${JSON.stringify(surface)} (${prior.decision}${prior.reason ? `: ${prior.reason}` : ""}) — re-decisions are never silent (bi#55)`,
+		);
+	}
+	const r = String(reason ?? "").trim();
+	if (decision === "retire" && r === "") {
+		throw new Error(`retire-surface needs --reason <R> — retirements are never silent (got surface ${JSON.stringify(surface)})`);
+	}
+	const rec = { surface, case: caseId, decision, reason: decision === "retire" ? r : String(reason ?? ""), snapshot: String(snapshot ?? "") };
+	goal.surface_decisions = [...surfaceDecisionsOf(goal), rec];
+	return rec;
+}
+
+// Physical retire form: a comment marker under the first line. Idempotent —
+// a present marker is replaced, never duplicated (the ledger still refuses
+// double-decides; this only keeps hand-applied files clean).
+export function markSurfaceRetired(text, reason) {
+	const line = `// surface retired: ${String(reason ?? "").trim()}`;
+	const src = String(text ?? "");
+	if (/^\/\/ surface retired: .*$/m.test(src)) return src.replace(/^\/\/ surface retired: .*$/m, line);
+	const lines = src.split("\n");
+	lines.splice(1, 0, line);
+	return lines.join("\n");
+}
+
 // --- goal.toml schema (see bais/spec/goal.md) ---
 //
 // [goal]
@@ -763,6 +869,7 @@ const GOAL_SNAPSHOT_LINE = /^\/\/ goal snapshot: .*$/m;
 // contract = [{ field = "outcome|verification|constraints|boundaries|stop_when", text = "..." }, ...]
 // goal_snapshot = "goal-snapshot-<sha256:12>" (hub#195 — committed campaigns only)
 // approved_sketch_hash = "sha256:<hex>" (hub#195 — hash of the approved sketch.toml)
+// surface_decisions = [{ surface = "...", case = "...", decision = "keep|retire", reason = "...", snapshot = "..." }, ...] (hub#221 — recorded keep/retire ledger, only when non-empty)
 // [interview.<box>] status = "open|filled|waived|defaulted", value = "..."
 
 export function heroOf(goal) {
@@ -810,6 +917,15 @@ export function renderGoalToml(goal) {
 	// for uncommitted/legacy goals, which keeps pre-195 files byte-identical).
 	if (goal.goal_snapshot) L.push(`goal_snapshot = ${escStr(goal.goal_snapshot)}`);
 	if (goal.approved_sketch_hash) L.push(`approved_sketch_hash = ${escStr(goal.approved_sketch_hash)}`);
+	// hub#221: the recorded keep/retire ledger (only when non-empty — the
+	// hub#195 conditional-render precedent keeps pre-221 files byte-identical).
+	if (surfaceDecisionsOf(goal).length > 0) {
+		const dec = surfaceDecisionsOf(goal).map(
+			(d) =>
+				`{ surface = ${escStr(d.surface)}, case = ${escStr(d.case)}, decision = ${escStr(d.decision)}, reason = ${escStr(d.reason)}, snapshot = ${escStr(d.snapshot)} }`,
+		);
+		L.push(`surface_decisions = [${dec.join(", ")}]`);
+	}
 	for (const box of CHECKLIST) {
 		L.push(`[interview.${JSON.stringify(box)}]`);
 		L.push(`status = ${escStr(goal.boxes[box].status)}`);
@@ -848,6 +964,10 @@ export function parseGoalToml(text) {
 	if (snap195) goal.goal_snapshot = snap195;
 	const hash195 = field("approved_sketch_hash");
 	if (hash195) goal.approved_sketch_hash = hash195;
+	// hub#221: the keep/retire ledger (absent on pre-221 goal.toml files —
+	// only assigned when present so legacy parses stay shape-identical).
+	const dec221 = extractGoalList(text, "surface_decisions");
+	if (dec221.found) goal.surface_decisions = dec221.items.map(parseSurfaceDecisionItem).filter((d) => d !== null);
 	for (const box of CHECKLIST) {
 		const sec = String(text).match(new RegExp(`^\\[interview\\.("?)${box.replace(/-/g, "\\-")}\\1\\]([^\\[]*)`, "m"));
 		const status = sec && sec[2].match(/status *= *"(\w+)"/);
@@ -1160,6 +1280,28 @@ export function validateGoal(text, { knownStyles = null, knownHeroes = null, sty
 				seen.add(c.field);
 			}
 		}
+	}
+
+	// surface_decisions (hub#221): shape-only enforcement, mirroring
+	// testing_surface. Present items must each carry a usable surface and a
+	// keep|retire decision; a retire should carry its reason (warn, not
+	// fail — the reason lives loud in `bais goal` output either way).
+	// Missing/empty is grandfathered (see GOAL_REQUIRED_FIELDS note) so
+	// pre-221 goals stay green.
+	const dec221 = extractGoalList(src, "surface_decisions");
+	if (dec221.found && dec221.items.length > 0) {
+		const parsed = dec221.items.map(parseSurfaceDecisionItem);
+		const bad = dec221.items.filter((_, i) => parsed[i] === null);
+		if (bad.length > 0) {
+			errors.push(
+				`invalid goal.toml: "surface_decisions" items need a usable surface and a keep|retire decision (got ${JSON.stringify(bad)})`,
+			);
+		}
+		parsed.forEach((c, i) => {
+			if (c !== null && c.decision === "retire" && c.reason.trim() === "") {
+				warns.push(`"surface_decisions"[${i}] retires ${JSON.stringify(c.surface)} without a recorded reason — retirements are never silent`);
+			}
+		});
 	}
 
 	const style = extractGoalString(src, "style");
@@ -3039,6 +3181,105 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 		"switch on a goal loaded from goal.toml re-derives surfaces + snapshot id",
 	);
 
+	// hub#221: keep/retire-surface decisions applied to case files. The
+	// committed campaign (commit184) carries two sketched surfaces; decisions
+	// resolve by surface text or case id, record into the ledger, and apply
+	// physically (keep = rebind to the live snapshot, retire = marker line).
+	const keep221 = recordSurfaceDecision(commit184, {
+		target: "bais list shows open issues",
+		decision: "keep",
+		snapshot: "goal-snapshot-0000000000aa",
+	});
+	check(
+		keep221.case === "bais-list-shows-open-issues" && keep221.decision === "keep" && keep221.snapshot === "goal-snapshot-0000000000aa",
+		`keep records the resolved case + live snapshot (got ${JSON.stringify(keep221)})`,
+	);
+	const keepByCase221 = resolveSurfaceTarget(commit184, "bais-ready-orders-by-severity");
+	check(
+		keepByCase221.surface === "bais ready orders by severity",
+		`targets resolve by case id as well as surface text (got ${JSON.stringify(keepByCase221)})`,
+	);
+	// After a switch the new campaign may not declare the old surfaces —
+	// the case files on disk stay decidable via their headers.
+	const switched221 = switchGoal(commit184, "v2 without the old surfaces");
+	useDefaults(switched221.fresh);
+	const diskFiles221 = [...files184.keys()]
+		.filter((p) => p.startsWith("e2e/"))
+		.map((p) => ({ case: p.slice(4, -4), ...parseE2eCaseHeader(files184.get(p)) }));
+	const oldViaDisk221 = resolveSurfaceTarget(switched221.fresh, "bais-list-shows-open-issues", { files: diskFiles221 });
+	check(
+		oldViaDisk221.surface === "bais list shows open issues",
+		`switched-away surface resolves via the case file on disk (got ${JSON.stringify(oldViaDisk221)})`,
+	);
+	const rebound221 = rebindE2eSnapshot(files184.get("e2e/bais-list-shows-open-issues.mjs"), "goal-snapshot-0000000000aa");
+	check(
+		rebound221.includes("// goal snapshot: goal-snapshot-0000000000aa") && !rebound221.includes(commit184.goal_snapshot),
+		"recorded keep applies to the case file via rebind to the live snapshot",
+	);
+	// A second decision for the same surface refuses loud naming it (bi#55).
+	let redecided221 = "";
+	try {
+		recordSurfaceDecision(commit184, { target: "bais-list-shows-open-issues", decision: "retire", reason: "changed mind" });
+	} catch (e) {
+		redecided221 = String(e && e.message);
+	}
+	check(
+		redecided221.includes("already decided") && redecided221.includes("bais list shows open issues"),
+		`already-decided surface decision refuses loud naming the surface (got ${JSON.stringify(redecided221)})`,
+	);
+	// Unknown targets and reasonless retires refuse loud; the ledger is
+	// untouched by refused decisions.
+	let unknown221 = "";
+	try {
+		recordSurfaceDecision(commit184, { target: "no such surface", decision: "keep" });
+	} catch (e) {
+		unknown221 = String(e && e.message);
+	}
+	check(unknown221.includes("unknown surface"), `unknown surface target refuses loud (got ${JSON.stringify(unknown221)})`);
+	let reasonless221 = "";
+	try {
+		recordSurfaceDecision(commit184, { target: "bais ready orders by severity", decision: "retire" });
+	} catch (e) {
+		reasonless221 = String(e && e.message);
+	}
+	check(reasonless221.includes("--reason"), `reasonless retire refuses loud (got ${JSON.stringify(reasonless221)})`);
+	check(surfaceDecisionsOf(commit184).length === 1, "refused decisions leave the ledger untouched");
+	// The retire records with its reason and marks the case file; the anchor
+	// header survives so the coverage join still resolves the case.
+	const retire221 = recordSurfaceDecision(commit184, {
+		target: "bais-ready-orders-by-severity",
+		decision: "retire",
+		reason: "goal moved off the ready view",
+	});
+	check(
+		retire221.decision === "retire" && retire221.reason === "goal moved off the ready view",
+		`retire records with its reason (got ${JSON.stringify(retire221)})`,
+	);
+	const marked221 = markSurfaceRetired(files184.get("e2e/bais-ready-orders-by-severity.mjs"), retire221.reason);
+	check(
+		marked221.includes("// surface retired: goal moved off the ready view") && marked221.includes("// goal anchor:"),
+		"retire marks the case file without touching the anchor header",
+	);
+	check(
+		markSurfaceRetired(marked221, "other reason").split("\n").filter((l) => l.startsWith("// surface retired:")).length === 1,
+		"retire marker application is idempotent (replace, never duplicate)",
+	);
+	// The ledger round-trips through goal.toml; a hand-corrupted ledger
+	// fails the file gate naming surface_decisions.
+	const back221 = parseGoalToml(renderGoalToml(commit184));
+	check(
+		JSON.stringify(back221.surface_decisions) === JSON.stringify(surfaceDecisionsOf(commit184)),
+		"surface_decisions round-trip through goal.toml",
+	);
+	const badLedger221 = validateGoal(
+		`[goal]\nstatement = "x"\nstyle = "plain"\nhero = "plain"\ndone_criteria = ["a"]\nsurface_decisions = [{ surface = "s", case = "c", decision = "maybe", reason = "", snapshot = "" }]\n`,
+		{ knownStyles: ["plain"], knownHeroes: ["plain"] },
+	);
+	check(
+		badLedger221.ok === false && badLedger221.errors.some((e) => e.includes("surface_decisions")),
+		`corrupt surface_decisions ledger fails naming the field (errors: ${JSON.stringify(badLedger221.errors)})`,
+	);
+
 	process.exit(failures ? 1 : 0);
 }
 
@@ -3218,4 +3459,27 @@ function parseGoalSurfaceSpecItem(item) {
 		}
 	}
 	return { facet: "", spec: "", malformed: true };
+}
+
+// File-level surface-decision item (hub#221): inline tables need a surface
+// and a keep|retire decision; anything else is not a decision. Mirrors
+// parseGoalSurfaceSpecItem.
+function parseSurfaceDecisionItem(item) {
+	const t = String(item).trim();
+	if (t === "") return null;
+	if (!t.startsWith("{")) return null;
+	const str = (name) => {
+		const m = t.match(new RegExp(`${name} *= *("(?:[^"\\\\]|\\\\.)*")`));
+		if (!m) return "";
+		try {
+			return JSON.parse(m[1]);
+		} catch {
+			return "";
+		}
+	};
+	const decision = str("decision");
+	if (decision !== "keep" && decision !== "retire") return null;
+	const surface = str("surface");
+	if (surface.trim() === "") return null;
+	return { surface, case: str("case"), decision, reason: str("reason"), snapshot: str("snapshot") };
 }

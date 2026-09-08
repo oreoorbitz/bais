@@ -15,6 +15,12 @@ style = "plain"
 hero = "plain"
 non_goals = ["backlog-wide campaigns"]
 done_criteria = [{ text = "sketch refused while open", done = false }]
+testing_surface = [{ surface = "bais list shows open issues", exercise = "run: bais list --json => exit 0 (facets: cli output shape)" }]
+surface_spec = [{ facet = "cli output shape", spec = "TSV rows + --json envelopes per SPEC.md" }]
+contract = [{ field = "outcome", text = "..." }]  # all five fields: outcome, verification, constraints, boundaries, stop_when
+goal_snapshot = "goal-snapshot-a071da2aceaa"
+approved_sketch_hash = "sha256:<hex of the approved sketch.toml>"
+surface_decisions = [{ surface = "...", case = "<slug>", decision = "keep|retire", reason = "<retire reason>", snapshot = "<live snapshot for keep>" }]
 
 [interview.users]
 status = "filled"   # open | filled | waived | defaulted
@@ -29,6 +35,25 @@ value = "solo dev"
 - `style`: working style for the campaign.
 - `hero`: the node the sketch's criterion nodes depend on (defaults to
   the style answer; the sketch falls back to the statement).
+- `testing_surface` / `surface_spec` / `contract`: the file-level lists
+  backing the `testing-surface`, `surface-spec`, and `contract`
+  interview boxes (inline tables; missing/empty is grandfathered for
+  pre-surface/spec/contract goals).
+- `goal_snapshot` (hub#195): the campaign snapshot id stamped by
+  `commit()` (`goalSnapshotId` of the approved sketch.toml) and into
+  every e2e scaffold header (`// goal snapshot: <id>` — the campaign
+  version the case was authored under). Kept cases rebind explicitly to
+  the new snapshot id (`rebindE2eSnapshot`); cross-goal reuse without an
+  explicit keep decision flags as `e2e-snapshot-stale` in `bais check`.
+- `approved_sketch_hash` (hub#195): `sha256:<hex>` of the exact
+  sketch.toml bytes `commit()` wrote. Post-approval sketch edits flag
+  loud as `goal-sketch-stale` in `bais check` (`verifyApprovedSketch`);
+  a goal.toml without the hash is grandfathered (pre-195 campaigns).
+- `surface_decisions` (hub#221): the recorded keep/retire ledger,
+  written only by `bais goal keep-surface` / `retire-surface`, rendered
+  only when non-empty. `bais check` suppresses the retired surfaces'
+  gap/stale/snapshot rows and prints a `surface-retired` line with the
+  reason instead.
 - `[interview.<box>]`: per-box scoping state so the interview can resume.
 
 ## Scoping interview
@@ -57,4 +82,10 @@ style, acceptance, non-goals`. Rules:
 - `status` tracks acceptance: `{ done, total, open[], checklist, sketched }`.
 - `switch` (restructure flow) archives the old campaign, starts a fresh
   interview for the new statement, and lists prior sketch node ids for
-  the human to retire.
+  the human to retire. Old testing-surface items list as undecided +
+  flagged for an explicit keep/retire decision.
+- `keep-surface <surface|case>` (hub#221) records a keep decision and
+  rebinds the case file to the live campaign snapshot; `retire-surface
+  <surface|case> --reason <R>` records a retire decision and marks the
+  case file. A second decision for the same surface refuses loud
+  (bi#55); `bais check` stops flagging decided surfaces.

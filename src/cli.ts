@@ -54,6 +54,8 @@ Usage:
   bais dispatch --agents N [--json] [--briefs]  # dry-run swarm pack: load-bearing first (bi#123), never mutates
                                 # carries as_of + completeness from the store
   bais goal <start|sketch|commit|status|switch> [--approve]  # per-directory campaign interview (bi#132)
+  bais goal keep-surface <surface|case>          # rebind the case file to the live snapshot (hub#221)
+  bais goal retire-surface <surface|case> --reason <R>  # mark the case file, ledger the retire; check stops flagging (hub#221)
   bais goal e2e [--json]                  # surface/case coverage join: ok/missing/stale rows (hub#191);
                                 # exits 1 when any surface lacks a case or any case is stale
   bais goal gate [--json]                 # deterministic gates first (baml check/test + e2e scaffolds),
@@ -858,6 +860,27 @@ if (cmd === "check") {
 	// silent; the phase line always names the rollout state.
 	const goalText = existsSync(join(root, "goal.toml")) ? readFileSync(join(root, "goal.toml"), "utf8") : "";
 	const e2eDrift = e2eDriftJoin(parseGoalTestingSurface(goalText), e2eCaseAnchorsIn(e2eDir));
+	// hub#221: decided surfaces stop flagging. Retired surfaces (ledger in
+	// goal.toml via `bais goal retire-surface --reason`) suppress their
+	// gap/stale/snapshot rows — decided, never silently absent; a
+	// surface-retired line names each one with its reason. Kept surfaces
+	// need no suppression: the rebind moves the case header onto the live
+	// snapshot, so the drift join clears on its own.
+	const retired221: { surfaces: string[]; cases: string[]; reasons: Map<string, string> } = { surfaces: [], cases: [], reasons: new Map() };
+	try {
+		const gm221 = await loadGoalModule();
+		for (const d of gm221.surfaceDecisionsOf(gm221.parseGoalToml(goalText))) {
+			if (d?.decision === "retire" && typeof d?.surface === "string" && d.surface !== "") {
+				retired221.surfaces.push(d.surface);
+				if (typeof d?.case === "string" && d.case !== "") retired221.cases.push(d.case);
+				retired221.reasons.set(d.surface, typeof d?.reason === "string" ? d.reason : "");
+			}
+		}
+	} catch {}
+	if (retired221.surfaces.length > 0) {
+		e2eDrift.gaps = e2eDrift.gaps.filter((g) => !retired221.surfaces.includes(g.surface));
+		e2eDrift.stale = e2eDrift.stale.filter((s) => !retired221.cases.includes(String(s.file ?? "").replace(/\.mjs$/, "")));
+	}
 	const e2eDriftFatal = e2ePhase === "fail" ? e2eDrift.gaps.length + e2eDrift.stale.length : 0;
 	const printE2eDrift = (): void => {
 		for (const g of e2eDrift.gaps) {
@@ -865,6 +888,9 @@ if (cmd === "check") {
 		}
 		for (const s of e2eDrift.stale) {
 			console.log(`e2e-stale\t${s.file}\tgoal anchor ${s.anchor ?? "(none embedded)"} matches no declared testing_surface item — the surface was edited or renamed without touching the case (hub#191)`);
+		}
+		for (const s of retired221.surfaces) {
+			console.log(`surface-retired\t${s}\t${retired221.reasons.get(s) ?? ""} — decided via \`bais goal retire-surface\`, no longer flagged (hub#221)`);
 		}
 		console.log(
 			`e2e-phase\t${e2ePhase}\t${e2ePhase === "warn" ? "advisory — --e2e-strict flips to fail (hub#188/hub#191)" : "strict — unresolvable-e2e, e2e-gap and e2e-stale are fatal (hub#188/hub#191)"}`,
@@ -942,7 +968,11 @@ if (cmd === "check") {
 			return [];
 		}
 	})();
-	const snapshotDrift195 = lm195.e2eSnapshotDrift({ goalSnapshot: goalSnapshot195, cases: e2eCaseFiles195 });
+	// hub#221: retired surfaces suppress their snapshot rows alongside the
+	// hub#191 gap/stale rows above (retired221 computed at the e2e join).
+	const snapshotDrift195 = lm195
+		.e2eSnapshotDrift({ goalSnapshot: goalSnapshot195, cases: e2eCaseFiles195 })
+		.filter((r: any) => !retired221.cases.includes(String(r.file ?? "").replace(/\.mjs$/, "")));
 	const snapshotDriftFatal = e2ePhase === "fail" ? snapshotDrift195.length : 0;
 	const printSketchStale = (): void => {
 		if (!sketchStale.ok) console.log(`goal-sketch-stale\t${sketchStale.error}`);
@@ -1887,7 +1917,7 @@ if (cmd === "goal") {
 	const gm = await loadGoalModule();
 	const goalFile = join(root, "goal.toml");
 	const verb = argv[1];
-	const usage = `bais goal <start|sketch|commit|status|switch|snapshot|clear|retire|gate|e2e|baseline> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding; gate is hub#213; e2e is the hub#191 surface/case coverage join; baseline is the hub#219 layer-drift audit activation)`;
+	const usage = `bais goal <start|sketch|commit|status|switch|keep-surface|retire-surface|snapshot|clear|retire|gate|e2e|baseline> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding; gate is hub#213; e2e is the hub#191 surface/case coverage join; baseline is the hub#219 layer-drift audit activation; keep-surface|retire-surface apply recorded surface decisions to case files, hub#221)`;
 	const loadGoal = (): any => {
 		if (!existsSync(goalFile)) {
 			console.error(`bais goal: no campaign at ${goalFile} — run \`bais goal start "<statement>"\` first`);
@@ -2049,6 +2079,85 @@ if (cmd === "goal") {
 			if (res.archived.surface_spec) console.log(`surface-spec-default\t${res.archived.surface_spec}`);
 		}
 		await runInterview(res.fresh); // restructure flow ends in a fresh interview
+	} else if (verb === "keep-surface" || verb === "retire-surface") {
+		// hub#221: apply a recorded surface decision to the case files on
+		// disk. Decision semantics live ONLY in goal.mjs
+		// (recordSurfaceDecision/resolveSurfaceTarget/rebindE2eSnapshot/
+		// markSurfaceRetired) — this block routes argv, touches the
+		// filesystem, and renders; it never mirrors decision rules.
+		// keep rebinds the case file to the live campaign snapshot (check
+		// stops flagging it); retire marks the case file with the reason and
+		// records the ledger entry check suppresses. A second decision for
+		// the same surface refuses loud (bi#55).
+		const target = argv[2];
+		if (!target || target.startsWith("--")) {
+			console.error(`bais goal ${verb} needs "<surface|case>"${verb === "retire-surface" ? " --reason <R>" : ""}`);
+			process.exit(1);
+		}
+		const g = loadGoal();
+		const e2eDir = e2eDirFor(issuesDir);
+		// The decidable set is the live goal's surfaces PLUS the case files
+		// on disk (a switched campaign may not declare the old surfaces —
+		// the files are still decidable, hub#221). Header shapes live in
+		// goal.mjs (parseE2eCaseHeader); this only reads files.
+		const caseFiles: { case: string; surface: string; snapshot: string }[] = [];
+		try {
+			for (const f of readdirSync(e2eDir).filter((f) => f.endsWith(".mjs")).sort()) {
+				try {
+					const h = gm.parseE2eCaseHeader(readFileSync(join(e2eDir, f), "utf8"));
+					caseFiles.push({ case: f.slice(0, -4), surface: h.surface ?? "", snapshot: h.snapshot ?? "" });
+				} catch {}
+			}
+		} catch {}
+		if (verb === "retire-surface") {
+			const reason = flagVal("--reason");
+			if (!reason) {
+				console.error("bais goal retire-surface refused: --reason is mandatory (retirements are never silent)");
+				process.exit(1);
+			}
+			let rec: any;
+			try {
+				rec = gm.recordSurfaceDecision(g, { target, decision: "retire", reason, files: caseFiles });
+			} catch (e: any) {
+				console.error(`bais goal retire-surface refused: ${e?.message ?? e}`);
+				process.exit(1);
+			}
+			const file = join(e2eDir, `${rec.case}.mjs`);
+			const marked = existsSync(file);
+			if (marked) writeFileSync(file, gm.markSurfaceRetired(readFileSync(file, "utf8"), rec.reason));
+			saveGoal(g);
+			if (asJson) printJson({ ok: true, decision: rec, file: marked ? file : null });
+			else console.log(`retired\t${rec.surface}\t${rec.reason}${marked ? "" : " (no case file on disk — ledger recorded, check suppresses the surface)"}`);
+		} else {
+			const live = g.goal_snapshot ?? "";
+			if (!live) {
+				console.error("bais goal keep-surface refused: no campaign snapshot — run `bais goal commit --approve` first (hub#195)");
+				process.exit(1);
+			}
+			let resolved: any;
+			try {
+				resolved = gm.resolveSurfaceTarget(g, target, { files: caseFiles });
+			} catch (e: any) {
+				console.error(`bais goal keep-surface refused: ${e?.message ?? e}`);
+				process.exit(1);
+			}
+			const file = join(e2eDir, `${resolved.case}.mjs`);
+			if (!existsSync(file)) {
+				console.error(`bais goal keep-surface refused: no case file ${file} — the surface has nothing to rebind (commit first)`);
+				process.exit(1);
+			}
+			let rec: any;
+			try {
+				rec = gm.recordSurfaceDecision(g, { target, decision: "keep", snapshot: live, files: caseFiles });
+			} catch (e: any) {
+				console.error(`bais goal keep-surface refused: ${e?.message ?? e}`);
+				process.exit(1);
+			}
+			writeFileSync(file, gm.rebindE2eSnapshot(readFileSync(file, "utf8"), live));
+			saveGoal(g);
+			if (asJson) printJson({ ok: true, decision: rec, file });
+			else console.log(`kept\t${rec.surface}\trebound to ${live}`);
+		}
 	} else if (verb === "snapshot") {
 		// bi#136: snapshot-first precondition for `goal clear`. Captures the
 		// live statement + issue id set; `clear` refuses unless the snapshot
