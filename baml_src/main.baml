@@ -87,21 +87,17 @@ function is_blocked(issue: Issue, edges: Edge[], issues: Issue[]) -> bool {
     false
 }
 
-function ready_issues(issues: Issue[], edges: Edge[]) -> Issue[] {
-    issues.filter((issue) -> {
-        issue.status == Status.Open && !is_blocked(issue, edges, issues)
-    })
-}
-
 // Epic policy (derived, never stored): an issue is an epic iff at least
 // one SubtaskOf edge points at it. Direction: the edge runs from the
 // subtask (child) to the epic (parent) — `from` does the work, `to`
 // coordinates it. Doing-claims consult is_epic (epic + footprint gate,
 // bais/src/cli.ts + bi/src/bais.ts) and route around epics instead of
-// reading "(epic)" prose in titles; ready/dispatch exclusion is a
-// follow-up (dispatch still packs epics with a scope warning). A big
-// task with no subtasks is not an epic; an epic whose subtasks all
-// close stays an epic (Done needs Evidence like any other Done).
+// reading "(epic)" prose in titles; ready/dispatch consult is_epic too
+// (hub#223) — epics leave the ready set and dispatch withholds them with
+// a named reason (dispatch_epic_withheld), mirroring the hub#175
+// unknown-footprint lane. A big task with no subtasks is not an epic;
+// an epic whose subtasks all close stays an epic (Done needs Evidence
+// like any other Done).
 function is_epic(issue: Issue, edges: Edge[]) -> bool {
     edges.some((e) -> {
         e.to == issue.id && e.kind == EdgeKind.SubtaskOf
@@ -117,6 +113,14 @@ function epic_children(epic: Issue, edges: Edge[]) -> string[] {
         .map((e) -> {
             e.from
         })
+}
+
+function ready_issues(issues: Issue[], edges: Edge[]) -> Issue[] {
+    issues.filter((issue) -> {
+        // Epics coordinate from outside the pack, never inside it (hub#223):
+        // an Open epic is not work, so it never reads as ready.
+        issue.status == Status.Open && !is_blocked(issue, edges, issues) && !is_epic(issue, edges)
+    })
 }
 
 test "epic is derived from inbound subtask edges" {
@@ -1325,6 +1329,13 @@ test "severity stays 2 while cost crosses its cap: urgency rises, hatch untouche
 // Leases arrive as plain IssueLease data, not via ns_event: namespaces do not
 // import each other, and the host's leases table already materializes what
 // current_lease derives. The scan path (no store, no leases) passes [].
+//
+// Epics are out of scope here by design (hub#223): an Open epic leaves the
+// ready set via ready_issues but carries no WhyNot — there is no edge, lease,
+// or cycle to name, and WhyNotKind grows only where the CLI can render it.
+// The epic omission is diagnosed via is_epic / dispatch_epic_withheld, the
+// same split as a DependsOn-only cycle (both stay ready there, so `check`
+// stays the diagnosis).
 enum WhyNotKind {
     BlockedBy,
     DanglingRef,
@@ -1929,6 +1940,104 @@ test "dispatch is empty on zero budget or fully leased backlog" {
     assert.equal(dispatch_pack(issues, [], [], [], 0).length(), 0);
     assert.equal(dispatch_pack(issues, [], ["t#01"], [], 4).length(), 0);
     assert.equal(dispatch_pack([], [], [], [], 4).length(), 0)
+}
+
+// ── Epic exclusion from work queues (hub#223) ─────────────────────────────
+// An epic in a work queue is a mistargeted agent: the Doing-claim gate
+// catches it late (at claim time) instead of never offering it. So epics
+// leave the ready set and dispatch withholds them with a named reason,
+// mirroring the hub#175 unknown-footprint lane. The reason is a constant —
+// BAML `+` is numeric-only, so no composed message; the host names the
+// coordinated children beside it (graph.ts epicWithheldIn).
+class EpicHold {
+    issue_id: string,
+    reason: string @description("epic_hold_reason() — constant, never composed"),
+}
+
+function epic_hold_reason() -> string {
+    "epic: coordinates subtasks from outside the pack; claim a child instead"
+}
+
+// Every Open + unblocked + unleased epic: the pack seats everything else,
+// this names what the exclusion cost. Blocked/leased epics are out for
+// those reasons (why-not BlockedBy / --json leased), never double-counted
+// here.
+function dispatch_epic_withheld(issues: Issue[], edges: Edge[], leased: string[]) -> EpicHold[] {
+    let out: EpicHold[] = [];
+    for (let issue in issues) {
+        if (
+            issue.status == Status.Open
+                && !is_blocked(issue, edges, issues)
+                && !contains_id(leased, issue.id)
+                && is_epic(issue, edges)
+        ) {
+            out.push(EpicHold { issue_id: issue.id, reason: epic_hold_reason() });
+        }
+    }
+    out
+}
+
+test "ready excludes epics but keeps their children" {
+    let epic = mk_issue("bi#189", Status.Open);
+    let c1 = mk_issue("bi#192", Status.Open);
+    let c2 = mk_issue("bi#193", Status.Open);
+    let edges = [
+        Edge { from: "bi#192", to: "bi#189", kind: EdgeKind.SubtaskOf },
+        Edge { from: "bi#193", to: "bi#189", kind: EdgeKind.SubtaskOf },
+    ];
+    let ready = ready_issues([epic, c1, c2], edges);
+    assert.equal(ready.length(), 2);
+    assert.equal(ready[0].id, "bi#192");
+    assert.equal(ready[1].id, "bi#193")
+}
+
+test "dispatch seats leaves only and names the epic withheld with reason" {
+    let epic = mk_issue("bi#189", Status.Open);
+    let c1 = mk_issue("bi#192", Status.Open);
+    let c2 = mk_issue("bi#193", Status.Open);
+    let lone = mk_issue("bi#99", Status.Open);
+    let edges = [
+        Edge { from: "bi#192", to: "bi#189", kind: EdgeKind.SubtaskOf },
+        Edge { from: "bi#193", to: "bi#189", kind: EdgeKind.SubtaskOf },
+    ];
+    let issues = [epic, c1, c2, lone];
+    let slots = dispatch_pack(issues, edges, [], [], 4);
+    assert.equal(slots.length(), 3);
+    assert.equal(slot_issue(slots, 0), "bi#192");
+    assert.equal(slot_issue(slots, 1), "bi#193");
+    assert.equal(slot_issue(slots, 2), "bi#99");
+    let held = dispatch_epic_withheld(issues, edges, []);
+    assert.equal(held.length(), 1);
+    assert.equal(held[0].issue_id, "bi#189");
+    assert.equal(held[0].reason, epic_hold_reason())
+}
+
+test "epic withheld skips blocked, leased, and non-Open epics" {
+    let open_epic = mk_issue("bi#189", Status.Open);
+    let child = mk_issue("bi#192", Status.Open);
+    let blocked_epic = mk_issue("bi#26", Status.Open);
+    let blocker = mk_issue("bi#01", Status.Open);
+    let leased_epic = mk_issue("bi#40", Status.Open);
+    let done_epic = mk_issue("bi#41", Status.Done);
+    let edges = [
+        Edge { from: "bi#192", to: "bi#189", kind: EdgeKind.SubtaskOf },
+        Edge { from: "bi#01", to: "bi#26", kind: EdgeKind.Blocks },
+        Edge { from: "bi#27", to: "bi#26", kind: EdgeKind.SubtaskOf },
+        Edge { from: "bi#42", to: "bi#40", kind: EdgeKind.SubtaskOf },
+        Edge { from: "bi#43", to: "bi#41", kind: EdgeKind.SubtaskOf },
+    ];
+    let issues = [open_epic, child, blocked_epic, blocker, leased_epic, done_epic];
+    // The blocked epic is out behind its blocker, the leased one behind its
+    // claim, the Done one is finished — only the plain Open epic is withheld
+    // for being an epic.
+    let held = dispatch_epic_withheld(issues, edges, ["bi#40"]);
+    assert.equal(held.length(), 1);
+    assert.equal(held[0].issue_id, "bi#189");
+    // And the pack still seats the non-epic work around all of them.
+    let slots = dispatch_pack(issues, edges, ["bi#40"], [], 4);
+    assert.equal(slots.length(), 2);
+    assert.equal(slot_issue(slots, 0), "bi#01");
+    assert.equal(slot_issue(slots, 1), "bi#192")
 }
 
 test "parse_file_claims reads Files lines, strips comments, unions" {

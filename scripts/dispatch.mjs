@@ -780,6 +780,95 @@ radius = []
 	);
 }
 
+// 17. hub#223: epics leave the ready set and dispatch withholds them with
+// a named reason (BAML-first: is_epic consults in ready_issues +
+// dispatch_epic_withheld/epic_hold_reason in bais/baml_src/main.baml;
+// host mirror: readyIssues/dispatchPack/epicWithheldIn/warnEpicWithheld in
+// bais/src/graph.ts). An epic in a work queue is a mistargeted agent — the
+// Doing-claim gate caught it late (at claim time) instead of never offering
+// it. Fixtures use the live derived-epic ids (bi#189 + children bi#192,
+// bi#193) so the shape matches the real board, plus a bi#26-style second
+// epic for the plural lane.
+//
+// Red-check 2026-09-08 (bi#57, observed live): with the host exclusion
+// neutered (the `&& !isEpic(f.issue.id, edges)` conjunct of readyIssues in
+// bais/src/graph.ts dropped + rebuild), the suite failed LOUD with 7
+// failure(s) FOR THE RIGHT REASON —
+//   FAIL: epic leaves the pack, leaves seat (["bi#189","bi#192","bi#193","bi#99"])
+//   FAIL: epic holds no slot
+//   FAIL: withheld epic counts unfilled (0)
+//   FAIL: epic leaves ready, children stay (["bi#189","bi#192","bi#193","bi#99"])
+//   FAIL: pure readyIssues drops the epic (["bi#189","bi#192","bi#193","bi#99"])
+//   FAIL: pure dispatchPack seats leaves only (["bi#189","bi#192","bi#193","bi#99"])
+//   FAIL: live pack never seats an Open epic (["bi#26","bi#119","bi#189","bi#192"])
+// — the epic seats slot0 everywhere (bi#26 holds the live slot0 again, the
+// hub#223 bug reproduced). Restored cmp-identical, rebuilt, green. The
+// BAML-side twin: neutering `&& !is_epic(issue, edges)` in ready_issues
+// fails exactly the 3 hub#223 baml tests (`ready excludes epics but keeps
+// their children`: left = 3, right = 2, and the two dispatch twins off by
+// one) — restored cmp-identical. An epic exclusion that cannot go red on a
+// seated epic is camouflage, not coverage.
+//
+// FOLLOW-UPS (out of lane, recorded in hub#223 handoff): the bi host mirror
+// (bi/src/bais.ts filterReadyIssues/dispatchPack) still seats epics; the
+// store projection (bais/src/store.ts storeReady) still lists them, so
+// cross-check §3 goes red on Open epics until that lane lands; the raw
+// dispatch --json/--human CLI names no epic warning line (cli.ts untouched
+// — warnEpicWithheld waits for its call site).
+{
+	const graph = await import("../dist/src/graph.js");
+	const epicFix = [
+		["bi#189.toml", issue("bi#189", "epic", "Open", [], "", "epic.ts")],
+		["bi#192.toml", issue("bi#192", "child one", "Open", [["bi#192", "bi#189", "SubtaskOf"]], "", "c192.ts")],
+		["bi#193.toml", issue("bi#193", "child two", "Open", [["bi#193", "bi#189", "SubtaskOf"]], "", "c193.ts")],
+		["bi#99.toml", issue("bi#99", "lone", "Open", [], "", "lone.ts")],
+	];
+	const dE = mkfix(epicFix);
+	const runH17 = (dir, args) => {
+		const r = spawnSync("node", [CLI, ...args], { cwd: dir, encoding: "utf8", timeout: 60000 });
+		return { code: r.status ?? -1, out: r.stdout ?? "", err: r.stderr ?? "" };
+	};
+	const jE = JSON.parse(run(dE, ["dispatch", "--agents", "4", "--json"]).out);
+	const slotIds = jE.slots.map((s) => s.issue.id);
+	check(jE.slots.length === 3 && JSON.stringify(slotIds) === '["bi#192","bi#193","bi#99"]', `epic leaves the pack, leaves seat (${JSON.stringify(slotIds)})`);
+	check(!slotIds.includes("bi#189"), `epic holds no slot`);
+	check(jE.unfilled === 1, `withheld epic counts unfilled (${jE.unfilled})`);
+	const hE = runH17(dE, ["dispatch", "--agents", "4"]);
+	check(hE.code === 0, `epic pack human mode exits 0 (valid work)`);
+	const rE = JSON.parse(run(dE, ["ready", "--json"]).out).ready.map((f) => f.issue.id);
+	check(!rE.includes("bi#189") && rE.includes("bi#192") && rE.includes("bi#193"), `epic leaves ready, children stay (${JSON.stringify(rE)})`);
+	// Pure-mirror pins against dist (same lockstep as mirror-parity.mjs).
+	// Bodies carry Files: lines (declared footprints): bare bodies read as
+	// unknown and the hub#175 lane would keep only the first — that lane is
+	// §13/§14 territory, not this section's.
+	const F = (id, status, edges = [], file = `${id.replace("#", "")}.ts`) => ({ issue: { id, title: id, status, kind: "Feat", area: null, severity: null, source: null, body: `work\nFiles: ${file}\n` }, edges: edges.map((e) => ({ from: e[0], to: e[1], kind: e[2] })), holder: null, lease: null });
+	const sub = [["bi#192", "bi#189", "SubtaskOf"], ["bi#193", "bi#189", "SubtaskOf"]];
+	const pureAll = [F("bi#189", "Open"), F("bi#192", "Open", [sub[0]]), F("bi#193", "Open", [sub[1]]), F("bi#99", "Open")];
+	const pureFp = new Map(pureAll.map((f) => [f.issue.id, graph.parseFileClaims(f.issue.body)]));
+	check(graph.isEpic("bi#189", pureAll.flatMap((f) => f.edges)) === true && graph.isEpic("bi#192", pureAll.flatMap((f) => f.edges)) === false, `pure isEpic derives the epic, not the child`);
+	check(JSON.stringify(graph.readyIssues(pureAll).map((f) => f.issue.id)) === '["bi#192","bi#193","bi#99"]', `pure readyIssues drops the epic (${JSON.stringify(graph.readyIssues(pureAll).map((f) => f.issue.id))})`);
+	check(JSON.stringify(graph.dispatchPack(pureAll, [], pureFp, 4).map((s) => s.issue_id)) === '["bi#192","bi#193","bi#99"]', `pure dispatchPack seats leaves only (${JSON.stringify(graph.dispatchPack(pureAll, [], pureFp, 4).map((s) => s.issue_id))})`);
+	const held = graph.epicWithheldIn(pureAll, []);
+	check(held.length === 1 && held[0].issue_id === "bi#189" && held[0].reason === "epic" && JSON.stringify(held[0].children) === '["bi#192","bi#193"]', `pure withheld names the epic, its children, its reason (${JSON.stringify(held)})`);
+	check(graph.warnEpicWithheld(["bi#189"]) === "[bais] epic withheld from swipe pack: bi#189 (coordinates subtasks from outside the pack — claim a child instead per hub#223)", `epic warn format exact`);
+	check(graph.warnEpicWithheld(["bi#189", "bi#26"]) === "[bais] epics withheld from swipe pack: bi#189, bi#26 (coordinates subtasks from outside the pack — claim a child instead per hub#223)", `epic warn plural format exact`);
+	// Blocked/leased epics are out for those reasons, never double-counted.
+	const mixed = [
+		F("bi#189", "Open"),
+		F("bi#192", "Open", [sub[0]]),
+		F("bi#26", "Open", [["bi#01", "bi#26", "Blocks"], ["bi#27", "bi#26", "SubtaskOf"]]),
+		F("bi#01", "Open"),
+	];
+	check(JSON.stringify(graph.epicWithheldIn(mixed, []).map((h) => h.issue_id)) === '["bi#189"]', `blocked epic not double-counted as withheld`);
+	check(JSON.stringify(graph.epicWithheldIn(mixed, ["bi#189"]).map((h) => h.issue_id)) === '[]', `leased epic not double-counted as withheld`);
+	// Live hub structural (no pins — robust to backlog evolution): no slot
+	// seats an Open epic. bi#26 + bi#189 are Open epics today; if either
+	// closes the check still holds (a Done issue never dispatches).
+	const live = JSON.parse(run("/Users/adrian/code/orion/orion-learn-baml", ["dispatch", "--agents", "4", "--json"]).out);
+	const liveSlots = live.slots.map((s) => s.issue.id);
+	check(!liveSlots.includes("bi#26") && !liveSlots.includes("bi#189"), `live pack never seats an Open epic (${JSON.stringify(liveSlots)})`);
+}
+
 if (failures) {
 	console.error(`${failures} failure(s)`);
 	process.exit(1);

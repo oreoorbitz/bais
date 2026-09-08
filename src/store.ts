@@ -570,8 +570,9 @@ export function storeEdges(issuesDir: string): StoredEdge[] {
 
 // The one agent-dispatch query: Open, no live lease, no unclosed Blocks
 // predecessor — including dangling blockers (conservative, same rule as
-// is_blocked). Leases table is empty until Phase 3; the clause stays so the
-// query does not silently change shape when claims land.
+// is_blocked) — and no inbound SubtaskOf (epics coordinate from outside the
+// pack, hub#223/hub#225). Leases table is empty until Phase 3; the clause
+// stays so the query does not silently change shape when claims land.
 export function storeReady(issuesDir: string): { ready: StoredTask[]; as_of: AsOf; completeness: Completeness } {
 	const db = openDb(issuesDir);
 	try {
@@ -589,6 +590,10 @@ export function storeReady(issuesDir: string): { ready: StoredTask[]; as_of: AsO
              SELECT 1 FROM rels d
              WHERE d.target = t.entity AND d.type = 'Blocks'
                AND NOT EXISTS (SELECT 1 FROM tasks p2 WHERE p2.entity = d.source)
+           )
+           AND NOT EXISTS (
+             SELECT 1 FROM rels s
+             WHERE s.target = t.entity AND s.type = 'SubtaskOf'
            )`,
 			)
 			.all() as any[];

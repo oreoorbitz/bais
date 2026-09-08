@@ -63,11 +63,16 @@ export async function loadIssues(issuesDir: string): Promise<BaisLoad> {
 	return { issues, failures };
 }
 
-// Mirror of BAML ready_issues/is_blocked. Ready = Open, and no Blocks edge
-// points at it from an issue that is neither Done nor Dropped. A Blocks edge
-// naming an id we cannot see is unresolvable and blocks: we cannot prove the
-// blocker is closed, so we do not hand the node out as work. `check` reports
-// those so a typo is loud rather than parking an issue forever.
+// Mirror of BAML ready_issues/is_blocked/is_epic. Ready = Open, and no
+// Blocks edge points at it from an issue that is neither Done nor Dropped.
+// A Blocks edge naming an id we cannot see is unresolvable and blocks: we
+// cannot prove the blocker is closed, so we do not hand the node out as
+// work. `check` reports those so a typo is loud rather than parking an
+// issue forever. Epics (hub#223) never read as ready: they coordinate
+// subtasks from outside the pack, so offering one as work mistargets the
+// agent — the Doing-claim gate used to catch that late, at claim time.
+// RED-CHECK TARGET (bi#57): the `!isEpic(...)` conjunct below. Neutering it
+// seats epics again — dispatch.mjs §17 fails LOUD with the epic in a slot.
 export function readyIssues(all: BaisFile[]): BaisFile[] {
 	const byId = new Map(all.map((f) => [f.issue.id, f.issue]));
 	const blocked = new Set<string>();
@@ -80,7 +85,8 @@ export function readyIssues(all: BaisFile[]): BaisFile[] {
 			}
 		}
 	}
-	return all.filter((f) => f.issue.status === "Open" && !blocked.has(f.issue.id));
+	const edges = all.flatMap((f) => f.edges);
+	return all.filter((f) => f.issue.status === "Open" && !blocked.has(f.issue.id) && !isEpic(f.issue.id, edges));
 }
 
 // Mirror of BAML blast_radii (bi#122): per issue, the TRANSITIVE dependents
@@ -186,7 +192,8 @@ export function groupSwarmClaims(claims: { id: string; holder: string | null }[]
 }
 
 // Mirror of BAML dispatch_pack (bi#123): the workload-aware swarm pack as a
-// pure function. Candidates are ready (Open + unblocked) and unleased;
+// pure function. Candidates are ready (Open + unblocked + non-epic, hub#223)
+// and unleased;
 // greedy by open blast radius (ties: id ascending), skipping packed/leased
 // issues and file clashes with already-packed slots. `leased` is the
 // precomputed live-claim set (the host owns the clock); `footprints` maps
@@ -272,6 +279,44 @@ export function warnUnknownWithheld(ids: string[]): string {
 
 export function warnUnknownShared(unknownId: string, declaredIds: string[]): string {
 	return `[bais] unknown footprint ${unknownId} shares a swipe pack with declared ${[...declaredIds].map(String).join(", ")} (no Files: — confirm scope with the operator before writing)`;
+}
+
+// Mirror of BAML dispatch_epic_withheld/epic_hold_reason (hub#223): every
+// Open + unblocked + unleased epic is withheld from the pack with a named
+// reason, mirroring the hub#175 unknown-footprint lane. BAML `+` is
+// numeric-only so the BAML reason is a constant sentence; the host names
+// the coordinated children beside the machine slug. Blocked/leased epics
+// are out for those reasons (why-not BlockedBy / --json leased), never
+// double-counted here — same exclusion the BAML function applies.
+export type EpicHold = { issue_id: string; children: string[]; reason: "epic" };
+export function epicWithheldIn(all: BaisFile[], leased: string[] = []): EpicHold[] {
+	const byId = new Map(all.map((f) => [f.issue.id, f.issue]));
+	const edges = all.flatMap((f) => f.edges);
+	const blocked = new Set<string>();
+	for (const f of all) {
+		for (const e of f.edges) {
+			if (e.kind !== "Blocks") continue;
+			const blocker = byId.get(e.from);
+			if (!blocker || (blocker.status !== "Done" && blocker.status !== "Dropped")) {
+				blocked.add(e.to);
+			}
+		}
+	}
+	return all
+		.filter(
+			(f) =>
+				f.issue.status === "Open" &&
+				!blocked.has(f.issue.id) &&
+				!leased.includes(f.issue.id) &&
+				isEpic(f.issue.id, edges),
+		)
+		.map((f) => ({ issue_id: f.issue.id, children: epicChildren(f.issue.id, edges), reason: "epic" as const }));
+}
+
+export function warnEpicWithheld(ids: string[]): string {
+	const list = [...ids].map(String);
+	const noun = list.length === 1 ? "epic" : "epics";
+	return `[bais] ${noun} withheld from swipe pack: ${list.join(", ")} (coordinates subtasks from outside the pack — claim a child instead per hub#223)`;
 }
 
 export function dispatchPack(

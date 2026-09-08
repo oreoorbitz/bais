@@ -19,7 +19,7 @@ import { resolveHubDir } from "./resolve.js";
 function printJson(obj: unknown): void {
 	writeSync(1, JSON.stringify(obj, null, 2) + "\n");
 }
-import { baselineIssueFromSketch, blastRadii, closeEvidenceIn, creationDaysFromMtimes, cyclicIds, danglingRefsIn, declarationDistributionIn, dispatchPack, e2eCaseAnchorsIn, e2eDirFor, e2eDriftJoin, epicChildren, groupSwarmClaims, hashEvidenceIn, isDeclaredFootprint, isEpic, knownDrillNames, knownE2eStems, layerDriftIn, loadIssues, nowDays, parseFileClaims, parseGoalTestingSurface, parseSwarmVerdicts, precedesAncestors, projectName, radiusVsEvidenceIn, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
+import { baselineIssueFromSketch, blastRadii, closeEvidenceIn, creationDaysFromMtimes, cyclicIds, danglingRefsIn, declarationDistributionIn, dispatchPack, e2eCaseAnchorsIn, e2eDirFor, e2eDriftJoin, epicChildren, epicWithheldIn, groupSwarmClaims, hashEvidenceIn, isDeclaredFootprint, isEpic, knownDrillNames, knownE2eStems, layerDriftIn, loadIssues, nowDays, parseFileClaims, parseGoalTestingSurface, parseSwarmVerdicts, precedesAncestors, projectName, radiusVsEvidenceIn, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnEpicWithheld, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
 import { findShadowHubs, formatShadow } from "./fork.js";
 import type { BlastRadius, Urgency } from "./graph.js";
 import { parseBaisFile } from "./toml.js";
@@ -623,6 +623,9 @@ if (cmd === "dispatch") {
 	// hub#219: the foundation seating warns ride the same channels (stderr
 	// human/briefs, the warnings array in --json).
 	unknownWarnings.push(...foundationWarns);
+	// hub#225: epics leave the pack with a named reason — same channels.
+	const epicsWithheld = epicWithheldIn(issues, leased).map((h) => h.issue_id);
+	if (epicsWithheld.length) unknownWarnings.push(warnEpicWithheld(epicsWithheld));
 	// bi#125/bi#126: --briefs renders spawn briefs instead of slot rows;
 	// every mode carries unfilled + the loud partial-pack stderr line.
 	// hub#163: renderer is single-sourced (briefs.mjs) — no local mirror.
