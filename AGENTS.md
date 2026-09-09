@@ -1,29 +1,39 @@
 # AGENTS.md — bais
 
-> Read `../AGENTS.md` first — this file is the `bais` specialization.
+> Read `../AGENTS.md` first. BAIS is Basically A made-up Issue Standard: graph-native, directory-local work and coordination data.
 
-## What this is
+## Ownership and entry points
 
-*Basically A made-up Issue Standard* — graph-native, directory-local, git-hosted, `rg`-indexed. Ingredients: GitHub Issues + TOML frontmatter + git + JIRA link types + `rg`; recipe (file-per-issue + graph) is new.
+* `baml_src/main.baml` owns Issue/Edge and graph policies; `ns_toml/toml.baml` parses strict TOML plus BAIS conventions. `src/toml.ts` exposes the BAML validator to hosts.
+* `baml_src/ns_event/` owns event envelopes, deterministic reduction, verification, leases, capabilities, budgets, checkpoints and sync policies.
+* `src/graph.ts` implements host graph queries/mirrors. `src/store.ts` maintains an optional `node:sqlite` event-log projection at `.bais/store.db`; reads fall back to a file scan when absent. Hub, signing and sync modules own I/O.
+* `scripts/` contains substantial goal, dispatch, campaign, handoff, evidence and test-tier logic. BAML curriculum/curator/foundation policies do not imply every host consumer is wired; inspect the script and hub issue.
+* Public contracts: `SPEC.md`, `schema/*.json`, `toml/BAIS.md`, and `spec/`; conformance levels L1 reader / L2 graph+CLI / L3 event log. External implementations must not need BAML tooling.
 
-* BAML owns the schema: `baml_src/main.baml` `Issue{Status,Kind,area,severity,source}+Edge{Blocks…}+IssueExtension` + `ns_toml/toml.baml` strict TOML v1.0.0 parser (`toml.md/abnf` vendor).
-* Host owns validation: `src/toml.ts` re-exports BAML validator, `src/cli.ts` `bais list/ready/check`.
+## Integration and board discipline
 
-## Toolchain
+* BAIS has no BAML package dependencies. BI/BAGL's reserved declarations do not enable BAML imports; they consume the built BAIS TS wrapper. Build BAIS before testing those paths.
+* TOML issue files remain readable alongside the event projection. Queries carry freshness/completeness information. Re-ingest after board mutations, then run cross-check before diagnosing projection failures.
+* The root `.bais/issues/` is the shared hub board. Resolve directory-local boards intentionally; BITS also has its own board.
+* Claim Doing with `--as <owner> --for <ttl>`, renew while working, and respect live holders. Preserve named rejection reasons and executable evidence checks.
+* On 0.17.0 retain `IssueExtension::validate throws never` and `${ctx.output_format}` without call parentheses.
+* Proposal to the BAML team remains deferred until BI and BAIS are dogfooded on a real project; use the root upstream filing gate.
 
-Pinned `0.17.0` (wrapper `0.2.4`, bridge `0.17.0` — SDK and bridge versions must
-match or every file reports `bad` with a version-skew error).
+## Toolchain and gates
 
+Follow the root [storage hygiene rules](../AGENTS.md#storage-hygiene): set `BAML_PROFILE=0` in the actual launcher environment, watch for new dumps after long runs, and retain Rust build artifacts only while needed. These projects use the installed CLI/bridge; normal work does not require compiling the BAML Rust checkout.
+
+Wrapper `0.2.4`, toolchain `0.17.0`, bridge `0.17.0`; keep bridge/toolchain aligned. Use `BAML_PROFILE=0` before runtime initialization (root instructions explain shell/GUI setup). From the workspace root:
+
+```bash
+baml check --project bais
+baml test --project bais
+baml fmt --project bais
+baml generate --project bais
+npm run build --prefix bais
+npm run typecheck --prefix bais
 ```
-baml check --project bais    # 5 files Finished (main, tools, ns_toml, ns_event/envelope+rel)
-baml test --project bais     # 66 passed
-baml generate --project bais # 70 files
-```
 
-## Project wiring
+Never hand-edit `baml_sdk/` or `dist/`. Report observed test results; historical counts are not a current gate result.
 
-* No `[dependencies]` — `bais` is the leaf. `bi`/`bagl` depend on it via `bais = { path = "../bais" }`.
-* `0.17.0` compat: `IssueExtension::validate throws never`, `${ctx.output_format}` (no call parens — the `()` form is 0.18+).
-* Public contract for other tooling: `SPEC.md` + `schema/*.json` (conformance levels L1 reader / L2 graph+CLI / L3 event log).
-* Proposal to BAML team deferred until `bi`+`bais` have been dogfooded on a real project.
-
+`npm test --prefix bais` runs T0/T1. `npm run test:t2 --prefix bais` runs fast acceptance. Inspect `scripts/tiers.mjs`; re-ingest before cross-check after board mutations.
