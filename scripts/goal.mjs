@@ -844,6 +844,151 @@ export function recordSurfaceDecision(goal, { target, decision, reason = "", sna
 	return rec;
 }
 
+// --- box-level edit verb for flat goal.toml files (hub#227) ---
+//
+// Declaring testing_surface/surface_spec on the live flat goal.toml (bare
+// keys, no [goal]/[interview] sections) meant hand-authoring the
+// [interview."testing-surface"]/[interview."surface-spec"] sections plus the
+// file-level lists, keeping the hub#190 spec-capture guard (file list vs
+// box value) in agreement by hand. `bais goal set` closes that gap: one
+// verb writes BOTH halves through the render/parse pair below (single
+// writer — the CLI splices nothing itself, never two writers), refuses
+// loud on shape violations, and keeps the spec-capture guard green by
+// construction (both halves derive from the same settled box).
+//
+//   bais goal set testing-surface "<surface> => <exercise>; ..."
+//   bais goal set surface-spec "<facet> => <spec>; ..."
+//   bais goal set testing-surface --waive "<reason>"
+//
+// Settle semantics are the interview's own: the box reopens in memory and
+// answer() runs its loud settle-time validation (empty, malformed, and
+// reasonless waiver values throw naming the box; a stay-on-box word like
+// "more" never settles and refuses loud instead of looping). The file
+// surgery preserves the flat shape — comments, unrelated keys, and sibling
+// sections are byte-identical; only the target list and its interview
+// section are rewritten.
+//
+// Load-bearing hunk (hub#227/bi#57 red-check target): the file-level list
+// splice in setGoalBoxText. Skipping it (box section only) must trip the
+// selftest below with exactly:
+//   "FAIL selftest: set writes the file-level testing_surface list alongside the box"
+// (verified 2026-09-09: splice neutered to box-section-only -> that FAIL
+// observed first, with the spec round-trip, both waiver halves, and both
+// guard-green checks red behind it, exit 1 -> restored green, 208 ok).
+export const GOAL_SET_BOXES = ["testing-surface", "surface-spec"];
+
+// Canonical box name for the set verb: hyphen/underscore spellings both
+// land; anything else refuses loud naming the two settable boxes.
+export function normalizeGoalSetBox(target) {
+	const t = String(target ?? "")
+		.trim()
+		.toLowerCase()
+		.replace(/_/g, "-");
+	if (t === "testing-surface" || t === "surface-spec") return t;
+	throw new Error(`unknown goal box ${JSON.stringify(String(target ?? ""))} — bais goal set edits "testing-surface" or "surface-spec"`);
+}
+
+// File-level list renders: the interview box value in, the top-level list
+// line out (multi-line to match the live flat style; empty renders [] —
+// the waived-testing-surface precedent from renderGoalToml).
+export function renderTestingSurfaceList(goal) {
+	const items = goalSurface(goal).map((s) => `{ surface = ${JSON.stringify(s.surface)}, exercise = ${JSON.stringify(s.exercise)} }`);
+	if (items.length === 0) return `testing_surface = []`;
+	return `testing_surface = [\n${items.map((it) => `  ${it},`).join("\n")}\n]`;
+}
+
+export function renderSurfaceSpecList(goal) {
+	const items = goalSurfaceSpec(goal).map((s) => `{ facet = ${JSON.stringify(s.facet)}, spec = ${JSON.stringify(s.spec)} }`);
+	if (items.length === 0) return `surface_spec = []`;
+	return `surface_spec = [\n${items.map((it) => `  ${it},`).join("\n")}\n]`;
+}
+
+// Replace the top-level `<name> = [...]` span with the rendered list,
+// string-aware so quoted text holding brackets cannot end the scan early.
+// A missing list (pre-surface goals) is inserted before the first section
+// header so bare keys stay above sections, else appended.
+function replaceGoalList(text, name, replacement) {
+	const src = String(text ?? "");
+	const m = src.match(new RegExp(`^${name} *= *\\[`, "m"));
+	if (!m || m.index === undefined) {
+		const tail = src === "" || src.endsWith("\n") ? "" : "\n";
+		const sec = src.match(/^\[.*\]/m);
+		if (sec && sec.index !== undefined) return `${src.slice(0, sec.index)}${replacement}\n${src.slice(sec.index)}`;
+		return `${src}${tail}${replacement}\n`;
+	}
+	let depth = 0;
+	let inStr = false;
+	let esc = false;
+	for (let j = m.index + m[0].length - 1; j < src.length; j++) {
+		const ch = src[j];
+		if (inStr) {
+			if (esc) esc = false;
+			else if (ch === "\\") esc = true;
+			else if (ch === '"') inStr = false;
+			continue;
+		}
+		if (ch === '"') {
+			inStr = true;
+			continue;
+		}
+		if (ch === "[" || ch === "{") depth++;
+		else if (ch === "]" || ch === "}") {
+			depth--;
+			if (depth === 0 && ch === "]") return src.slice(0, m.index) + replacement + src.slice(j + 1);
+		}
+	}
+	throw new Error(`invalid goal.toml: "${name}" list never closes`);
+}
+
+// Replace the `[interview."<box>"]` section body with the canonical three
+// lines — a set clears stale stay-on-box loop state (followups /
+// followup_pending), which the caller resets in memory. A missing section
+// (hand-authored flat files pre-dating the box) is appended.
+function replaceInterviewBox(text, box, status, value) {
+	const src = String(text ?? "");
+	const body = `[interview.${JSON.stringify(box)}]\nstatus = ${JSON.stringify(status)}\nvalue = ${JSON.stringify(value)}\n`;
+	const m = src.match(new RegExp(`^\\[interview\\.("?)${box.replace(/-/g, "\\-")}\\1\\]`, "m"));
+	if (!m || m.index === undefined) {
+		const tail = src === "" || src.endsWith("\n") ? "" : "\n";
+		return `${src}${tail}${body}`;
+	}
+	const rest = src.slice(m.index);
+	const nl = rest.indexOf("\n");
+	if (nl === -1) return src.slice(0, m.index) + body;
+	const bodyStart = m.index + nl + 1;
+	const tail = src.slice(bodyStart);
+	const nextSec = tail.match(/^\[/m);
+	const end = nextSec && nextSec.index !== undefined ? bodyStart + nextSec.index : src.length;
+	return src.slice(0, m.index) + body + src.slice(end);
+}
+
+// The set-verb single writer: settled box value in, edited goal.toml text
+// out — interview section AND file-level list, both derived from the same
+// box (the hub#190 guard compares exactly these two, so it stays green).
+// Pure: throws on every shape violation, never half-writes.
+export function setGoalBoxText(text, target, value) {
+	const box = normalizeGoalSetBox(target);
+	const goal = parseGoalToml(String(text ?? ""));
+	// Reopen the box so answer() runs its loud settle-time validation —
+	// the interview settle precedent, never a silent write.
+	goal.boxes[box] = { status: "open", value: "" };
+	goal.followups[box] = 0;
+	if (goal.followupBox === box) goal.followupBox = null;
+	answer(goal, box, value);
+	if (goal.boxes[box].status !== "filled") {
+		throw new Error(
+			`invalid ${box}: value ${JSON.stringify(String(value ?? ""))} leaves the box open (a stay-on-box reply never settles via bais goal set) — supply "<surface> => <exercise>" items ("; "-separated) or "waiver => <reason>"`,
+		);
+	}
+	let next = replaceGoalList(
+		String(text ?? ""),
+		box === "testing-surface" ? "testing_surface" : "surface_spec",
+		box === "testing-surface" ? renderTestingSurfaceList(goal) : renderSurfaceSpecList(goal),
+	);
+	next = replaceInterviewBox(next, box, "filled", goal.boxes[box].value);
+	return next;
+}
+
 // Physical retire form: a comment marker under the first line. Idempotent —
 // a present marker is replaced, never duplicated (the ledger still refuses
 // double-decides; this only keeps hand-applied files clean).
@@ -3278,6 +3423,120 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 	check(
 		badLedger221.ok === false && badLedger221.errors.some((e) => e.includes("surface_decisions")),
 		`corrupt surface_decisions ledger fails naming the field (errors: ${JSON.stringify(badLedger221.errors)})`,
+	);
+
+	// hub#227: box-level edit verb for flat goal.toml files. A flat live
+	// shape (bare keys + interview sections, comments included) round-trips
+	// a set through BOTH halves — the interview box and the file-level
+	// list — with unrelated content byte-identical and the hub#190
+	// spec-capture guard green.
+	const flat227 = `# flat campaign — bare keys, comments survive a set\nstatement = "flat campaign"\nstyle = "plain"\nhero = "plain"\ndone_criteria = ["ship it"]\ntesting_surface = [\n  { surface = "old surface", exercise = "run: old => exit 0 (facets: old facet)" },\n]\nsurface_spec = [\n  { facet = "old facet", spec = "old spec" },\n]\n[interview."testing-surface"]\nstatus = "filled"\nvalue = "old surface => run: old => exit 0 (facets: old facet)"\n[interview."surface-spec"]\nstatus = "filled"\nvalue = "old facet => old spec"\n`;
+	const set227 = setGoalBoxText(
+		flat227,
+		"testing-surface",
+		"new surface => run: new => exit 0 (facets: new facet); second => run: s2 => exit 0 (facets: new facet)",
+	);
+	const back227 = parseGoalToml(set227);
+	check(
+		back227.boxes["testing-surface"].value ===
+			"new surface => run: new => exit 0 (facets: new facet); second => run: s2 => exit 0 (facets: new facet)",
+		"set writes the interview box value",
+	);
+	check(
+		back227._parsed.testing_surface.length === 2 &&
+			back227._parsed.testing_surface[0].surface === "new surface" &&
+			back227._parsed.testing_surface[1].surface === "second",
+		`set writes the file-level testing_surface list alongside the box (got ${JSON.stringify(back227._parsed.testing_surface)})`,
+	);
+	check(
+		set227.includes(`statement = "flat campaign"`) &&
+			set227.includes(`# flat campaign`) &&
+			set227.includes(`value = "old facet => old spec"`),
+		"set leaves unrelated keys, comments, and sibling sections byte-identical",
+	);
+	const gate227 = validateGoal(set227, { knownStyles: ["plain"], knownHeroes: ["plain"] });
+	check(
+		gate227.ok === true && gate227.errors.length === 0,
+		`edited flat file validates clean (errors: ${JSON.stringify(gate227.errors)})`,
+	);
+	// The surface-spec half: underscore spelling lands, and both halves
+	// agree so the hub#190 spec-capture guard stays green.
+	const spec227 = setGoalBoxText(set227, "surface_spec", "new facet => the new spec text");
+	const specBack227 = parseGoalToml(spec227);
+	check(
+		specBack227.boxes["surface-spec"].value === "new facet => the new spec text" &&
+			JSON.stringify(specBack227._parsed.surface_spec.map((s) => [s.facet, s.spec])) === JSON.stringify([["new facet", "the new spec text"]]),
+		"set writes the surface-spec box and file-level list together (underscore spelling lands)",
+	);
+	check(
+		status(specBack227).warns.every((w) => !w.includes("surface_spec amended")),
+		`set keeps the hub#190 spec-capture guard green (warns: ${JSON.stringify(status(specBack227).warns)})`,
+	);
+	// Waiver round-trip: a waived testing-surface settles filled with an
+	// empty file-level list; a waived surface-spec records the waiver facet
+	// in both halves (guard compares exactly these two — still green).
+	const waive227 = setGoalBoxText(flat227, "testing-surface", "waiver => owner accepts the gap, review-gated");
+	const waiveBack227 = parseGoalToml(waive227);
+	check(
+		waiveBack227.boxes["testing-surface"].status === "filled" &&
+			waiveBack227._parsed.testing_surface.length === 0 &&
+			waive227.includes("testing_surface = []"),
+		"waived testing-surface settles filled with an empty file-level list",
+	);
+	const specWaive227 = setGoalBoxText(flat227, "surface-spec", "waiver => no interface surface, taste unexamined");
+	const specWaiveBack227 = parseGoalToml(specWaive227);
+	check(
+		specWaiveBack227.boxes["surface-spec"].value === "waiver => no interface surface, taste unexamined" &&
+			JSON.stringify(specWaiveBack227._parsed.surface_spec.map((s) => [s.facet, s.spec])) ===
+				JSON.stringify([["waiver", "no interface surface, taste unexamined"]]),
+		"waived surface-spec records the waiver facet in both halves",
+	);
+	check(
+		status(specWaiveBack227).warns.every((w) => !w.includes("surface_spec amended")),
+		"waived surface-spec keeps the spec-capture guard green",
+	);
+	// Refusals: unknown box, malformed value, reasonless waiver, and a
+	// stay-on-box word (which never settles via set) all throw loud — and
+	// the pure function never half-writes (the input text is untouched).
+	for (const [label, t, v, want] of [
+		["unknown box", "testing-area", "x => y", "unknown goal box"],
+		["malformed value", "testing-surface", "a surface with no exercise half", "testing-surface"],
+		["reasonless waiver", "testing-surface", "waiver => ", "testing-surface"],
+		["reasonless spec waiver", "surface-spec", "waiver => ", "surface-spec"],
+		["stay-on-box word", "testing-surface", "more", "stay-on-box"],
+	]) {
+		let msg227 = "";
+		try {
+			setGoalBoxText(flat227, t, v);
+		} catch (e) {
+			msg227 = String(e && e.message);
+		}
+		check(msg227.includes(want), `${label} refuses loud naming it (got ${JSON.stringify(msg227)})`);
+	}
+	// Live-root fidelity (read-only — the live file is never written, only
+	// copied in memory): the set applies to the real flat shape, comments
+	// survive, the file gate stays clean, and the guard stays green.
+	const live227 = readFileSync(HUB_GOAL_TOML, "utf8");
+	const liveSet227 = setGoalBoxText(
+		live227,
+		"testing-surface",
+		"bais ready --json => run: bi bais ready --json => exit 0 and stdout parses as JSON with ready rows (facets: cli output shape)",
+	);
+	check(
+		liveSet227.includes("bais ready --json => run: bi bais ready --json") &&
+			liveSet227.includes(`statement = "A sophisticated agent harness`) &&
+			liveSet227.includes("# Ecosystem goal"),
+		"set applies to the live flat shape with statement and comments intact",
+	);
+	check(readFileSync(HUB_GOAL_TOML, "utf8") === live227, "the live file is untouched (pure — read, never written)");
+	const liveGate227 = validateGoal(liveSet227, { knownStyles: packs158 });
+	check(
+		liveGate227.ok === true && liveGate227.errors.length === 0,
+		`edited live copy validates clean (errors: ${JSON.stringify(liveGate227.errors)})`,
+	);
+	check(
+		status(parseGoalToml(liveSet227)).warns.every((w) => !w.includes("surface_spec amended")),
+		"edited live copy keeps the spec-capture guard green",
 	);
 
 	process.exit(failures ? 1 : 0);

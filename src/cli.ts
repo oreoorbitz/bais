@@ -56,6 +56,7 @@ Usage:
   bais goal <start|sketch|commit|status|switch> [--approve]  # per-directory campaign interview (bi#132)
   bais goal keep-surface <surface|case>          # rebind the case file to the live snapshot (hub#221)
   bais goal retire-surface <surface|case> --reason <R>  # mark the case file, ledger the retire; check stops flagging (hub#221)
+  bais goal set <testing-surface|surface-spec> "<value>" [--waive <R>]  # box-level edit of the live goal.toml: interview box + file list (hub#227)
   bais goal e2e [--json]                  # surface/case coverage join: ok/missing/stale rows (hub#191);
                                 # exits 1 when any surface lacks a case or any case is stale
   bais goal gate [--json]                 # deterministic gates first (baml check/test + e2e scaffolds),
@@ -1917,7 +1918,7 @@ if (cmd === "goal") {
 	const gm = await loadGoalModule();
 	const goalFile = join(root, "goal.toml");
 	const verb = argv[1];
-	const usage = `bais goal <start|sketch|commit|status|switch|keep-surface|retire-surface|snapshot|clear|retire|gate|e2e|baseline> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding; gate is hub#213; e2e is the hub#191 surface/case coverage join; baseline is the hub#219 layer-drift audit activation; keep-surface|retire-surface apply recorded surface decisions to case files, hub#221)`;
+	const usage = `bais goal <start|sketch|commit|status|switch|keep-surface|retire-surface|set|snapshot|clear|retire|gate|e2e|baseline> — per-directory campaign interview (bi#132; snapshot/clear/retire are the bi#136 lifecycle binding; gate is hub#213; e2e is the hub#191 surface/case coverage join; baseline is the hub#219 layer-drift audit activation; keep-surface|retire-surface apply recorded surface decisions to case files, hub#221; set edits testing-surface|surface-spec boxes on the live file, hub#227)`;
 	const loadGoal = (): any => {
 		if (!existsSync(goalFile)) {
 			console.error(`bais goal: no campaign at ${goalFile} — run \`bais goal start "<statement>"\` first`);
@@ -2158,6 +2159,67 @@ if (cmd === "goal") {
 			if (asJson) printJson({ ok: true, decision: rec, file });
 			else console.log(`kept\t${rec.surface}\trebound to ${live}`);
 		}
+	} else if (verb === "set") {
+		// hub#227: box-level edit of the live goal.toml — declares
+		// testing_surface/surface_spec without hand-authoring interview
+		// sections. Box semantics live ONLY in goal.mjs (setGoalBoxText —
+		// the hub#163 single-source rule: this block routes argv, writes
+		// the spliced text, and renders; it never mirrors box rules and
+		// splices nothing itself). Both halves (the interview box and the
+		// file-level list) come back from the one goal.mjs writer, so the
+		// hub#190 spec-capture guard stays green by construction. Shape
+		// violations refuse loud (bi#55), exit 1, file untouched.
+		const target = argv[2];
+		if (!target || target.startsWith("--")) {
+			console.error(`bais goal set needs "<testing-surface|surface-spec>" ("<value>" or --waive "<reason>")`);
+			process.exit(1);
+		}
+		const waived = argv.includes("--waive");
+		const rest = argv.slice(3);
+		const positional = rest.filter((a, i) => !(a === "--waive" || (i > 0 && rest[i - 1] === "--waive")));
+		const pos = positional[0];
+		let value = "";
+		if (waived) {
+			if (pos !== undefined) {
+				console.error(`bais goal set refused: supply either "<value>" or --waive "<reason>", not both`);
+				process.exit(1);
+			}
+			const reason = flagVal("--waive");
+			if (!reason || reason.trim() === "") {
+				console.error(`bais goal set refused: --waive needs a reason (reasonless skips fail loud)`);
+				process.exit(1);
+			}
+			value = `waiver => ${reason}`;
+		} else {
+			if (pos === undefined || pos.startsWith("--")) {
+				console.error(`bais goal set needs "<testing-surface|surface-spec>" ("<value>" or --waive "<reason>")`);
+				process.exit(1);
+			}
+			value = pos;
+		}
+		const beforeText = readFileSync(goalFile, "utf8");
+		let box = "";
+		let next = "";
+		try {
+			box = gm.normalizeGoalSetBox(target);
+			next = gm.setGoalBoxText(beforeText, target, value);
+		} catch (e: any) {
+			console.error(`bais goal set refused: ${e?.message ?? e}`);
+			process.exit(1);
+		}
+		// The splicer proves itself: the edit must introduce no new
+		// file-gate errors. Pre-existing file issues are `bais check`'s
+		// business, not this verb's — only fresh errors refuse.
+		const beforeGate = gm.validateGoal(beforeText);
+		const afterGate = gm.validateGoal(next);
+		const fresh = afterGate.errors.filter((e: string) => !beforeGate.errors.includes(e));
+		if (fresh.length) {
+			console.error(`bais goal set refused: edited goal.toml fails validation: ${fresh.join("; ")}`);
+			process.exit(1);
+		}
+		writeFileSync(goalFile, next);
+		if (asJson) printJson({ ok: true, box, value });
+		else console.log(`set\t${box}\t${value}`);
 	} else if (verb === "snapshot") {
 		// bi#136: snapshot-first precondition for `goal clear`. Captures the
 		// live statement + issue id set; `clear` refuses unless the snapshot
