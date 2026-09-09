@@ -4,6 +4,7 @@
 
 ## Ownership and entry points
 
+* `skills/bais/SKILL.md` and its `scripts/bais-json.mjs` form the portable outside-agent package: explicit hub, read-only JSON adapter over the built BAIS host, no BI dependency. Keep diagnostics and partial results visible. Validate with `node scripts/portable-skill-fixture.mjs`; source stays in this repository, copied installs locate it through `BAIS_HOME`.
 * `baml_src/main.baml` owns Issue/Edge and graph policies; `ns_toml/toml.baml` parses strict TOML plus BAIS conventions. `src/toml.ts` exposes the BAML validator to hosts.
 * `baml_src/ns_event/` owns event envelopes, deterministic reduction, verification, leases, capabilities, budgets, checkpoints and sync policies.
 * `src/graph.ts` implements host graph queries/mirrors. `src/store.ts` maintains an optional `node:sqlite` event-log projection at `.bais/store.db`; reads fall back to a file scan when absent. Hub, signing and sync modules own I/O.

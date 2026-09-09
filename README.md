@@ -21,3 +21,17 @@ node dist/src/cli.js --help
 ```
 
 BI and BAGL consume the built `bais/dist/src/toml.js` wrapper through TS-host interop. Their `baml.toml` dependency declarations are reserved for Phase B; cross-package BAML imports are not active. Build BAIS before using those consumers' BAIS commands.
+
+## Outside coding agents
+
+The portable [BAIS skill](skills/bais/SKILL.md) provides a JSON helper for list, ready, show, graph, check and dry-run dispatch. It uses BAIS directly; BI is not required. Reads preserve partial results and diagnostics, and malformed boards exit nonzero.
+
+Copy or symlink `skills/bais/` into your coding CLI's skill directory. If copied, set `BAIS_HOME` to this checkout. The built host needs Node with `node:sqlite`, the generated SDK, and the matching bridge. Set `BAML_PROFILE=0` in the agent's launcher environment.
+
+```sh
+BAIS_HOME=/absolute/path/to/bais node /path/to/installed/bais/scripts/bais-json.mjs <<'JSON'
+{"action":"ready","hub":"/absolute/path/to/project"}
+JSON
+```
+
+The helper reads a single JSON request on stdin and returns `{ok,data,...}` on stdout. Parse stdout even on exit 1: failed checks retain their report. It is read-only; the skill explains supported CLI claim operations. Run `node scripts/portable-skill-fixture.mjs` to exercise the adapter against temporary boards.
