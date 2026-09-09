@@ -11,6 +11,7 @@
 		"build": "tsc -p tsconfig.json",
 		"typecheck": "tsc -p tsconfig.json --noEmit",
 		"test": "node scripts/tiers.mjs t0 t1",
+		"issue:fixture": "node scripts/issue-commands-fixture.mjs",
 		"test:t0": "node scripts/tiers.mjs t0",
 		"test:t1": "node scripts/tiers.mjs t1",
 		"test:t2": "node scripts/test-t2.mjs"

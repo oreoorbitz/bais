@@ -35,3 +35,19 @@ JSON
 ```
 
 The helper reads a single JSON request on stdin and returns `{ok,data,...}` on stdout. Parse stdout even on exit 1: failed checks retain their report. It is read-only; the skill explains supported CLI claim operations. Run `node scripts/portable-skill-fixture.mjs` to exercise the adapter against temporary boards.
+
+## Native issue authoring
+
+The standalone CLI supports issue creation and editing without a custom script or TOML template. After building, link the executable with `npm link --offline --ignore-scripts`, or invoke `node /absolute/path/to/bais/dist/src/cli.js` directly.
+
+```sh
+bais new "Fix parser escaping" --kind Bug --files src/parser.ts --body-file repro.md --hub /path/to/project --json
+bais show 'project#12' --hub /path/to/project --json
+bais edit 'project#12' --append-body "Evidence: drill(parser-fixture)" --hub /path/to/project --json
+```
+
+`--hub` selects an existing board exactly for local commands; `grant`/`revoke` retain their existing remote `--hub URL` meaning. Without it, normal nearest-board resolution applies. `init` remains cwd-local. `new` allocates the next numeric ID from the board's project name, or accepts `--id project#name`; status starts Open. Existing and archived IDs cannot be overwritten.
+
+`edit` accepts `--title`, `--kind`, `--area`, `--severity`, `--source`, one body replacement/append option, and repeated `--files` footprints. Body files resolve from the invoking cwd; `-` reads stdin. `show --json` returns a full file record and content hash; `edit --expect-hash HASH` rejects a stale snapshot. Edits to live-claimed issues require the holder's `--as` identity. Status, claims, and edges remain intact; use `move`/`renew` for lifecycle changes.
+
+BAML serializes and validates each write before it lands, normalizing TOML formatting and comments. Native writes use exclusive locks and creation, then rebuild an existing local projection. As with `move`, rebuilding from files is for local seed-backed boards; hub/sync-only events need the existing synchronized-board workflow. Errors identify any file write that succeeded before a projection failure. Run `npm run issue:fixture` for the offline CLI acceptance tests.

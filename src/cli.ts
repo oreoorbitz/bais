@@ -39,7 +39,36 @@ import { event, mcp_tools } from "../baml_sdk/index.js";
 // ancestor hub resolves absolute. No hub anywhere keeps the old relative
 // paths so ensureInit/init behave exactly as before. `init` below stays
 // cwd-local on purpose: it creates hubs (and forks), never claims one.
-const resolvedHub = resolveHubDir(process.cwd());
+// Explicit board selection never falls through to an ancestor. Strip the
+// global option before command-specific positional parsing. Relative body-file
+// paths remain relative to the invoking cwd.
+const argv = process.argv.slice(2);
+let explicitHub: string | undefined;
+// grant/revoke already use --hub for their remote coordinator URL.
+const hi = ["grant", "revoke"].includes(argv[0]) ? -1 : argv.indexOf("--hub");
+if (hi !== -1) {
+	const value = argv[hi + 1];
+	if (!value || value.startsWith("--") || argv.lastIndexOf("--hub") !== hi) {
+		printJson({ ok: false, error: "--hub requires one project directory" });
+		process.exit(1);
+	}
+	explicitHub = resolve(value);
+	argv.splice(hi, 2);
+	if (!existsSync(join(explicitHub, ".bais", "config.toml")) || !existsSync(join(explicitHub, ".bais", "issues"))) {
+		printJson({ ok: false, error: `missing board at ${explicitHub}/.bais (config.toml and issues required)` });
+		process.exit(1);
+	}
+	// Existing subcommands can launch scripts that resolve their board from
+	// cwd. Preserve caller-relative authoring inputs before selecting that cwd.
+	if (argv[0] === "new" || argv[0] === "edit") {
+		for (const option of ["--body-file", "--append-body-file"]) {
+			const index = argv.indexOf(option);
+			if (index >= 0 && argv[index + 1] && argv[index + 1] !== "-" && !argv[index + 1].startsWith("--")) argv[index + 1] = resolve(argv[index + 1]);
+		}
+	}
+	if (argv[0] !== "init") process.chdir(explicitHub);
+}
+const resolvedHub = explicitHub ? join(explicitHub, ".bais") : resolveHubDir(process.cwd());
 const root = resolvedHub !== null && resolvedHub !== join(resolve(process.cwd()), ".bais") ? resolvedHub : ".bais";
 const issuesDir = join(root, "issues");
 
@@ -47,6 +76,16 @@ function help(): void {
 	console.log(`bais — Basically A made-up Issue Standard
 
 Usage:
+  bais <command> [--hub <project-dir>]  # exact board (grant/revoke retain --hub URL)
+  bais new "title" [--id project#N] [--kind Feat] [--area A] [--severity 1..5] [--source S]
+            [--body TEXT | --body-file FILE|-] [--files PATH]... [--json]
+                                # creates Open; automatic id uses board project + next number
+  bais show <id> [--json]        # full file record, claims, edges and content_hash
+  bais edit <id> [--title T] [--kind K] [--area A] [--severity 1..5] [--source S]
+            [--body TEXT | --body-file FILE|- | --append-body TEXT | --append-body-file FILE|-]
+            [--files PATH]... [--as OWNER] [--expect-hash HASH] [--json]
+                                # preserves status/claims/edges; canonical BAML TOML formatting
+                                # matching --as required for a live claim; move changes status
   bais init
   bais ingest [--json]              # build .bais/store.db from issues/*.toml via the BAML reducer
   bais list [--json]                       # trailing br=N col = open blast radius (bi#122)
@@ -109,9 +148,6 @@ Usage:
   bais grant <aud> --can a,b --scope S --expiry-lc N --hub URL
   bais revoke <grant-id> --revoker did --hub URL   # the kill switch
 
-Not yet implemented:
-  bais new "title" --kind bug [--area bridge/ffi] [--status open]
-
 One Issue = one file in .bais/issues/<id>.toml, git is the hosting.
 `);
 }
@@ -123,11 +159,11 @@ function ensureInit(): void {
 	}
 }
 
-const argv = process.argv.slice(2);
 const cmd = argv[0];
 const asJson = argv.includes("--json");
 
 if (cmd === "init") {
+	if (explicitHub) { printJson({ ok: false, error: "init is cwd-local; do not pass --hub" }); process.exit(1); }
 	// hub#160: always cwd-local (see resolution above) — init creates a hub
 	// here, even when an ancestor hub exists (that is how forks are born).
 	mkdirSync(join(".bais", "issues"), { recursive: true });
@@ -139,6 +175,22 @@ if (cmd === "init") {
 if (!cmd || argv.includes("--help") || argv.includes("-h")) {
 	help();
 	process.exit(cmd ? 0 : 1);
+}
+
+if (["new", "show", "edit"].includes(cmd)) {
+	try {
+		const { runIssueCommand } = await import("./issue_commands.js");
+		const result = await runIssueCommand(cmd, argv.slice(1), issuesDir);
+		if (asJson) printJson(result);
+		else if (cmd === "show") console.log(`${result.issue.issue.id}\t${result.issue.issue.status}\t${result.issue.issue.title}\n${result.issue.issue.body}`);
+		else console.log(`${cmd}\t${result.issue.issue.id}\t${result.file}`);
+		process.exit(0);
+	} catch (error) {
+		const message = String((error as Error).message ?? error);
+		if (asJson) printJson({ ok: false, error: message });
+		else console.error(`bais ${cmd}: ${message}`);
+		process.exit(1);
+	}
 }
 
 // Projection-first: every read below uses the store when present, so the
