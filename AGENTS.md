@@ -2,6 +2,10 @@
 
 > Read `../AGENTS.md` first. BAIS is Basically A made-up Issue Standard: graph-native, directory-local work and coordination data.
 
+## Required BAIS tooling
+
+Follow the root [required BAIS workflow](../AGENTS.md#required-bais-workflow). Use standalone `bais` commands for supported reads, issue creation, edits, status changes, and claims. Do not replace these operations with ad hoc scripts or direct TOML/SQLite edits. The shipped JSON helper is allowed for reads. Target the shared backlog with `--hub /absolute/path/to/workspace`; do not infer the board from the issue prefix. Use the root workflow's narrow exceptions for unsupported operations, malformed-file repair, and fixture/internal development; record the reason and validate the result.
+
 ## Ownership and entry points
 
 * `skills/bais/SKILL.md` and its `scripts/bais-json.mjs` form the portable outside-agent package: explicit hub, read-only JSON adapter over the built BAIS host, no BI dependency. Keep diagnostics and partial results visible. Validate with `node scripts/portable-skill-fixture.mjs`; source stays in this repository, copied installs locate it through `BAIS_HOME`.
