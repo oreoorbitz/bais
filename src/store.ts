@@ -251,11 +251,42 @@ function setMeta(db: DatabaseSync, k: string, v: string): void {
 // policy change: the merge is host-side log concatenation, reduction is
 // untouched (ingest-from-TOML == replay-from-log still holds, extended to
 // seed + replayed hub history).
+// hub#228: released leases must not fence seed transitions. Re-ingest
+// regenerates seed ids (wall ts in the hash) while carried-over hub
+// LeaseClaim rows keep their original lc, so a seed
+// TaskTransition{to:Done} can reduce while a later-released claim is still
+// live — the BAML fencing gate excludes it as `stale-fence` and the
+// file-marked Done goes blind (sample total:0, scan=Done store=Open).
+// Seeds carry no fencing token and the reducer is frozen (BAML owns the
+// rule), so the host repairs the projection: a file-marked Done whose seed
+// transition was fenced out wins over lease-derived liveness. Scoped to
+// Done (the Goal) and to the stale-fence reason (lease-derived only —
+// needs-approval and every other gate still hold). Total by construction:
+// scan-Done implies store-Done. Reseals when it repairs: the fingerprint
+// commits to tasks.
+function enforceFileDoneWins(db: DatabaseSync, fileStatus: Map<string, string>, seedAuthor: string): void {
+	const done = [...fileStatus.entries()].filter(([, s]) => s === "Done").map(([id]) => id);
+	if (!done.length) return;
+	const fenced = new Set(
+		(db.prepare("SELECT event_id FROM excluded WHERE reason = 'stale-fence'").all() as any[]).map((r) => r.event_id as string),
+	);
+	if (!fenced.size) return;
+	const seedTransition = db.prepare("SELECT id FROM events WHERE type = 'TaskTransition' AND entity = ? AND author = ?");
+	const markDone = db.prepare("UPDATE tasks SET status = 'Done' WHERE entity = ? AND status != 'Done'");
+	let repaired = 0;
+	for (const id of done) {
+		const seeds = seedTransition.all(id, seedAuthor) as any[];
+		if (seeds.some((r) => fenced.has(r.id as string))) repaired += Number(markDone.run(id).changes ?? 0);
+	}
+	if (repaired) sealProjection(db);
+}
+
 export async function ingestIssues(issuesDir: string): Promise<{ events: number; failures: number }> {
 	const project = projectName(issuesDir);
 	const files = existsSync(issuesDir) ? readdirSync(issuesDir).filter((f) => f.endsWith(".toml")).sort() : [];
 	const wireEvents: any[] = [];
 	const failures: { file: string; error: string }[] = [];
+	const fileStatus = new Map<string, string>();
 	let lc = 0;
 	// Chain-legal seed (envelope: seq 0 is genesis, prev links the author's
 	// prior id): one author, contiguous seq from 0, prev chained. lc stays
@@ -316,6 +347,7 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 			if (parsed.issue.status && parsed.issue.status !== "Open") {
 				seedEvent(parsed.issue.id, "TaskTransition", { to: parsed.issue.status });
 			}
+			fileStatus.set(parsed.issue.id, parsed.issue.status ?? "Open");
 		} catch (e: any) {
 			failures.push({ file: f, error: String(e?.message ?? e).split("\n")[0] });
 		}
@@ -432,6 +464,8 @@ export async function ingestIssues(issuesDir: string): Promise<{ events: number;
 		const heads = fullLog.map((e) => e.id);
 		const maxLc = fullLog.reduce((m, e) => Math.max(m, e.lc), 0);
 		refreshProjectionTables(db, reduction, heads, maxLc);
+		// hub#228: file-marked Done wins over lease-derived liveness.
+		enforceFileDoneWins(db, fileStatus, seedAuthor);
 		const insFail = db.prepare("INSERT INTO failures(file, error) VALUES (?, ?)");
 		for (const fl of failures) insFail.run(fl.file, fl.error);
 		setMeta(db, "completeness", failures.length ? "partial" : "complete");
