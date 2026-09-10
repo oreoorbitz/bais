@@ -65,7 +65,10 @@ Files: bais/baml_src/main.baml  # second group, unions with the first
 Paths are relative to the project root, space-separated, `#` comments
 stripped. A `Files:` prefix means declared — even `Files:` empty (touches no
 files is a real claim). No prefix means `unknown`: the issue still packs, but
-the operator must confirm the footprint by hand.
+the operator must confirm the footprint by hand. A path may carry an LOD
+level pointer (`path#L0`, `#L1`, `#L2`, either case, hub#236) — narrower-or-equal
+to its file: same-file different-level claims never clash, unknown levels warn
+and fall back to whole-file. Other `#` suffixes remain comments.
 
 `bais dispatch --agents N [--json]` dry-runs the pack: ready + unclaimed
 issues, greedy by open blast radius, skipping live claims and file

@@ -139,20 +139,123 @@ export function blastRadii(all: BaisFile[]): BlastRadius[] {
 // issue's file footprint (space-separated paths, `#` comments stripped,
 // multiple lines union, first-seen order). The CLI dry-runs packs against
 // these; undeclared issues pack freely but are flagged `files: unknown`.
+//
+// hub#236: claims accept `path#L0|#L1|#L2` level pointers (LOD sketch of
+// the file — L0 symbol, L1 signature, L2 source refinement, reserved —
+// either case, bare `path` = whole file as before). `#` still starts a
+// comment UNLESS it forms a level tail (`#[Ll]<digits>` ending a token
+// with a non-empty head). Inputs without level tails behave
+// byte-identically to the old strip-first form.
+export function isLevelTail(tail: string): boolean {
+	if (tail.length < 2) return false;
+	const head = tail[0];
+	if (head !== "L" && head !== "l") return false;
+	for (let i = 1; i < tail.length; i++) {
+		if (tail[i] < "0" || tail[i] > "9") return false;
+	}
+	return true;
+}
+
+// Mirror of BAML claim_base: `a.ts#L1` -> `a.ts`; a bare path is its own base.
+export function claimBase(claim: string): string {
+	const hash = claim.indexOf("#");
+	if (hash === -1) return claim;
+	if (isLevelTail(claim.slice(hash + 1))) return claim.slice(0, hash);
+	return claim;
+}
+
+// Mirror of BAML claim_level: `L0`/`L1`/`L2` canonical (either case in,
+// uppercase out), the raw tail for an unknown numeric level, "" for whole-file.
+export function claimLevel(claim: string): string {
+	const hash = claim.indexOf("#");
+	if (hash === -1) return "";
+	const tail = claim.slice(hash + 1);
+	if (!isLevelTail(tail)) return "";
+	const digits = tail.slice(1);
+	if (digits === "0") return "L0";
+	if (digits === "1") return "L1";
+	if (digits === "2") return "L2";
+	return tail;
+}
+
+// Mirror of BAML known_file_level.
+export function knownFileLevel(level: string): boolean {
+	return level === "L0" || level === "L1" || level === "L2";
+}
+
 export function parseFileClaims(body: string): string[] {
 	const out: string[] = [];
 	for (const line of (body ?? "").split("\n")) {
 		const t = line.trim();
 		if (!t.startsWith("Files:")) continue;
-		let rest = t.slice("Files:".length).trim();
-		const hash = rest.indexOf("#");
-		if (hash !== -1) rest = rest.slice(0, hash).trim();
+		const rest = t.slice("Files:".length).trim();
+		let stopped = false;
 		for (const part of rest.split(" ")) {
+			if (stopped) continue;
 			const p = part.trim();
-			if (p !== "" && !out.includes(p)) out.push(p);
+			if (p === "") continue;
+			const hash = p.indexOf("#");
+			if (hash === -1) {
+				if (!out.includes(p)) out.push(p);
+			} else {
+				const tail = p.slice(hash + 1);
+				const head = p.slice(0, hash);
+				if (isLevelTail(tail) && head !== "") {
+					if (!out.includes(p)) out.push(p);
+				} else {
+					const h = head.trim();
+					if (h !== "" && !out.includes(h)) out.push(h);
+					stopped = true;
+				}
+			}
 		}
 	}
 	return out;
+}
+
+// Mirror of BAML claims_overlap: same base file AND (either side
+// whole-file or the same level). Same-file different-level = disjoint
+// sketches = no clash; overlapping = clash.
+export function claimsOverlap(a: string, b: string): boolean {
+	if (claimBase(a) !== claimBase(b)) return false;
+	const la = claimLevel(a);
+	const lb = claimLevel(b);
+	return la === "" || lb === "" || la === lb;
+}
+
+// Mirror of BAML resolve_file_claims: narrow claims stay narrow; a level
+// pointer with an unknown level or with no built index for its file
+// degrades to its base path. `indexed` is host-injected (files with a
+// built level index) — BAGL levels are derived artifacts, BAML only
+// derives the fallback.
+export function resolveFileClaims(claims: string[], indexed: string[]): string[] {
+	return claims.map((c) => {
+		const level = claimLevel(c);
+		if (level !== "" && (!knownFileLevel(level) || !indexed.includes(claimBase(c)))) return claimBase(c);
+		return c;
+	});
+}
+
+// Mirror of BAML unresolved_level_files: base files needing the fallback,
+// deduped first-seen. The host warns naming these (warn-first) and serves
+// resolveFileClaims. Empty = every level resolved narrow.
+export function unresolvedLevelFiles(claims: string[], indexed: string[]): string[] {
+	const out: string[] = [];
+	for (const c of claims) {
+		const level = claimLevel(c);
+		if (level === "") continue;
+		const base = claimBase(c);
+		if ((!knownFileLevel(level) || !indexed.includes(base)) && !out.includes(base)) out.push(base);
+	}
+	return out;
+}
+
+// hub#236 fallback warning — names every file served whole. Verbatim shape
+// pinned by the lod-level-pointers drill + mirror-parity §L.
+export function warnLevelFallback(files: string[]): string {
+	const list = [...files].map(String);
+	const noun = list.length === 1 ? "pointer" : "pointers";
+	return `[bais] level ${noun} with no built index fall back to whole-file: ${list.join(", ")} (rebuild BAGL levels for the file, or drop the #Ln suffix)`;
 }
 
 // bi#130: swarm membership is a holder convention, not a schema change.
@@ -332,7 +435,9 @@ export function dispatchPack(
 	const ready = readyIssues(all);
 	const bodies = new Map(all.map((f) => [f.issue.id, f.issue.body ?? ""]));
 	const filesFor = (id: string): string[] => fp.get(id) ?? [];
-	const clash = (a: string[], b: string[]): boolean => a.some((x) => b.includes(x));
+	// hub#236: level-aware — a level pointer is narrower-or-equal to its
+	// file (same-file different-level = no clash; overlapping = clash).
+	const clash = (a: string[], b: string[]): boolean => a.some((x) => b.some((y) => claimsOverlap(x, y)));
 	const packed: string[] = [];
 	const packedFiles: string[] = [];
 	while (slots.length < budget) {

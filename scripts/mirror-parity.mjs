@@ -307,6 +307,44 @@ const agree = (label, a, b) =>
 	}
 }
 
+// ---- §L level pointers (hub#236 <- claim_base/claim_level/files_clash/resolve) ----
+// BAML spec: "parse_file_claims keeps level pointers, comments still
+// strip", "claim base and level split pointers from whole files",
+// "files_clash narrows on levels", "level fallback warns naming the
+// file", "dispatch packs same-file different-level issues together".
+// Bais-side literal pins ONLY — bi's mirror (bi/src/bais.ts) is outside
+// this lane's footprint and still strips `#Ln` as a comment, so no
+// agree() on level inputs here; a bi follow-up restores biamese
+// agreement. Bare-path agreement (§P/§D above) is unaffected.
+{
+	check(JSON.stringify(bais.parseFileClaims("Files: a.ts#L0 b.ts#l1 c.ts#L2 d.ts")) ===
+		JSON.stringify(["a.ts#L0", "b.ts#l1", "c.ts#L2", "d.ts"]), `level parse keeps pointers`);
+	check(JSON.stringify(bais.parseFileClaims("Files: a.ts#L1 # note")) === JSON.stringify(["a.ts#L1"]) &&
+		JSON.stringify(bais.parseFileClaims("Files: a.ts#frag c.ts")) === JSON.stringify(["a.ts"]),
+		`level parse: comments still strip`);
+	check(bais.claimBase("a.ts#L1") === "a.ts" && bais.claimLevel("a.ts#l2") === "L2" &&
+		bais.claimLevel("a.ts#L9") === "L9" && bais.claimLevel("a.ts") === "" &&
+		bais.knownFileLevel("L1") && !bais.knownFileLevel("L9"), `level split pins`);
+	check(!bais.claimsOverlap("a.ts#L0", "a.ts#L1") && bais.claimsOverlap("a.ts#L1", "a.ts#L1") &&
+		bais.claimsOverlap("a.ts", "a.ts#L0") && bais.claimsOverlap("a.ts#L2", "a.ts") &&
+		!bais.claimsOverlap("a.ts#L0", "b.ts#L0"), `level overlap narrows`);
+	const slotIds = (slots) => slots.map((s) => s.issue_id);
+	const trio = [
+		F("n#01", "Open", [], "b\nFiles: store.ts#L0"),
+		F("n#02", "Open", [], "b\nFiles: store.ts#L1"),
+		F("n#03", "Open", [], "b\nFiles: store.ts#L1"),
+	];
+	const nfp = new Map([["n#01", ["store.ts#L0"]], ["n#02", ["store.ts#L1"]], ["n#03", ["store.ts#L1"]]]);
+	check(JSON.stringify(slotIds(bais.dispatchPack(trio, [], nfp, 3))) === JSON.stringify(["n#01", "n#02"]),
+		`level dispatch seats disjoint sketches, holds the shared level`);
+	check(JSON.stringify(bais.resolveFileClaims(["s.ts#L0", "f.ts#L1"], ["s.ts"])) === JSON.stringify(["s.ts#L0", "f.ts"]) &&
+		JSON.stringify(bais.unresolvedLevelFiles(["f.ts#L1", "s.ts#L9"], ["s.ts"])) === JSON.stringify(["f.ts", "s.ts"]) &&
+		bais.unresolvedLevelFiles(["s.ts#L0"], ["s.ts"]).length === 0, `level fallback resolves + names`);
+	check(bais.warnLevelFallback(["f.ts"]) ===
+		"[bais] level pointer with no built index fall back to whole-file: f.ts (rebuild BAGL levels for the file, or drop the #Ln suffix)",
+		`level warn shape`);
+}
+
 // ---- §D-blocked dispatch never hands out blocked work (M-bi4/bais4, bi#37 Mode B) ----
 // BAML spec: "dispatch skips leased and blocked issues" (main.baml:1785)
 // plus "dangling Blocks edge keeps issue out of ready" (main.baml:170).

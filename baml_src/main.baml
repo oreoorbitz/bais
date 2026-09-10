@@ -1777,20 +1777,142 @@ class AgentSlot {
     issue_id: string,
 }
 
+// ── File-claim level pointers (hub#236) ────────────────────────────────────
+// `Files:` lines accept `path#L0`, `path#L1`, `path#L2` level pointers
+// beside bare `path` claims. A level pointer names an LOD sketch of the
+// file instead of the whole file (L0 = symbol sketch per hub#232, L1 =
+// signature sketch per hub#233, L2 = source refinement, reserved). Bare
+// `path` keeps whole-file semantics, byte-identical to before.
+//
+// Parsing: `#` still starts a comment UNLESS it forms a level tail —
+// `#[Ll]<digits>` at the end of a token with a non-empty path head — so
+// `Files: a.ts#L1 b.ts # note` claims `a.ts#L1` + `b.ts`, while
+// `Files: a.ts # dup` still claims `a.ts`. A lone `#L9` (unknown level)
+// is kept as a pointer and resolved below — never silently dropped.
+//
+// Clash (claim gate, blast ordering, dispatch): a level pointer is
+// narrower-or-equal to its file. Same file + different levels = no
+// clash (disjoint sketches, finer granularity, fewer false conflicts);
+// same file + same level, or either side whole-file = clash.
+//
+// Resolution (warn-first, never silent, never fail-closed): levels bind
+// to built indexes (BAGL levels are derived, rebuildable artifacts — the
+// host injects which files are indexed, BAML only derives the fallback).
+// A level pointer whose level is unknown or whose file has no built
+// index degrades to whole-file semantics; unresolved_level_files names
+// the files the host must warn about.
+function is_level_digit(c: string) -> bool {
+    c == "0"
+        || c == "1"
+        || c == "2"
+        || c == "3"
+        || c == "4"
+        || c == "5"
+        || c == "6"
+        || c == "7"
+        || c == "8"
+        || c == "9"
+}
+
+// A `#` tail of the form `[Ll]<digits>` (e.g. `L1`, `l0`, `L10`).
+function is_level_tail(tail: string) -> bool {
+    if (tail.length() < 2) {
+        return false;
+    }
+    let head = tail.slice(0, 1);
+    if (head != "L" && head != "l") {
+        return false;
+    }
+    let i = 1;
+    while (i < tail.length()) {
+        if (!is_level_digit(tail.slice(i, i + 1))) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// Base path of a claim: `a.ts#L1` -> `a.ts`; a bare path is its own base.
+function claim_base(claim: string) -> string {
+    let hash = claim.index_of("#");
+    if (hash == null) {
+        return claim;
+    }
+    if (is_level_tail(claim.slice(hash + 1, claim.length()))) {
+        return claim.slice(0, hash);
+    }
+    claim
+}
+
+// Canonical level of a claim: `L0`/`L1`/`L2` (either case in, uppercase
+// out), the raw tail for an unknown numeric level (e.g. `L9`), and ""
+// for a whole-file claim. Unknown levels resolve via the fallback, so
+// they stay visible here instead of collapsing to whole-file silently.
+function claim_level(claim: string) -> string {
+    let hash = claim.index_of("#");
+    if (hash == null) {
+        return "";
+    }
+    let tail = claim.slice(hash + 1, claim.length());
+    if (!is_level_tail(tail)) {
+        return "";
+    }
+    let digits = tail.slice(1, tail.length());
+    if (digits == "0") {
+        return "L0";
+    }
+    if (digits == "1") {
+        return "L1";
+    }
+    if (digits == "2") {
+        return "L2";
+    }
+    tail
+}
+
+// Levels with an LOD sketch behind them. Anything else numeric (L9, L10)
+// parses as a pointer but never resolves narrow — the fallback arm.
+function known_file_level(level: string) -> bool {
+    level == "L0" || level == "L1" || level == "L2"
+}
+
 function parse_file_claims(body: string) -> string[] {
     let out: string[] = [];
     for (let line in body.lines()) {
         let t = line.trim();
         if (t.starts_with("Files:")) {
             let rest = t.slice(6, t.length()).trim();
-            let hash = rest.index_of("#");
-            if (hash != null) {
-                rest = rest.slice(0, hash).trim();
-            }
+            // Token scan, not whole-rest comment strip: a `#Ln` tail is a
+            // level pointer, any other `#` starts a comment that drops the
+            // token and everything after it. Inputs without level tails
+            // behave byte-identically to the old strip-first form.
+            let stopped = false;
             for (let part in rest.split(" ")) {
-                let p = part.trim();
-                if (p != "" && !contains_id(out, p)) {
-                    out.push(p);
+                if (!stopped) {
+                    let p = part.trim();
+                    if (p != "") {
+                        let hash = p.index_of("#");
+                        if (hash == null) {
+                            if (!contains_id(out, p)) {
+                                out.push(p);
+                            }
+                        } else {
+                            let tail = p.slice(hash + 1, p.length());
+                            let head = p.slice(0, hash);
+                            if (is_level_tail(tail) && head != "") {
+                                if (!contains_id(out, p)) {
+                                    out.push(p);
+                                }
+                            } else {
+                                let h = head.trim();
+                                if (h != "" && !contains_id(out, h)) {
+                                    out.push(h);
+                                }
+                                stopped = true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1807,13 +1929,61 @@ function files_for(id: string, footprints: FileClaim[]) -> string[] {
     []
 }
 
+// Two claims overlap iff they name the same base file AND neither narrows
+// to a different level: whole-file overlaps everything of its file, the
+// same level overlaps itself, different levels are disjoint.
+function claims_overlap(a: string, b: string) -> bool {
+    if (claim_base(a) != claim_base(b)) {
+        return false;
+    }
+    let la = claim_level(a);
+    let lb = claim_level(b);
+    la == "" || lb == "" || la == lb
+}
+
 function files_clash(a: string[], b: string[]) -> bool {
     for (let x in a) {
-        if (contains_id(b, x)) {
-            return true;
+        for (let y in b) {
+            if (claims_overlap(x, y)) {
+                return true;
+            }
         }
     }
     false
+}
+
+// Narrow claims stay narrow; a level pointer with an unknown level or
+// with no built index for its file degrades to its base path
+// (whole-file semantics). `indexed` is host-injected: the files with a
+// built level index.
+function resolve_file_claims(claims: string[], indexed: string[]) -> string[] {
+    let out: string[] = [];
+    for (let c in claims) {
+        let level = claim_level(c);
+        if (level != "" && (!known_file_level(level) || !contains_id(indexed, claim_base(c)))) {
+            out.push(claim_base(c));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+// Every base file whose level pointer needs the fallback — the host warns
+// naming these (warn-first) and serves resolve_file_claims. Deduped,
+// first-seen order. Empty means every level resolved narrow.
+function unresolved_level_files(claims: string[], indexed: string[]) -> string[] {
+    let out: string[] = [];
+    for (let c in claims) {
+        let level = claim_level(c);
+        if (level != "") {
+            let base = claim_base(c);
+            if ((!known_file_level(level) || !contains_id(indexed, base)) && !contains_id(out, base)) {
+                out.push(base);
+            }
+        }
+    }
+    out
 }
 
 function dispatch_pack(
@@ -2047,6 +2217,80 @@ test "parse_file_claims reads Files lines, strips comments, unions" {
     assert.equal(parse_file_claims("Files: a.ts\nprose\nFiles: b.ts"), ["a.ts", "b.ts"]);
     assert.equal(parse_file_claims("Files:"), []);
     assert.equal(parse_file_claims("NotFiles: a.ts"), [])
+}
+
+test "parse_file_claims keeps level pointers, comments still strip" {
+    assert.equal(
+        parse_file_claims("Files: a.ts#L0 b.ts#L1 c.ts#L2 d.ts"),
+        ["a.ts#L0", "b.ts#L1", "c.ts#L2", "d.ts"],
+    );
+    assert.equal(parse_file_claims("Files: a.ts#l1"), ["a.ts#l1"]);
+    assert.equal(parse_file_claims("Files: a.ts#L1 # trailing note"), ["a.ts#L1"]);
+    assert.equal(parse_file_claims("Files: a.ts#L1 b.ts # note"), ["a.ts#L1", "b.ts"]);
+    assert.equal(parse_file_claims("Files: a.ts#L9"), ["a.ts#L9"]);
+    // Non-level `#` is still a comment, exactly as before.
+    assert.equal(parse_file_claims("Files: a.ts#frag c.ts"), ["a.ts"]);
+    assert.equal(parse_file_claims("Files: # full-line comment"), []);
+    assert.equal(parse_file_claims("Files: #L1"), [])
+}
+
+test "claim base and level split pointers from whole files" {
+    assert.equal(claim_base("a.ts#L1"), "a.ts");
+    assert.equal(claim_base("a.ts"), "a.ts");
+    assert.equal(claim_level("a.ts#L0"), "L0");
+    assert.equal(claim_level("a.ts#l2"), "L2");
+    assert.equal(claim_level("a.ts#L9"), "L9");
+    assert.equal(claim_level("a.ts"), "");
+    assert.equal(known_file_level("L0"), true);
+    assert.equal(known_file_level("L2"), true);
+    assert.equal(known_file_level("L9"), false);
+    assert.equal(known_file_level(""), false)
+}
+
+test "files_clash narrows on levels: different-level shares, overlap clashes" {
+    // Same file, different levels: disjoint sketches, no clash.
+    assert.is_true(!files_clash(["a.ts#L0"], ["a.ts#L1"]));
+    assert.is_true(!files_clash(["a.ts#L1"], ["a.ts#L2"]));
+    // Overlapping: same level, or either side whole-file.
+    assert.is_true(files_clash(["a.ts#L1"], ["a.ts#L1"]));
+    assert.is_true(files_clash(["a.ts"], ["a.ts#L0"]));
+    assert.is_true(files_clash(["a.ts#L2"], ["a.ts"]));
+    assert.is_true(files_clash(["a.ts"], ["a.ts"]));
+    // Different files never clash, levels or not.
+    assert.is_true(!files_clash(["a.ts#L0"], ["b.ts#L0"]));
+    assert.is_true(!files_clash(["a.ts"], ["b.ts"]))
+}
+
+test "level fallback warns naming the file, serves whole-file" {
+    let indexed = ["store.ts"];
+    assert.equal(
+        resolve_file_claims(["store.ts#L0", "store.ts#L1"], indexed),
+        ["store.ts#L0", "store.ts#L1"],
+    );
+    assert.equal(unresolved_level_files(["store.ts#L0", "store.ts#L1"], indexed), []);
+    // No index built for the file: warn naming it, fall back to whole-file.
+    assert.equal(resolve_file_claims(["fresh.ts#L0"], indexed), ["fresh.ts"]);
+    assert.equal(unresolved_level_files(["fresh.ts#L0", "fresh.ts#L1"], indexed), ["fresh.ts"]);
+    // Unknown level never resolves narrow, even on an indexed file.
+    assert.equal(resolve_file_claims(["store.ts#L9"], indexed), ["store.ts"]);
+    assert.equal(unresolved_level_files(["store.ts#L9"], indexed), ["store.ts"]);
+    // Whole-file claims never warn.
+    assert.equal(unresolved_level_files(["store.ts", "fresh.ts"], indexed), [])
+}
+
+test "dispatch packs same-file different-level issues together" {
+    let issues = [mk_issue("t#01", Status.Open), mk_issue("t#02", Status.Open), mk_issue("t#03", Status.Open)];
+    let footprints = [
+        FileClaim { issue_id: "t#01", files: ["a.ts#L0"] },
+        FileClaim { issue_id: "t#02", files: ["a.ts#L1"] },
+        FileClaim { issue_id: "t#03", files: ["a.ts#L1"] },
+    ];
+    // t#01 + t#02 are disjoint sketches and both seat; t#03 shares t#02's
+    // level so the third slot stays empty.
+    let slots = dispatch_pack(issues, [], [], footprints, 3);
+    assert.equal(slots.length(), 2);
+    assert.equal(slot_issue(slots, 0), "t#01");
+    assert.equal(slot_issue(slots, 1), "t#02")
 }
 
 // ── Goal-conditioned relevance (bi#133) ─────────────────────────────────────
