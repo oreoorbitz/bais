@@ -20,7 +20,7 @@ import { eventId, verifyEventId } from "./ids.js";
 import { createHash } from "node:crypto";
 import { projectName } from "./graph.js";
 import { whyNotIn } from "./graph.js";
-import { closeEvidenceIn, knownDrillNames, scriptsDirFor } from "./graph.js";
+import { closeEvidenceIn, e2eDirFor, knownDrillNames, knownE2eStems, scriptsDirFor } from "./graph.js";
 import type { CloseEvidenceProblem } from "./graph.js";
 import type { BaisEdge, BaisFile, HostLease, WhyNot } from "./graph.js";
 
@@ -1279,6 +1279,14 @@ export function storeCheck(issuesDir: string): {
 		remaining = next;
 	}
 	// bi#83: Done tasks must carry resolvable close-evidence refs.
-	const evidence = closeEvidenceIn(entries, project, knownDrillNames(scriptsDirFor(issuesDir)));
+	// hub#231: the store path resolves the e2e ref kind too (hub#188) —
+	// without the 4th arg every resolving e2e cite reports
+	// unresolvable-e2e here while the cli scan path stays clean.
+	// Red-check (bi#57, observed 2026-09-10): arg dropped + rebuild →
+	// storeCheck on a fixture hub citing e2e(case-a) rows
+	// [{"reason":"unresolvable-e2e","ref":"e2e(case-a)","status":"Missing"}]
+	// FOR THAT REASON; restored → clean. cli.ts:1075 merge retained
+	// (outside hub#231 ownership) so `bais check` output is unchanged.
+	const evidence = closeEvidenceIn(entries, project, knownDrillNames(scriptsDirFor(issuesDir)), knownE2eStems(e2eDirFor(issuesDir)));
 	return { ok, bad, dangling, cycles: remaining, evidence };
 }
