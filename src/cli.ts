@@ -92,6 +92,10 @@ Usage:
   bais ready [--json] [--why-not] [--wait [--timeout N]] [--order blast-radius|urgency]
   bais dispatch --agents N [--json] [--briefs]  # dry-run swarm pack: load-bearing first (bi#123), never mutates
                                 # carries as_of + completeness from the store
+  bais campaign fold --handoffs <dir> --issue <issue.toml> [--fold-scope-strict]
+                                # fold-time verdicts: per-handoff scope check + oracle-continuity
+                                # refill verdict + empirical red-check (hub#230); warn-first,
+                                # warnings on stderr, exit untouched unless a refusal binds
   bais goal <start|sketch|commit|status|switch> [--approve]  # per-directory campaign interview (bi#132)
   bais goal keep-surface <surface|case>          # rebind the case file to the live snapshot (hub#221)
   bais goal retire-surface <surface|case> --reason <R>  # mark the case file, ledger the retire; check stops flagging (hub#221)
@@ -2768,6 +2772,159 @@ if (cmd === "delete") {
 	if (asJson) printJson({ deleted: id });
 	else console.log(`deleted\t${id}`);
 	process.exit(0);
+}
+
+if (cmd === "campaign") {
+// hub#230 (hub#219 item 7; hub#187/hub#192): fold-time campaign verdicts.
+// `bais campaign fold` runs the fold-time consumers over a handoffs dir
+// for one folding issue: per-handoff validation with the foldScope check
+// (the handoff-validate.mjs item-1 call path), the oracleContinuity
+// refill verdict over the goal gates (the same gate list `bais goal gate`
+// runs: baml check/test for the bais package when present, then the
+// committed goal's e2e scaffolds — but uncached and retry-free, so every
+// fold re-runs fresh; a fingerprint replay would be stale by construction
+// on a workspace the fold just changed), and the empirical
+// verifyRedCheck when the merger names hunk + expected (the host executor
+// re-runs --redcheck-run and judges observed-vs-expected; reverting the
+// hunk beforehand stays the host's precondition — without a reverted hunk
+// the suite run proves nothing).
+// Pure rules live ONLY in scripts/campaign.mjs (single-source, hub#163);
+// this block routes argv, gathers filesystem facts, and renders; it never
+// mirrors gate semantics. The full seat/land/verdict/refill/burndown
+// mapping (`bais campaign --budget N`, campaign.mjs header) is a
+// remainder for the campaign lane.
+// Warn-first (hub#158): warnings and operator-confirms go to stderr and
+// never move the exit code; --fold-scope-strict turns scope/budget
+// refusals into errors. Exits 0 on a clean fold, 1 on a refused fold, 2
+// on usage. Touches no dispatch/ready/store/check/goal paths.
+//
+// Red-check (hub#230/bi#57, recorded 2026-09-10): with the scope call
+// neutered (issueFile dropped from scopeOpts — no foldscope verdict),
+// the strict out-of-scope fixture folded exit 0 `campaign fold: clean`
+// with `scope n/a (note: diff-only gate)` (bad — gold-plating validated
+// clean, the exact scope bleed hub#192 exists to catch); with the oracle
+// call neutered (verdict forced ok), the red-oracle fold printed
+// `oracle green (0 gates)` with empty stderr (bad — outcome-fabrication
+// invisible, the exact escape hub#187 exists to close). Restored, the
+// strict fold exits 1 naming src/gold-plating.ts and the red-oracle fold
+// warns naming `baml check (bais)`. A fold surface that cannot go red is
+// camouflage, not coverage.
+	const usage = "bais campaign fold --handoffs <dir> --issue <issue.toml> [--fold-scope-strict] [--redcheck-hunk <hunk> --redcheck-expected <text> [--redcheck-run <cmd>]] [--json]";
+	if (argv[1] !== "fold") {
+		console.error(usage);
+		process.exit(2);
+	}
+	const handoffsDir = flagVal("--handoffs");
+	const issueFile = flagVal("--issue");
+	if (!handoffsDir || handoffsDir.startsWith("--") || !issueFile || issueFile.startsWith("--")) {
+		console.error(usage);
+		process.exit(2);
+	}
+	const strictScope = argv.includes("--fold-scope-strict");
+	const redHunk = flagVal("--redcheck-hunk");
+	const redExpected = flagVal("--redcheck-expected");
+	const redRun = flagVal("--redcheck-run");
+	if ((redHunk != null || redExpected != null || redRun != null) && (redHunk == null || redExpected == null)) {
+		console.error(`${usage} (--redcheck-hunk and --redcheck-expected are required together)`);
+		process.exit(2);
+	}
+	const cm = await loadScriptModule("campaign.mjs");
+	const hv = await loadScriptModule("handoff-validate.mjs");
+	let handoffs: string[];
+	try {
+		handoffs = readdirSync(handoffsDir).filter((f) => f.endsWith(".handoff")).sort();
+	} catch {
+		console.error(`bais campaign fold refused: unreadable handoffs dir ${handoffsDir}`);
+		process.exit(1);
+	}
+	if (!existsSync(issueFile)) {
+		console.error(`bais campaign fold refused: unknown issue file ${issueFile}`);
+		process.exit(1);
+	}
+	const scopeOpts = {
+		issueFile,
+		...(strictScope ? { foldScopePhase: "fail", foldBudgetPhase: "fail" } : {}),
+	};
+	const folds = handoffs.map((f) => hv.validateHandoffFile(join(handoffsDir, f), scopeOpts));
+	const issueBody = hv.extractIssueBody(readFileSync(issueFile, "utf8")) ?? "";
+	// Oracle: same gate list as `bais goal gate`; skipped loud when no
+	// goal is committed (an oracle-less fold stays silent, hub#187).
+	let oracle: any = { skipped: "no committed goal at .bais/goal.toml — oracle needs the hub#184 scaffolds (hub#187 stays silent here)" };
+	const goalFile = join(root, "goal.toml");
+	if (existsSync(goalFile)) {
+		const gm = await loadGoalModule();
+		const g = gm.parseGoalToml(readFileSync(goalFile, "utf8"));
+		const hubRoot = resolve(issuesDir, "..", "..");
+		const gates: { name: string; argv: string[]; cwd?: string; timeout?: number }[] = [];
+		if (existsSync(join(hubRoot, "bais", "baml.toml"))) {
+			gates.push(
+				{ name: "baml check (bais)", argv: ["baml", "check", "--project", "bais"], cwd: hubRoot, timeout: 300000 },
+				{ name: "baml test (bais)", argv: ["baml", "test", "--project", "bais"], cwd: hubRoot, timeout: 300000 },
+			);
+		}
+		gates.push(...gm.goalGates(g, { e2eDir: ".bais/e2e" }));
+		oracle = cm.oracleContinuity({ gates, issueBody, fingerprint: "campaign-fold" });
+	}
+	// Empirical red-check: only when the merger names hunk + expected.
+	// No --redcheck-run means no executed re-run — verifyRedCheck's own
+	// attestation-only verdict carries that (warn-first), never a pass.
+	let redcheck: any = { skipped: "no red-check named (pass --redcheck-hunk/--redcheck-expected to verify empirically)" };
+	if (redHunk != null && redExpected != null) {
+		const execute = redRun == null ? null : (rc: any) => {
+			try {
+				return String(execFileSync("sh", ["-c", redRun], { encoding: "utf8", timeout: 300000 }) ?? "");
+			} catch (e: any) {
+				// The reverted hunk is EXPECTED to fail the suite — a
+				// nonzero exit still carries the observed output.
+				return String((e?.stdout ?? "") + (e?.stderr ?? e?.message ?? ""));
+			}
+		};
+		redcheck = cm.verifyRedCheck({
+			redcheck: { hunk: redHunk, expected: redExpected },
+			execute,
+			phase: strictScope ? "fail" : cm.CAMPAIGN_BUDGETS.redCheckPhase,
+		});
+	}
+	const foldsOk = folds.every((r: any) => r.ok);
+	const foldOk = foldsOk && oracle.refusal == null && redcheck.refusal == null;
+	for (const w of folds.flatMap((r: any) => [r.foldscope?.warning, r.foldscope?.operatorConfirm])) {
+		if (w != null) console.error(w);
+	}
+	for (const s of [oracle.warning, oracle.skipped, redcheck.warning].flatMap((v: any) =>
+		typeof v === "string" && v.startsWith("[bais]") ? [v] : [])) console.error(s);
+	for (const skip of oracle.skips ?? []) console.error(skip);
+	if (asJson) {
+		printJson({
+			ok: foldOk,
+			folds: folds.map((r: any) => ({ file: r.file, ok: r.ok, type: r.type, base: r.base, foldscope: r.foldscope, errors: r.errors })),
+			oracle: { ok: oracle.ok ?? null, red: oracle.red ?? [], fixed: oracle.fixed ?? [], refusal: oracle.refusal ?? null, warning: oracle.warning ?? null, skipped: oracle.skipped ?? null },
+			redcheck: { ok: redcheck.ok ?? null, attestationOnly: redcheck.attestationOnly ?? null, observed: redcheck.observed ?? null, refusal: redcheck.refusal ?? null, warning: redcheck.warning ?? null, skipped: redcheck.skipped ?? null },
+		});
+	} else {
+		if (handoffs.length === 0) console.log("fold\tno-handoffs\t(dir carries no .handoff files — vacuous fold, bi#55)");
+		for (const r of folds) {
+			if (r.ok) console.log(`fold\tok\t${r.file}`);
+			else {
+				console.log(`fold\trefused\t${r.file}\t${r.errors.length} error(s)`);
+				for (const e of r.errors) console.log(`error\t${e.line}\t${e.message}`);
+			}
+			if (r.foldscope == null) console.log(`scope\tn/a\t${r.file}\t(note: diff-only gate)`);
+			else if (r.foldscope.ok) console.log(`scope\tclean\t${r.file}`);
+			else if (r.foldscope.warning != null) console.log(`scope\twarn\t${r.file}\t${r.foldscope.excess.join(", ")}`);
+			else if (r.foldscope.operatorConfirm != null) console.log(`scope\toperator-confirm\t${r.file}`);
+			else console.log(`scope\trefused\t${r.file}\t${(r.foldscope.excess ?? []).join(", ")}`);
+		}
+		if (oracle.skipped) console.log(`oracle\tskipped\t${oracle.skipped}`);
+		else if (oracle.refusal != null) console.log(`oracle\trefused\t${oracle.refusal}`);
+		else if (oracle.warning != null) console.log(`oracle\twarn\t${oracle.red.join(", ")}`);
+		else console.log(`oracle\tgreen\t(${oracle.gate?.results?.length ?? 0} gates)`);
+		if (redcheck.skipped) console.log(`redcheck\tskipped\t${redcheck.skipped}`);
+		else if (redcheck.refusal != null) console.log(`redcheck\trefused\t${redcheck.refusal}`);
+		else if (redcheck.warning != null) console.log(`redcheck\twarn\thunk ${redHunk}`);
+		else console.log(`redcheck\tverified\thunk ${redHunk} reproduced ${JSON.stringify(redExpected)}`);
+		console.log(foldOk ? "campaign fold: clean" : "campaign fold: refused");
+	}
+	process.exit(foldOk ? 0 : 1);
 }
 
 console.error(`Unknown command: ${cmd}`);
