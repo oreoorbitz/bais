@@ -5,17 +5,19 @@
 // fails LOUD: printed diffs show BOTH sides (store vs scan).
 //
 // Run (daily, from repo root): node bais/scripts/cross-check.mjs [issues-dir]
-//   default issues-dir: bi/.bais/issues
+//   default: migrated layout — root .bais/issues first, then each
+//   project-local .bais/issues when present (absent or store-less boards
+//   skip with reason, not failure). An explicit [issues-dir] keeps the
+//   legacy single-dir contract (missing dir / missing store FAIL).
 // Read-only: never writes to the issues dir (or anywhere else). Exits non-zero
 // on any divergence; store staleness (projection older than newest *.toml) is
 // a warning only.
 
 import { existsSync, readdirSync, statSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, relative, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { dbPathFor, hasStore, storeEdges, storeGraph, storeList, storeReady } from "../dist/src/store.js";
 import { blastRadii, loadIssues, readyIssues } from "../dist/src/graph.js";
-
-const issuesDir = resolve(process.argv[2] ?? "bi/.bais/issues");
 
 let failures = 0;
 const check = (cond, msg) => {
@@ -24,6 +26,31 @@ const check = (cond, msg) => {
 		console.error(`FAIL: ${msg}`);
 	} else console.log(`ok: ${msg}`);
 };
+
+// Target resolution (hub#242): bi/.bais was deleted in the board migration —
+// the root .bais is the live hub. The bare default checks the migrated layout
+// anchored at the repo root (derived from this script's path, so it works from
+// any cwd): the root hub first, then each project-local board when present.
+// Absent or store-less project-local boards skip with reason, never fail. An
+// explicit [issues-dir] keeps the legacy single-dir contract exactly (missing
+// dir / missing store FAIL) for drill dirs and tiers pins.
+const here = dirname(fileURLToPath(import.meta.url));
+const repoRoot = resolve(here, "..", "..");
+const rel = (p) => {
+	const r = relative(process.cwd(), p);
+	return r && !r.startsWith("..") ? r : p;
+};
+const explicitArg = process.argv[2];
+/** @type {{ dir: string; kind: "explicit" | "required" | "local"; reason?: string }[]} */
+const targets = explicitArg
+	? [{ dir: resolve(explicitArg), kind: "explicit" }]
+	: [
+			{ dir: resolve(repoRoot, ".bais/issues"), kind: "required", reason: "root hub (live board post-migration)" },
+			{ dir: resolve(repoRoot, "bi/.bais/issues"), kind: "local", reason: "absent by design post-migration (root .bais is the live hub)" },
+			{ dir: resolve(repoRoot, "bais/.bais/issues"), kind: "local", reason: "no bais-local board" },
+			{ dir: resolve(repoRoot, "bagl/.bais/issues"), kind: "local", reason: "bagl-local board without a store projection" },
+			{ dir: resolve(repoRoot, "bits/.bais/issues"), kind: "local", reason: "bits-local board without a store projection" },
+		];
 
 const fmt = (xs) => (xs.length ? xs.join(", ") : "(none)");
 const sorted = (xs) => [...new Set(xs)].sort();
@@ -61,10 +88,27 @@ const asSet = (xs) => new Set(xs);
 		`G-strict(b): pre-existing graph checks see a clean world (ready ${gSurvivorsReady.join(",")}, zero problems)`);
 }
 
-if (!existsSync(issuesDir)) {
-	console.error(`FAIL: issues dir missing: ${issuesDir}`);
-	process.exit(1);
-}
+let checkedDirs = 0;
+let skippedDirs = 0;
+for (const target of targets) {
+	const issuesDir = target.dir;
+	const tag = rel(issuesDir);
+	if (!existsSync(issuesDir)) {
+		if (target.kind === "local") {
+			console.log(`skip: ${tag} absent (${target.reason})`);
+			skippedDirs++;
+			continue;
+		}
+		console.error(`FAIL: issues dir missing: ${issuesDir}`);
+		process.exit(1);
+	}
+	if (target.kind === "local" && !hasStore(issuesDir)) {
+		console.log(`skip: ${tag} has no store projection (${target.reason}; scan fallback, nothing to cross-check)`);
+		skippedDirs++;
+		continue;
+	}
+	console.log(`--- cross-check: ${tag} ---`);
+	checkedDirs++;
 
 // Staleness is a WARNING, not a failure: the projection may legitimately lag
 // the directory. Compare store.db mtime against the newest *.toml mtime.
@@ -72,7 +116,8 @@ try {
 	const dbPath = dbPathFor(issuesDir);
 	if (!hasStore(issuesDir)) {
 		console.error(`FAIL: no store at ${dbPath} — store answers unavailable (re-ingest; scan has no baseline to compare)`);
-		process.exit(1);
+		failures++;
+		continue;
 	}
 	const tomls = readdirSync(issuesDir).filter((f) => f.endsWith(".toml"));
 	const newestToml = tomls.reduce((m, f) => Math.max(m, statSync(resolve(issuesDir, f)).mtimeMs), 0);
@@ -86,7 +131,8 @@ try {
 	}
 } catch (e) {
 	console.error(`FAIL: staleness probe errored: ${e?.message ?? e}`);
-	process.exit(1);
+	failures++;
+	continue;
 }
 
 // Fresh scan answers (host graph mirrors — BAML owns the rules).
@@ -284,10 +330,15 @@ const pins = { "bi#26": 1, "bi#32": 0, "bi#69": 0, "bi#27": 0, "bi#30": 0 };
 			for (const [id, want] of bad) console.error(`  ${id}: want open=${want} got open=${scanBr.get(id)?.open_downstream ?? "(absent)"}`);
 		} else console.log(`ok: blast-radius pins hold (${Object.entries(pins).map(([k, v]) => `${k.split("#")[1]}:${v}`).join(" ")})`);
 	}
-}
+} // end §6
+} // end per-dir loop (hub#242: one full §§1-6 pass per board)
 
+if (checkedDirs === 0 && !failures) {
+	console.error(`FAIL: no issues dir checked (${skippedDirs} skipped) — root hub missing and no explicit dir given`);
+	process.exit(1);
+}
 if (failures) {
 	console.error(`${failures} failure(s)`);
 	process.exit(1);
 }
-console.log("cross-check: all green");
+console.log(`cross-check: all green (${checkedDirs} dir(s) checked, ${skippedDirs} skipped)`);
