@@ -19,7 +19,7 @@ import { resolveHubDir } from "./resolve.js";
 function printJson(obj: unknown): void {
 	writeSync(1, JSON.stringify(obj, null, 2) + "\n");
 }
-import { baselineIssueFromSketch, blastRadii, closeEvidenceIn, creationDaysFromMtimes, cyclicIds, danglingRefsIn, declarationDistributionIn, dispatchPack, e2eCaseAnchorsIn, e2eDirFor, e2eDriftJoin, epicChildren, epicWithheldIn, groupSwarmClaims, hashEvidenceIn, isDeclaredFootprint, isEpic, knownDrillNames, knownE2eStems, layerDriftIn, loadIssues, nowDays, parseFileClaims, parseGoalTestingSurface, parseSwarmVerdicts, precedesAncestors, projectName, radiusVsEvidenceIn, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnEpicWithheld, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
+import { baselineIssueFromSketch, blastRadii, closeEvidenceIn, creationDaysFromMtimes, cyclicIds, danglingRefsIn, declarationDistributionIn, dispatchPack, e2eCaseAnchorsIn, e2eDirFor, e2eDriftJoin, epicChildren, epicWithheldIn, groupSwarmClaims, hashEvidenceIn, isDeclaredFootprint, isEpic, knownDrillNames, knownE2eStems, layerDriftIn, loadIssues, nowDays, parseCloseEvidence, parseFileClaims, parseGoalTestingSurface, parseSwarmVerdicts, precedesAncestors, projectName, radiusVsEvidenceIn, readyIssues, scriptsDirFor, swarmVerdictProblemsIn, urgencyFor, warnEpicWithheld, warnUnknownShared, warnUnknownWithheld, whyNotIn } from "./graph.js";
 import { findShadowHubs, formatShadow } from "./fork.js";
 import type { BlastRadius, Urgency } from "./graph.js";
 import { parseBaisFile } from "./toml.js";
@@ -128,7 +128,7 @@ Usage:
   bais renew <id> --as <owner> [--for 4h]  # extend a live claim (heartbeat)
   bais reap [--now <instant>] [--json]     # expired Doing -> Open
   bais list [--json] [--claims]            # --claims appends holder/lease cols + swarm groups (bi#130)
-  bais check [--json] [--registry-strict] [--e2e-strict] [--audit-strict]
+  bais check [--json] [--registry-strict] [--e2e-strict] [--audit-strict] [--selfmod-strict]
                                 # --registry-strict: prompt-registry problems + parse failures become
                                 # fatal (hub#210); default phase is warn (advisory, exit untouched)
                                 # --e2e-strict: unresolvable-e2e evidence + e2e-gap/e2e-stale drift
@@ -136,6 +136,9 @@ Usage:
                                 # --audit-strict: layer-drift / radius-vs-evidence /
                                 # declaration-distribution / hash-vs-evidence audits become
                                 # fatal (hub#193, hub#224); default warn
+                                # --selfmod-strict: self-modification closes without
+                                # Evidence: drill()/e2e() cites become fatal
+                                # (hub#218); default warn
   bais check [--hash-root <dir>]...          # extra sibling-clone roots for
                                 # the hash-vs-evidence audit (fixture hubs carry
                                 # no siblings; repeatable)
@@ -995,6 +998,37 @@ if (cmd === "check") {
 		return { ok: false, tried };
 	};
 	const hashAudit = hashEvidenceIn(checkFiles.map((f) => ({ id: f.issue.id, body: f.issue.body })), hashResolve);
+	// hub#218: trace-provenance-law audit (warn-first-then-fail, the
+	// hub#210 rollout precedent). A Done issue is self-modification-class
+	// when any Files: footprint touches the law's five classes — BAML
+	// sources (baml_src/, *.baml), skills (skill), prompts (prompt),
+	// memory (memory), or tools (tool, plus the src/cli.* entry points
+	// agents invoke). The close must cite executable eval evidence: at
+	// least one Evidence: drill()/e2e() ref. Verdict-only closes satisfy
+	// close-evidence (bi#83) but not this audit — a review record is not
+	// an eval run. Warn phase is advisory, never touching the exit code;
+	// --selfmod-strict flips to fail. Done-only: Open/Doing carry no
+	// requirement (a proposal is not a close).
+	const SELFMOD_CLASS_RE = /(baml_src|\.baml$|skill|prompt|memory|tool|src\/cli\.)/i;
+	const selfmodAudit = swarmEntries
+		.filter((e) => e.status === "Done")
+		.flatMap((e) => {
+			const hits = parseFileClaims(e.body).filter((c) => SELFMOD_CLASS_RE.test(c));
+			if (hits.length === 0) return [];
+			const executable = parseCloseEvidence(e.body).some((r) => r.kind === "drill" || r.kind === "e2e");
+			return executable ? [] : [{ id: e.id, footprints: hits }];
+		});
+	const selfmodPhase: "warn" | "fail" = argv.includes("--selfmod-strict") ? "fail" : "warn";
+	const selfmodFatal = selfmodPhase === "fail" ? selfmodAudit.length : 0;
+	const selfmodJson = (): unknown => ({ phase: selfmodPhase, problems: selfmodAudit });
+	const printSelfmod = (): void => {
+		for (const p of selfmodAudit) {
+			console.log(`selfmod\t${p.id}\tselfmod-no-eval-evidence\tDone self-modification-class (${p.footprints.join(", ")}) with no Evidence: drill()/e2e() cite — bind the close to executable eval evidence (hub#218)`);
+		}
+		console.log(
+			`selfmod-phase\t${selfmodPhase}\t${selfmodPhase === "warn" ? "advisory — --selfmod-strict flips to fail (hub#218)" : "strict — self-modification closes without eval evidence are fatal (hub#218)"}`,
+		);
+	};
 	// hub#195: the committed goal.toml is bound to the human-approved sketch
 	// by approved_sketch_hash; drift (post-approval nodes/edges edits) flags
 	// loud and fatal — the bi#136 "snapshot stale" precedent, never silently
@@ -1093,7 +1127,7 @@ if (cmd === "check") {
 			const staleClaims = checkFiles
 				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
 				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
-			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence, staleClaims, staleStore, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson(), goalSketch: sketchStaleJson() }, null, 2));
+			console.log(JSON.stringify({ ok, bad, dangling, cycles, evidence, staleClaims, staleStore, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson(), goalSketch: sketchStaleJson(), selfmod: selfmodJson() }, null, 2));
 		} else {
 			for (const d of missing) console.log(`dangling\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
 			for (const d of external) console.log(`external\t${d.declaredBy}\t${d.side}=${d.id}\t${d.kind} ${d.from} -> ${d.to}`);
@@ -1112,15 +1146,16 @@ if (cmd === "check") {
 			printE2eDrift();
 			printAudits();
 			printSketchStale();
+			printSelfmod();
 			console.log(`ok\t${ok} issues, ${bad.length} bad`);
-			if (bad.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal) process.exit(1);
+			if (bad.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal || selfmodFatal) process.exit(1);
 			process.exit(0);
 		}
 		// hub#188/hub#191/hub#193: in the warn phases unresolvable-e2e and
 		// every drift/audit row are advisory — e2eDriftFatal/auditFatal are
 		// zero and unresolvable-e2e is excluded from the fatal count.
 		const fatalEvidence = evidence.filter((p) => p.status === "Missing" && !(e2ePhase === "warn" && p.reason === "unresolvable-e2e")).length;
-		if (bad.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal) process.exit(1);
+		if (bad.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal || selfmodFatal) process.exit(1);
 	} else {
 		const issues = checkFiles;
 		const failures = checkLoad.failures;
@@ -1136,7 +1171,7 @@ if (cmd === "check") {
 			const staleClaims = issues
 				.filter((f) => f.issue.status === "Doing" && leaseExpired(f.lease, Date.now()))
 				.map((f) => ({ id: f.issue.id, holder: f.holder, lease: f.lease }));
-			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence, staleClaims, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson(), goalSketch: sketchStaleJson() }, null, 2));
+			console.log(JSON.stringify({ ok: issues.length, bad: failures, dangling, cycles, evidence, staleClaims, shadows, swarm, swarmVerdicts, promptRegistry: registryJson(), e2e: e2eJson(), audits: auditsJson(), goalSketch: sketchStaleJson(), selfmod: selfmodJson() }, null, 2));
 		} else {
 			for (const f of issues) console.log(`ok\t${f.issue.id}`);
 			for (const b of failures) console.log(`bad\t${b.file}\t${b.error}`);
@@ -1165,7 +1200,8 @@ if (cmd === "check") {
 			printE2eDrift();
 			printAudits();
 			printSketchStale();
-			if (failures.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal) process.exit(1);
+			printSelfmod();
+			if (failures.length || missing.length || cycles.length || fatalEvidence || fatalSwarm || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal || selfmodFatal) process.exit(1);
 			process.exit(0);
 		}
 
@@ -1176,7 +1212,7 @@ if (cmd === "check") {
 		// warn phase unresolvable-e2e is advisory too (e2eDriftFatal/auditFatal
 		// stay zero until --e2e-strict/--audit-strict).
 		const fatalEvidence = evidence.filter((p) => p.status === "Missing" && !(e2ePhase === "warn" && p.reason === "unresolvable-e2e")).length;
-		if (failures.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal) process.exit(1);
+		if (failures.length || missing.length || cycles.length || fatalEvidence || swarm.length || undeclared.length || registryFatal || e2eDriftFatal || auditFatal || sketchStaleFatal || snapshotDriftFatal || selfmodFatal) process.exit(1);
 	}
 	process.exit(0);
 }
